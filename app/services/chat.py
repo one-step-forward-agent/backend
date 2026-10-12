@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import snowballstemmer
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -213,7 +213,7 @@ async def history(session: AsyncSession, user: User, limit: int = HISTORY_LIMIT)
     rows = list(
         await session.scalars(
             select(ConversationMessage)
-            .where(ConversationMessage.user_id == user.id)
+            .where(ConversationMessage.user_id == user.id, ConversationMessage.hidden_at.is_(None))
             .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
             .limit(limit)
         )
@@ -224,13 +224,25 @@ async def history(session: AsyncSession, user: User, limit: int = HISTORY_LIMIT)
     ]
 
 
+async def clear_history(session: AsyncSession, user: User) -> int:
+    """"Очистить историю": the chat starts anew for the user and for the assistant; the messages stay hidden
+    for analysing the assistant's quality and go after CONTEXT_DAYS like the rest."""
+    result = await session.execute(
+        update(ConversationMessage)
+        .where(ConversationMessage.user_id == user.id, ConversationMessage.hidden_at.is_(None))
+        .values(hidden_at=datetime.now(timezone.utc))
+    )
+    await session.commit()
+    return result.rowcount or 0
+
+
 async def remember_topic(session: AsyncSession, user: User, title: str, text: str) -> dict:
     """Start a conversation about a recommendation: it becomes the assistant's last message,
     so both the chat and the model see what the user wants to discuss."""
     reply = {"kind": "topic", "title": title.strip()[:120], "text": text.strip()[:600]}
     last = await session.scalar(
         select(ConversationMessage)
-        .where(ConversationMessage.user_id == user.id)
+        .where(ConversationMessage.user_id == user.id, ConversationMessage.hidden_at.is_(None))
         .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
         .limit(1)
     )
@@ -265,7 +277,7 @@ async def prune_history(session: AsyncSession, user_id: int) -> None:
     await session.execute(delete(ConversationMessage).where(ConversationMessage.user_id == user_id, ConversationMessage.created_at < since))
     oldest_kept = await session.scalar(
         select(ConversationMessage.id)
-        .where(ConversationMessage.user_id == user_id)
+        .where(ConversationMessage.user_id == user_id, ConversationMessage.hidden_at.is_(None))
         .order_by(ConversationMessage.id.desc())
         .offset(KEEP_MESSAGES - 1)
         .limit(1)
@@ -273,7 +285,10 @@ async def prune_history(session: AsyncSession, user_id: int) -> None:
     if oldest_kept is not None:
         await session.execute(
             delete(ConversationMessage).where(
-                ConversationMessage.user_id == user_id, ConversationMessage.id < oldest_kept, ConversationMessage.rating.is_(None)
+                ConversationMessage.user_id == user_id,
+                ConversationMessage.id < oldest_kept,
+                ConversationMessage.rating.is_(None),
+                ConversationMessage.hidden_at.is_(None),
             )
         )
 
@@ -281,7 +296,7 @@ async def prune_history(session: AsyncSession, user_id: int) -> None:
 async def recent_context(session: AsyncSession, user_id: int) -> str:
     rows = await session.scalars(
         select(ConversationMessage)
-        .where(ConversationMessage.user_id == user_id)
+        .where(ConversationMessage.user_id == user_id, ConversationMessage.hidden_at.is_(None))
         .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
         .limit(CONTEXT_MESSAGES)
     )
@@ -485,6 +500,12 @@ async def agenda(session: AsyncSession, user: User, scope: str, mark: bool = Fal
     length = 7 if scope == "week" else 1
     start = datetime.combine(first, time.min, tz)
     events = await tasks.events_between(session, user, start, start + timedelta(days=length), limit=200)
+    if mark and scope == "today":
+        # Unmarked tasks of the last days come first: marked now, they count in the statistics
+        from app.services.insights import OVERDUE_DAYS
+
+        past = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=OVERDUE_DAYS), time.min, tz), start, limit=200)
+        events = [event for event in past if tasks.is_overdue(event, today, tz)] + events
     titles = {"today": "Сегодня", "tomorrow": "Завтра", "week": "Ближайшие 7 дней"}
     reply = {"kind": "agenda", "scope": scope, "title": titles.get(scope, "План"), "date": first.isoformat(), "days": group_by_day(events, tz, today)}
     return {**reply, "mark": True} if mark else reply
@@ -568,6 +589,12 @@ def _llm_time(raw: dict, key: str) -> time | None:
         return None
 
 
+def mentions_day(text: str, now: datetime) -> bool:
+    """The message names a day or a repetition: "завтра", "в пятницу", "15 октября", "по вторникам"."""
+    parsed = dates.parse(text, now)
+    return parsed.date is not None or parsed.rrule is not None
+
+
 def mentions_time(text: str) -> bool:
     return bool(re.search(r"\d{1,2}[:.]\d{2}|\b(?:в|к|с)\s+\d{1,2}\b|полдень|полночь|половин|через\s+\S*\s*(?:минут|час|полчаса)", text.lower()))
 
@@ -621,6 +648,7 @@ def build_item(
     allow_llm_time: bool = False,
     deadline: str | None = None,
     fixed: bool = False,
+    allow_llm_day: bool = True,
 ) -> dict | None:
     """A draft item with a concrete date. A task without a stated time stays untimed instead of getting 09:00."""
     llm = llm or {}
@@ -628,14 +656,14 @@ def build_item(
     if not title:
         return None
     today = now.date()
-    llm_day = _llm_date(llm)
+    llm_day = _llm_date(llm) if allow_llm_day else None
     day = parsed.date or (llm_day if llm_day and llm_day >= today else None)
     start = parsed.time if parsed.time is not None else (_llm_time(llm, "start_time") if allow_llm_time else None)
     end = parsed.end_time if parsed.time is not None and parsed.end_time else (_llm_time(llm, "end_time") if allow_llm_time else None)
     duration = llm.get("duration_minutes")
     if start and not end and isinstance(duration, int) and not isinstance(duration, bool) and 0 < duration <= 24 * 60:
         end = (datetime.combine(today, start) + timedelta(minutes=duration)).time()
-        end = end if end > start else None
+        end = end if end != start else None
     rule = parsed.rrule or (dates.valid_rrule(llm.get("recurrence_rule")) if llm.get("recurrence_phrase") else None)
     if day is None:
         day = today + timedelta(days=1) if start and start <= now.time() and not rule else today
@@ -649,6 +677,9 @@ def build_item(
     last = parsed.end_date or (_iso_date(llm.get("end_date")) if llm.get("end_date_phrase") else None)
     if rule or not last or last <= day:
         last = None
+    if start and end and end <= start and not last:
+        # "с 22:00 до 6:00" ends the next morning: a night shift
+        last = day + timedelta(days=1)
     return {
         "title": title,
         "date": day.isoformat(),
@@ -687,7 +718,15 @@ def normalize_item(raw: dict, text: str, now: datetime, single: bool) -> dict | 
             parsed.time, parsed.end_time = whole.time, whole.end_time
     fixed = raw.get("fixed") is True or (single and bool(FIXED_PHRASE.search(text)))
     return build_item(
-        str(raw.get("title") or ""), parsed, now, raw, allow_llm_time=bool(raw.get("time_phrase")) or mentions_time(text), deadline=deadline, fixed=fixed
+        str(raw.get("title") or ""),
+        parsed,
+        now,
+        raw,
+        allow_llm_time=bool(raw.get("time_phrase")) or mentions_time(text),
+        deadline=deadline,
+        fixed=fixed,
+        # A task without a day is for today, whatever day the model guessed
+        allow_llm_day=bool(raw.get("date_phrase")) or mentions_day(text, now),
     )
 
 
@@ -1053,6 +1092,8 @@ async def apply_changes(session: AsyncSession, user: User, items: list[dict], tz
             continue
         event.title = str(item.get("title") or event.title).strip()[:300] or event.title
         event.start_at, event.end_at, event.all_day = start, end, all_day
+        if isinstance(item.get("tag_ids"), list):
+            event.tag_ids = await tasks.owned_tag_ids(session, user, item["tag_ids"])
         if "deadline" in item:
             event.deadline_at = tasks.deadline_moment(item.get("deadline"), tz)
         if event.external_id:
@@ -1255,6 +1296,9 @@ def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, 
             if event.all_day:
                 return None, "У этой задачи нет времени — сначала укажите, во сколько она начинается."
             finishes = change["time"]
+            if not change.get("date") and last == day and finishes <= begins:
+                # "продли смену до 6 утра": the next morning
+                last = day + timedelta(days=1)
         if datetime.combine(last, finishes or time.max) <= datetime.combine(day, begins or time.min):
             return None, "Окончание должно быть позже начала."
     elif not change.get("title"):
@@ -1268,7 +1312,8 @@ def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, 
             begins = change["time"]
             finishes = change.get("end_time") or ((datetime.combine(day, begins) + duration).time() if duration else None)
             if finishes and finishes <= begins and last <= day:
-                finishes = None
+                # "на 22:00–6:00" ends the next morning
+                last = day + timedelta(days=1)
     item = {
         **event_item(event, tz),
         "title": title,
@@ -1349,19 +1394,27 @@ def model_change(raw: dict, now: datetime) -> dict | None:
     return change
 
 
-async def apply_hashtags(session: AsyncSession, user: User, items: list[dict], text: str) -> None:
-    """#работа in a message puts the user's tag "работа" on the new tasks."""
-    names = {name.lower() for name in HASHTAG.findall(text)}
-    if not names:
-        return
-    tags = [tag for tag in await session.scalars(select(Tag).where(Tag.user_id == user.id)) if tag.name.lower() in names]
-    if not tags:
-        return
-    known = {tag.name.lower() for tag in tags}
+async def apply_hashtags(session: AsyncSession, user: User, items: list[dict], text: str) -> list[str]:
+    """#работа in a message puts the user's tag "работа" on the new tasks (created when there is none yet),
+    and the title keeps no "#работа". Tags the model named for an item ("tag_names") are found the same way.
+    Returns the names of the created tags."""
+    hashtags = [name for name in HASHTAG.findall(text) if not name.isdigit()]
+    ids, created = await tasks.tags_by_name(session, user, hashtags)
+    known = {name.lower() for name in hashtags}
     for item in items:
-        item["tag_ids"] = [tag.id for tag in tags]
-        title = HASHTAG.sub(lambda found: "" if found.group(1).lower() in known else found.group(0), item["title"])
-        item["title"] = " ".join(title.split()) or item["title"]
+        own, made = await tasks.tags_by_name(session, user, item.pop("tag_names", None))
+        created += [name for name in made if name not in created]
+        item["tag_ids"] = list(dict.fromkeys([*(item.get("tag_ids") or []), *ids, *own]))
+        if known:
+            title = HASHTAG.sub(lambda found: "" if found.group(1).lower() in known else found.group(0), item["title"])
+            item["title"] = " ".join(title.split()) or item["title"]
+    return created
+
+
+def tags_note(created: list[str]) -> str | None:
+    if not created:
+        return None
+    return ("Создала теги " if len(created) > 1 else "Создала тег ") + ", ".join(f"«{name}»" for name in created) + " — они есть в настройках."
 
 
 # ---------- entry point ----------
@@ -1514,15 +1567,16 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> d
             return reply
         answer = None
     if items:
-        await apply_hashtags(session, user, items, text)
+        created = await apply_hashtags(session, user, items, text)
         draft = await create_draft(session, user, items)
         now = datetime.now(tz)
         warning = night_note(text, now) if any(item["date"] > now.date().isoformat() for item in items) else None
         if ADD_REQUEST.match(text) and len(items) == 1 and not warning:
             # The user already said "добавь": add it now; "Отменить" is under the answer
-            return await confirm_draft(session, user, draft.id)
+            reply = await confirm_draft(session, user, draft.id)
+            return {**reply, "note": join_text(reply.get("note"), tags_note(created))} if created else reply
         # At night "завтра" is ambiguous: the tasks wait for confirmation with the date spelled out
-        return proposal(draft, tz, answer=join_text(warning, honest(answer)))
+        return proposal(draft, tz, answer=join_text(warning, honest(answer)), note=tags_note(created))
     if not answer and settings.llm_enabled:
         from services.gigachat import GigaChatClient
 
@@ -1860,7 +1914,7 @@ async def recent_event_ids(session: AsyncSession, user: User) -> list[int]:
     rows = list(
         await session.scalars(
             select(ConversationMessage)
-            .where(ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant")
+            .where(ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant", ConversationMessage.hidden_at.is_(None))
             .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
             .limit(20)
         )
@@ -1906,7 +1960,7 @@ async def open_draft(session: AsyncSession, user: User) -> AssistantDraft | None
     """The unconfirmed list of new tasks the previous answer offered — "их" may point at it."""
     last = await session.scalar(
         select(ConversationMessage)
-        .where(ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant")
+        .where(ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant", ConversationMessage.hidden_at.is_(None))
         .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
         .limit(1)
     )

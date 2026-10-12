@@ -267,11 +267,9 @@ async def test_batch_and_profile_limits(client, user):
     assert (await client.put("/api/me/onboarding", json=huge, headers=headers)).status_code == 422
 
 
-async def test_overdue_is_only_unfinished_untimed_one_off_tasks(client, user):
-    from datetime import timezone as utc
-
+async def test_overdue_is_every_unmarked_one_off_task_of_the_user(client, user):
     from app.core.database import session_factory
-    from app.models.models import Event, User
+    from app.models.models import User
     from app.services import insights, tasks
     from sqlalchemy import select
 
@@ -288,11 +286,14 @@ async def test_overdue_is_only_unfinished_untimed_one_off_tasks(client, user):
                 {"title": "Зарядка", "date": yesterday.isoformat(), "time": None, "rrule": "FREQ=DAILY"},
             ],
         )
+        # A meeting from Google cannot be ticked in Dayla: it counts as done once over
+        await tasks.create_tasks(session, user_row, [{"title": "Планёрка", "date": yesterday.isoformat(), "time": "12:00"}], source="google", push_google=False)
         data = await insights.facts(session, user_row, datetime.now(TZ))
-    assert data["overdue"] == ["Купить молоко"]
+    # A task of the user's with a time is not done until ticked, like one without (testers: the statistics lied)
+    assert sorted(data["overdue"]) == ["Встреча вчера", "Купить молоко"]
     stats = (await client.get("/api/stats", headers=headers)).json()
     day = next(entry for entry in stats["days"] if entry["date"] == yesterday.isoformat())
-    assert (day["total"], day["done"]) == (3, 1)  # the meeting happened; the to-dos were not ticked
+    assert (day["total"], day["done"]) == (4, 1)
     items = (await client.get("/api/recommendations", headers=headers)).json()["items"]
     assert any("Купить молоко" in item["text"] for item in items)
 

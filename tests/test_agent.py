@@ -255,12 +255,14 @@ async def test_analysis_uses_the_onboarding_and_proposes_moves(client, user, age
     reply = await say(client, headers, "проанализируй мою неделю")
     system = requests[0][0]["content"]
     assert "строго" in system  # the tone chosen in the onboarding
-    assert "Работа, Здоровье" in system and "Учить английский по 20 минут" in system and "Пн, Вт, Ср, Чт, Пт 10:00–19:00" in system
+    assert "Работа, Здоровье" in system and "Пн, Вт, Ср, Чт, Пт 10:00–19:00" in system
+    # Goals and habits are not a part of Dayla yet: the assistant does not talk about them
+    assert "Учить английский по 20 минут" not in system and "Не говори о целях и привычках" in system
     # The advice comes from the focused analysis request, which also gets the onboarding profile
     assert reply["kind"] == "proposal" and reply["answer"] == "Анализ: «Разобрать почту» просрочена — поставьте её на понедельник."
     assert [item["event_id"] for item in reply["events"]] == [overdue]
     facts = agent.analyses[-1]
-    assert facts["tone"] == "strict" and "Учить английский" in facts["profile"] and facts["moves"]
+    assert facts["tone"] == "strict" and "Учить английский" not in facts["profile"] and "10:00–19:00" in facts["profile"] and facts["moves"]
 
 
 async def test_the_rules_answer_when_gigachat_is_down(client, user, agent):

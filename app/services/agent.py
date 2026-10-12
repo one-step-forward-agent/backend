@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import ConversationMessage, Event, User
+from app.models.models import ConversationMessage, Event, Tag, User
 from app.services import chat, dates, insights, reminders, tasks
 from app.services.ru import MONTHS, WEEKDAYS, WEEKDAYS_SHORT, day_label, plural
 
@@ -100,6 +100,7 @@ FUNCTIONS = [
                             "location": {"type": "string"},
                             "description": {"type": "string"},
                             "fixed": {"type": "boolean", "description": "true, если дело нельзя переносить (экзамен, встреча)"},
+                            "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги задачи: названия из блока «Теги» или новые, без #"},
                         },
                         "required": ["title"],
                     },
@@ -132,6 +133,7 @@ FUNCTIONS = [
                 "shift_minutes": {"type": "integer", "description": "Сдвиг в минутах: 60 — на час позже, -30 — на полчаса раньше, 1440 — на день позже"},
                 "new_title": {"type": "string"},
                 "untimed": {"type": "boolean", "description": "true — убрать время, задача на весь день"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Поставить задаче теги: названия из блока «Теги» или новые, без #"},
             },
             "required": ["event_id"],
         },
@@ -188,7 +190,7 @@ FUNCTIONS = [
     {
         "name": "analyze_plan",
         "description": "Проанализировать загрузку и план: сегодня, завтра, неделю или месяц. Возвращает факты (перегруженные и свободные дни, "
-        "свободные окна, дедлайны, просроченное, привычки пользователя) и предлагает переносы, которые пользователь подтвердит. "
+        "свободные окна, дедлайны, просроченное, сколько пользователь обычно успевает) и предлагает переносы, которые пользователь подтвердит. "
         "Вызывай для анализа дня или недели, для советов, «что перенести», «как всё успеть», «разгрузи день».",
         "parameters": {
             "type": "object",
@@ -211,7 +213,7 @@ FUNCTIONS = [
     },
     {
         "name": "get_stats",
-        "description": "Статистика выполнения: сколько задач сделано за неделю, серия дней, привычки.",
+        "description": "Статистика выполнения: сколько задач сделано за неделю, серия дней.",
         "parameters": {"type": "object", "properties": {}},
     },
 ]
@@ -497,11 +499,14 @@ def new_item(raw: dict, turn: Turn, whole: dates.Parsed | None = None) -> tuple[
     if not title:
         return None, "нет названия"
     day = parse_day(raw.get("date"), turn)
+    if day and day != turn.today and re.match(r"\d{4}-\d{2}-\d{2}", str(raw.get("date")).strip()) and not chat.mentions_day(turn.text, turn.now):
+        # A day the model made up: the user named none, and a task without a day is for today
+        day = None
     start, end = parse_clock(raw.get("start_time")), parse_clock(raw.get("end_time"))
     if whole is not None:
         day = whole.date or day
         if whole.time:
-            start, end = whole.time, whole.end_time or (end if end and end > whole.time else None)
+            start, end = whole.time, whole.end_time or (end if end and end != whole.time else None)
     if day and day < turn.today:
         return None, f"«{title}»: дата {day.isoformat()} уже прошла"
     rule = None
@@ -528,7 +533,15 @@ def new_item(raw: dict, turn: Turn, whole: dates.Parsed | None = None) -> tuple[
         "description": raw.get("description") if isinstance(raw.get("description"), str) else None,
     }
     item = chat.build_item(title, parsed, turn.now, llm, deadline=deadline, fixed=raw.get("fixed") is True)
+    if item and tag_names(raw.get("tags")):
+        item["tag_names"] = tag_names(raw.get("tags"))
     return item, None if item else f"«{title}»: не получилось разобрать"
+
+
+def tag_names(value) -> list[str]:
+    if isinstance(value, str):
+        value = re.split(r"[,;]", value)
+    return [item.strip().lstrip("#") for item in value if isinstance(item, str) and item.strip().lstrip("#")][:10] if isinstance(value, list) else []
 
 
 async def create_events(turn: Turn, args: dict) -> dict:
@@ -565,13 +578,20 @@ async def update_event(turn: Turn, args: dict) -> dict:
     event = (await grounded(turn, found))[0]
     if turn.delete:
         return {"error": "В этом ответе уже предложено удаление. Изменение предложи следующим сообщением."}
+    tags = tag_names(args.get("tags"))
+    others = ("new_date", "new_start_time", "new_end_time", "shift_minutes", "new_title", "untimed")
+    if tags and not any(args.get(key) for key in others):
+        # Only tags: the task stays where it is
+        item = {**chat.event_item(event, turn.tz), "tag_names": tags}
+        turn.items = [existing for existing in turn.items if existing.get("event_id") != event.id] + [item]
+        return {"status": "Теги показаны пользователю черновиком: он подтвердит. Ещё ничего не изменено.", "tags": tags}
     # One change in the message ("перенеси созвон на понедельник в 11"): its new day and time are read from the text,
     # the model miscounts weekdays. With several ("созвон на завтра, а встречу на пятницу") the model's values stay.
     single = not re.search(r",|;|\s(?:и|а)\s", turn.text)
     local = chat.parse_change(turn.text, turn.now) if single else None
     if local and not turn.items and (local.get("date") or local.get("time") or local.get("shift") or local.get("title") or local.get("untimed")):
         change = {key: value for key, value in local.items() if key not in ("verb", "target")}
-        return await propose_change(turn, event, change)
+        return await propose_change(turn, event, change, tags=tags)
     new_date = parse_day(args.get("new_date"), turn)
     new_start, new_end = parse_clock(args.get("new_start_time")), parse_clock(args.get("new_end_time"))
     shift = as_int(args.get("shift_minutes"))
@@ -589,15 +609,17 @@ async def update_event(turn: Turn, args: dict) -> dict:
         return {"error": "Не указано, что изменить: new_date, new_start_time, new_end_time, shift_minutes, new_title или untimed."}
     if new_date and new_date < turn.today:
         return {"error": f"Дата {new_date.isoformat()} уже прошла."}
-    return await propose_change(turn, event, change, title)
+    return await propose_change(turn, event, change, title, tags)
 
 
-async def propose_change(turn: Turn, event: Event, change: dict, title: str | None = None) -> dict:
+async def propose_change(turn: Turn, event: Event, change: dict, title: str | None = None, tags: list[str] | None = None) -> dict:
     item, problem = chat.change_item(event, change, turn.tz)
     if problem:
         return {"error": problem}
     if title:
         item["title"] = title
+    if tags:
+        item["tag_names"] = tags
     if item["date"] < turn.today.isoformat():
         return {"error": f"Дата {item['date']} уже прошла."}
     turn.items = [existing for existing in turn.items if existing.get("event_id") != event.id] + [item]
@@ -877,8 +899,6 @@ def profile_text(user: User) -> str:
     if spheres:
         spheres.sort(key=lambda item: item.get("priority") if isinstance(item.get("priority"), int) else 99)
         lines.append("Важные сферы жизни по приоритету: " + ", ".join(str(item["name"]) for item in spheres))
-    if profile.get("goals"):
-        lines.append("Намерения и цели по приоритету: " + "; ".join(str(item) for item in profile["goals"]))
     days = [day for day in profile.get("workDays") or [] if day in insights.DAY_NAMES]
     if days:
         hours = f" {profile['workHoursFrom']}–{profile['workHoursTo']}" if profile.get("workHoursFrom") and profile.get("workHoursTo") else ""
@@ -928,6 +948,11 @@ async def plan_text(turn: Turn) -> str:
     return "\n".join(lines) or "(на ближайшие 7 дней ничего не запланировано)"
 
 
+async def tags_text(turn: Turn) -> str:
+    names = [tag.name for tag in await turn.session.scalars(select(Tag).where(Tag.user_id == turn.user.id).order_by(Tag.id))]
+    return ", ".join(names[:50]) or "(нет)"
+
+
 async def reminders_text(turn: Turn) -> str:
     found = await reminders.pending_custom(turn.session, turn.user)
     return "\n".join(f"[id {item['id']}] {item['label']}: {item['text']}" for item in (reminders.custom_view(row, turn.tz) for row in found[:10])) or "(нет)"
@@ -960,19 +985,22 @@ async def system_prompt(turn: Turn) -> str:
         "не спрашивай «удалить?» или «да/нет» текстом — сразу вызывай функцию, а после неё скажи, что показала черновик, "
         "и попроси проверить и подтвердить. Отметка «выполнено», напоминания и их отмена срабатывают сразу.\n"
         "6. Для анализа дня, недели, советов, «что перенести», «как всё успеть», «разгрузи» вызывай analyze_plan и опирайся на его факты. "
-        "Учитывай сферы и цели пользователя по приоритету, рабочий график и задачи, которые нельзя переносить. "
+        "Учитывай рабочий график и задачи, которые нельзя переносить. "
         + PERSONAL_ADVICE
         + "\n7. Если пользователь хочет подготовиться к чему-то большому или разбить задачу на шаги — breakdown_task.\n"
         "8. На вопросы о плане отвечай по блоку «План» или get_events, ничего не придумывай. Не перечисляй задачи, если вызвала get_events — "
         "пользователь увидит их списком; дай короткий вывод или комментарий.\n"
         "9. Ответ — по-русски, на «вы», коротко: до 5–6 предложений или список строк «• …». Без markdown-заголовков, таблиц и id задач.\n"
-        "10. На сообщения не о планах ответь коротко и дружелюбно и мягко верни разговор к планированию.\n\n"
+        "10. На сообщения не о планах ответь коротко и дружелюбно и мягко верни разговор к планированию.\n"
+        "11. Теги ставь полем tags (в create_events или update_event), а не символом # в названии. Бери тег из блока «Теги»; "
+        "если пользователь называет новый тег — передай его, приложение создаст его само.\n\n"
         f"СЕЙЧАС: {turn.now:%Y-%m-%d %H:%M}, {WEEKDAYS[turn.now.weekday()]}. Часовой пояс: {turn.tz}.\n\n"
         f"ТАБЛИЦА ДНЕЙ:\n{day_table(turn.today)}\n\n"
         f"О ПОЛЬЗОВАТЕЛЕ (из знакомства):\n{profile_text(turn.user)}\n\n"
-        f"ПРИВЫЧКИ (за последние недели):\n{known or '(пока мало данных)'}\n\n"
+        f"КАК ПОЛЬЗОВАТЕЛЬ ВЫПОЛНЯЕТ ЗАДАЧИ (за последние недели):\n{known or '(пока мало данных)'}\n\n"
         f"ПЛАН (сегодня и 7 дней вперёд, плюс просроченное):\n{await plan_text(turn)}\n\n"
-        f"НАПОМИНАНИЯ (активные):\n{await reminders_text(turn)}\n"
+        f"НАПОМИНАНИЯ (активные):\n{await reminders_text(turn)}\n\n"
+        f"ТЕГИ пользователя: {await tags_text(turn)}\n"
         f"Telegram: {telegram}."
     )
 
@@ -987,7 +1015,7 @@ async def history_messages(turn: Turn) -> list[dict]:
     rows = list(
         await turn.session.scalars(
             select(ConversationMessage)
-            .where(ConversationMessage.user_id == turn.user.id)
+            .where(ConversationMessage.user_id == turn.user.id, ConversationMessage.hidden_at.is_(None))
             .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
             .limit(HISTORY_MESSAGES)
         )
@@ -1107,7 +1135,14 @@ async def finish(turn: Turn, answer: str | None) -> dict:
         said = f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({turn.delete['title']})? Это нельзя отменить."
         return chat.proposal(draft, tz, answer=said)
     if turn.items:
-        await chat.apply_hashtags(session, user, [item for item in turn.items if not item.get("event_id")], turn.text)
+        created = await chat.apply_hashtags(session, user, [item for item in turn.items if not item.get("event_id")], turn.text)
+        for item in turn.items:
+            if item.get("event_id") and item.get("tag_names"):
+                ids, made = await tasks.tags_by_name(session, user, item.pop("tag_names"))
+                item["tag_ids"] = list(dict.fromkeys([*(item.get("tag_ids") or []), *ids]))
+                created += [name for name in made if name not in created]
+        if created:
+            turn.notes.append(chat.tags_note(created))
         draft = await chat.create_draft(session, user, turn.items)
         new = [item for item in turn.items if not item.get("event_id")]
         warning = chat.night_note(turn.text, turn.now) if any(item["date"] > turn.today.isoformat() for item in turn.items) else None

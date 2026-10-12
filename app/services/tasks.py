@@ -58,6 +58,40 @@ def deadline_moment(value, tz: ZoneInfo) -> datetime | None:
     return datetime.combine(day, moment, tz)
 
 
+MAX_TAGS = 50
+
+
+async def tags_by_name(session: AsyncSession, user: User, names) -> tuple[list[int], list[str]]:
+    """The ids of the user's tags with these names, any case; a missing one is created as in the settings.
+    Returns the ids and the names of the created tags."""
+    from app.schemas import TAG_COLORS
+
+    wanted = []
+    for value in names or []:
+        name = " ".join(str(value).split()).lstrip("#").strip()[:40] if isinstance(value, str) else ""
+        if name and not name.isdigit() and name.lower() not in (item.lower() for item in wanted):
+            wanted.append(name)
+    if not wanted:
+        return [], []
+    # Names are encrypted at rest, so they are compared after loading
+    existing = list(await session.scalars(select(Tag).where(Tag.user_id == user.id).order_by(Tag.id)))
+    by_name = {tag.name.lower(): tag for tag in existing}
+    ids, created = [], []
+    for name in wanted[:10]:
+        tag = by_name.get(name.lower())
+        if tag is None:
+            if len(existing) >= MAX_TAGS:
+                continue
+            tag = Tag(user_id=user.id, name=name, color=TAG_COLORS[len(existing) % len(TAG_COLORS)])
+            session.add(tag)
+            await session.flush()
+            existing.append(tag)
+            by_name[name.lower()] = tag
+            created.append(name)
+        ids.append(tag.id)
+    return ids, created
+
+
 def is_fixed(event: Event) -> bool:
     """A task that must stay where it is: marked so, or a meeting synced from another calendar."""
     return bool(event.is_fixed) or (not event.all_day and event.source in EXTERNAL_SOURCES)
@@ -249,14 +283,20 @@ async def events_between(session: AsyncSession, user: User, start: datetime, end
 
 
 def is_done(event: Event, now: datetime) -> bool:
-    """A task is done when marked so; a timed event (a meeting, an appointment) also once its time is over."""
-    return event.completed_at is not None or (not event.all_day and event.end_at <= now)
+    """A task is done when marked so. A meeting synced from another calendar (Google, Apple…) cannot be marked
+    in Dayla, so it counts as done once its time is over; the user's own tasks need the mark."""
+    return event.completed_at is not None or (event.source in EXTERNAL_SOURCES and not event.all_day and event.end_at <= now)
 
 
 def is_overdue(event: Event, today: date, tz: ZoneInfo) -> bool:
-    """Only a one-off task without a time can be overdue: past events simply happened,
-    and a missed day of a recurring task does not pile up."""
-    return event.all_day and event.completed_at is None and event.series_id is None and event.start_at.astimezone(tz).date() < today
+    """A one-off task of the user's from a past day that is not marked done, with or without a time.
+    Meetings from other calendars simply happened, and a missed day of a recurring task does not pile up."""
+    return (
+        event.completed_at is None
+        and event.series_id is None
+        and event.source not in EXTERNAL_SOURCES
+        and (event.end_at - timedelta(microseconds=1)).astimezone(tz).date() < today
+    )
 
 
 def _percent(done: int, total: int) -> int:

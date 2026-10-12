@@ -26,7 +26,7 @@ def task(days_ago: int, title: str = "Задача", done_hour: int | None = Non
 
 def test_little_history_says_so():
     found = insights.habits_from([task(1, done_hour=9)], {}, NOW, {"goals": ["Сдать сессию"]})
-    assert found["goals"] == ["Сдать сессию"] and "note" in found and "slipping" not in found
+    assert "goals" not in found and "note" in found and "slipping" not in found
 
 
 def test_habits_name_spheres_time_of_day_and_slipping_tasks():

@@ -153,16 +153,24 @@ def _clock(hour: int, minute: int = 0) -> time | None:
 def parse_time(text: str) -> tuple[time | None, time | None, list[tuple[int, int]]]:
     """Start time, end time and the matched spans of a phrase such as "с 10 до 12:30"."""
     low = text.lower()
+    period = r"(?:\s*(утра|дня|вечера|ночи))?"
     patterns = (
-        rf"\bс\s+(\d{{1,2}})(?:[:.](\d{{2}}))?\s*(?:часов\s+)?(?:до|по)\s+(\d{{1,2}})(?!\d)(?:[:.](\d{{2}}))?(?!\d)(?!\s*{NOT_HOUR})",
-        r"\b(\d{1,2}):(\d{2})\s*(?:-|–|—|до)\s*(\d{1,2}):(\d{2})\b",
+        rf"\bс\s+(\d{{1,2}})(?:[:.](\d{{2}}))?\s*(?:часов\s+)?{period}\s*(?:до|по)\s+(\d{{1,2}})(?!\d)(?:[:.](\d{{2}}))?(?!\d)(?!\s*{NOT_HOUR}){period}",
+        rf"\b(\d{{1,2}}):(\d{{2}}){period}\s*(?:-|–|—|до)\s*(\d{{1,2}}):(\d{{2}})\b{period}",
     )
     for pattern in patterns:
         if match := re.search(pattern, low):
-            start = _clock(int(match.group(1)), int(match.group(2) or 0))
-            end = _clock(int(match.group(3)), int(match.group(4) or 0))
-            if start and end:
-                return start, end if end > start else None, [match.span()]
+            first, second = match.group(3), match.group(6)
+            start = _clock(_hour(int(match.group(1)), first or (None if second in (None, "утра") else second)), int(match.group(2) or 0))
+            end = _clock(_hour(int(match.group(4)), second), int(match.group(5) or 0))
+            if start and end and end < start and start.hour < 12 and not second and end.hour + 12 > start.hour:
+                # "с 11 до 2" is the afternoon, not the night
+                end = end.replace(hour=end.hour + 12)
+            if start and end and end != start:
+                # An end earlier than the start is the next morning: a night shift "с 22 до 6"
+                return start, end, [match.span()]
+            if start:
+                return start, None, [match.span()]
     if match := re.search(r"\bв\s+полдень\b", low):
         return time(12), None, [match.span()]
     if match := re.search(r"\bв\s+полночь\b", low):

@@ -267,7 +267,7 @@ class ConversationMessage(Base):
     __tablename__ = "conversation_messages"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
     role: Mapped[str] = mapped_column(Text)
     content: Mapped[str] = mapped_column(EncryptedText("conversation_messages.content"))
     # The full assistant reply, so the chat history shows proposals and results after a reload
@@ -277,6 +277,8 @@ class ConversationMessage(Base):
     # The user's 👍 (1) or 👎 (-1) for an assistant answer
     rating: Mapped[int | None] = mapped_column(SmallInteger)
     rated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # "Очистить историю": the user no longer sees the message and the assistant no longer reads it; it stays for analysis
+    hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 

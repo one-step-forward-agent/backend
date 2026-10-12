@@ -62,6 +62,13 @@ def test_dates(text, expected):
         ("с 10 до 12", time(10), time(12)),
         ("с 9:30 до 11:15", time(9, 30), time(11, 15)),
         ("10:00-11:30", time(10), time(11, 30)),
+        # A night shift ends the next morning; "с 11 до 2" is still the afternoon
+        ("с 22 до 6", time(22), time(6)),
+        ("с 22:00 до 06:00", time(22), time(6)),
+        ("с 10 вечера до 6 утра", time(22), time(6)),
+        ("23:00-07:00", time(23), time(7)),
+        ("с 8 до 11 вечера", time(20), time(23)),
+        ("с 11 до 2", time(11), time(14)),
         ("в 5 классе", None, None),
         ("в 2 раза больше", None, None),
         ("на 2 дня", None, None),

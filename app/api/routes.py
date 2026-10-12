@@ -87,7 +87,7 @@ async def limit_assistant(session: AsyncSession, user: User, text: str | None = 
 
 def limit_uploads(user: User) -> None:
     ratelimit.hit(f"uploads:{user.id}", UPLOAD_LIMIT, UPLOAD_WINDOW, "Слишком много файлов, попробуйте через час")
-MAX_TAGS = 50
+MAX_TAGS = tasks.MAX_TAGS
 ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg"}
 AUDIO_EXTENSIONS = {".webm", ".ogg", ".oga", ".opus", ".mp3", ".m4a", ".mp4", ".wav", ".aac"}
 
@@ -402,6 +402,18 @@ async def rate_answer(message_id: int, payload: RatingRequest, user: User = Depe
 async def assistant_history(limit: int = 60, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     """The saved conversation (site and Telegram), oldest first."""
     return await chat.history(session, user, min(max(limit, 1), 200))
+
+
+@router.delete("/assistant/history")
+async def clear_assistant_history(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Clear the chat (site and Telegram): the user and the assistant no longer see the messages."""
+    return {"cleared": await chat.clear_history(session, user)}
+
+
+@router.delete("/assistant/history")
+async def clear_assistant_history(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Clear the chat (site and Telegram): the user and the assistant no longer see the messages."""
+    return {"cleared": await chat.clear_history(session, user)}
 
 
 @router.put("/assistant/drafts/{draft_id}")

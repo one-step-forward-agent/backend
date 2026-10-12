@@ -185,11 +185,10 @@ def habits_from(events: list[Event], tag_names: dict[int, str], now: datetime, p
     tracked = [event for event in past if event.all_day or event.completed_at is not None]
     found: dict = {
         "purpose": str(profile.get("purpose") or "") or None,
-        "goals": [str(goal) for goal in profile.get("goals") or []][:5],
         "spheres": [str(sphere.get("name")) for sphere in profile.get("spheres") or [] if isinstance(sphere, dict)][:6],
     }
     if len(tracked) < 5:
-        found["note"] = "истории пока мало: советуй по сегодняшнему плану и целям"
+        found["note"] = "истории пока мало: советуй по сегодняшнему плану"
         return found
 
     per_day: dict[date, list[int]] = {}
@@ -268,8 +267,6 @@ def habits_text(data: dict) -> str:
     lines = []
     if data.get("purpose"):
         lines.append(f"Чем занимается: {data['purpose']}")
-    if data.get("goals"):
-        lines.append("Цели: " + "; ".join(data["goals"]))
     if data.get("planned_per_day") is not None:
         lines.append(f"В среднем планирует {data['planned_per_day']} задач в день, выполняет {data['done_per_day']}")
     for key, label in (("spheres_done", "По сферам"), ("slipping", "Откладывается")):
