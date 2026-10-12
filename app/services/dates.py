@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from dateutil.relativedelta import relativedelta
 from dateutil.rrule import rrulestr
+
+from app.services.ru import MONTHS as MONTHS_GENITIVE
 
 RRULE_DAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 WEEKDAY_FORMS = (
@@ -407,14 +409,35 @@ def first_occurrence(rule: str, start: datetime, now: datetime) -> datetime | No
     return series.after(floor, inc=True)
 
 
+MAX_COUNT = 500
+
+
 def valid_rrule(rule: str | None) -> str | None:
+    """The rule in the form the app keeps, or None. An end date (UNTIL) is kept in UTC — "UNTIL=20261231" becomes
+    the end of that day, 20261231T235959Z — because a series starts at an aware moment; COUNT is 1..MAX_COUNT."""
     if not isinstance(rule, str) or not rule.strip():
         return None
     rule = rule.strip().upper().removeprefix("RRULE:")
     if not re.fullmatch(r"[A-Z0-9=;,+-]+", rule) or "FREQ=" not in rule:
         return None
+    parts = []
+    for part in rule.split(";"):
+        key, _, value = part.partition("=")
+        if key == "UNTIL":
+            if re.fullmatch(r"\d{8}", value):
+                value += "T235959Z"
+            elif re.fullmatch(r"\d{8}T\d{6}", value):
+                value += "Z"
+            elif not re.fullmatch(r"\d{8}T\d{6}Z", value):
+                return None
+        if key == "COUNT" and not (value.isdigit() and 1 <= int(value) <= MAX_COUNT):
+            return None
+        parts.append(f"{key}={value}" if _ or value else key)
+    rule = ";".join(parts)
+    if "UNTIL=" in rule and "COUNT=" in rule:
+        return None
     try:
-        rrulestr(rule, dtstart=datetime(2026, 1, 1))
+        rrulestr(rule, dtstart=datetime(2026, 1, 1, tzinfo=timezone.utc))
     except (TypeError, ValueError):
         return None
     return rule
@@ -427,10 +450,20 @@ def strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
 
 
 def describe_rrule(rule: str | None) -> str | None:
-    """Short Russian description: "каждую пятницу", "по будням", "каждый день"."""
+    """Short Russian description: "каждую пятницу", "по будням", "каждый день, 10 раз", "по будням, до 31 декабря"."""
     if not rule:
         return None
     parts = dict(part.split("=", 1) for part in rule.split(";") if "=" in part)
+    base = _describe_frequency(parts)
+    if parts.get("COUNT", "").isdigit():
+        count = int(parts["COUNT"])
+        return f"{base}, {count} {'раз' if count % 10 not in (2, 3, 4) or count % 100 in (12, 13, 14) else 'раза'}"
+    if match := re.match(r"(\d{4})(\d{2})(\d{2})", parts.get("UNTIL", "")):
+        return f"{base}, до {int(match.group(3))} {MONTHS_GENITIVE[int(match.group(2)) - 1]}"
+    return base
+
+
+def _describe_frequency(parts: dict) -> str:
     interval = int(parts.get("INTERVAL", "1") or 1)
     freq = parts.get("FREQ")
     if freq == "DAILY":

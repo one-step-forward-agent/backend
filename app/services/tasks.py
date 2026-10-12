@@ -142,6 +142,22 @@ def _copy(template: Event, moment: datetime, duration: timedelta) -> Event:
     )
 
 
+def align_to_rule(event: Event) -> None:
+    """A series starts on its first day the rule allows: "пн, ср, пт" chosen on a Tuesday starts on Wednesday."""
+    try:
+        tz = ZoneInfo(event.timezone)
+    except (TypeError, ValueError, KeyError):
+        tz = event.start_at.tzinfo
+    start = event.start_at.astimezone(tz)
+    try:
+        first = rrulestr(event.recurrence_rule, dtstart=start).after(start, inc=True)
+    except (TypeError, ValueError):
+        return
+    if first and first != start:
+        shift = first - start
+        event.start_at, event.end_at = event.start_at + shift, event.end_at + shift
+
+
 def add_occurrences(session: AsyncSession, event: Event, now: datetime) -> list[Event]:
     """Turn an event with a recurrence rule into a series: the rest of the occurrences up to the horizon."""
     event.series_id = event.series_id or str(uuid4())
@@ -229,22 +245,62 @@ async def extend_series(session: AsyncSession, now: datetime, force: bool = Fals
         .where(Event.series_id.is_not(None), Event.recurrence_rule.is_not(None))
         .group_by(Event.series_id)
         .having(func.max(Event.start_at) < now + SERIES_REFILL)
-        .limit(200)
+        # Finished series ("10 раз", "до 31 декабря") stay in this list: the limit leaves room for the live ones
+        .limit(1000)
     )
     added = 0
     for series_id, latest_start in rows.all():
         latest = await session.scalar(select(Event).where(Event.series_id == series_id, Event.start_at == latest_start).limit(1))
         if not latest or not valid_rrule(latest.recurrence_rule):
             continue
-        tz = ZoneInfo(latest.timezone or "UTC")
-        anchor = latest.start_at.astimezone(tz)
-        moments = occurrences(latest.recurrence_rule, anchor, now + SERIES_HORIZON, include_start=False)
+        first_start = await session.scalar(select(func.min(Event.start_at)).where(Event.series_id == series_id))
+        moments = following(latest, first_start, now + SERIES_HORIZON)
         session.add_all(_copy(latest, moment, latest.end_at - latest.start_at) for moment in moments)
         added += len(moments)
     if added:
         await session.commit()
         logger.info("Extended recurring series with %d events", added)
     return added
+
+
+def following(latest: Event, first_start: datetime, until: datetime) -> list[datetime]:
+    """The occurrences after `latest` up to `until`, counted from the series' first one: "10 раз" and "до 31 декабря"
+    end the series where they should, and "каждые 2 недели" keeps its weeks."""
+    try:
+        tz = ZoneInfo(latest.timezone or "UTC")
+    except (TypeError, ValueError, KeyError):
+        tz = timezone.utc
+    try:
+        series = rrulestr(latest.recurrence_rule, dtstart=first_start.astimezone(tz))
+    except (TypeError, ValueError):
+        return []
+    found = []
+    for moment in series.xafter(latest.start_at.astimezone(tz), count=MAX_OCCURRENCES, inc=False):
+        if moment > until:
+            break
+        found.append(moment)
+    return found
+
+
+async def change_series(session: AsyncSession, user: User, event: Event, rule: str | None) -> list[Event]:
+    """A new repeat from this occurrence on: the later ones of the old series go, this one starts the new series
+    (or stays alone when `rule` is None). The earlier ones stay as they were, no longer repeating."""
+    if event.series_id:
+        later = await session.scalars(
+            select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at > event.start_at, Event.id != event.id)
+        )
+        for item in later:
+            await session.delete(item)
+        await session.execute(
+            update(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.id != event.id).values(recurrence_rule=None)
+        )
+    event.recurrence_rule = rule
+    event.series_id = None
+    if not rule:
+        return []
+    event.series_id = str(uuid4())
+    align_to_rule(event)
+    return add_occurrences(session, event, datetime.now(timezone.utc))
 
 
 async def delete_series(session: AsyncSession, user: User, event: Event) -> int:

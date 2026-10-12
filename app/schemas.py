@@ -174,6 +174,8 @@ class EventUpdate(BaseModel):
     deadline_at: datetime | None = None
     is_fixed: bool | None = None
     tag_ids: list[int] | None = Field(default=None, max_length=20)
+    # A new repeat from this occurrence on ("" or null: no longer repeats); left out: the repeat stays
+    recurrence_rule: str | None = Field(default=None, max_length=300)
 
 
 class EventRead(EventCreate):

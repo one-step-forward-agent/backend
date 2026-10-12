@@ -175,7 +175,7 @@ async def test_message_about_something_else_gets_an_answer(client, user, agent, 
     monkeypatch.setattr(gigachat.GigaChatClient, "chat_reply", broken)
     agent([""])
     reply = await say(client, headers, "расскажи анекдот")
-    assert reply["kind"] == "answer" and reply["text"] == chat.OFF_TOPIC_ANSWER
+    assert reply["kind"] == "answer" and reply["text"] == chat.MODEL_FAILED_ANSWER
 
 
 async def test_answer_about_history_is_not_taken_for_a_calendar_claim(client, user, agent):
@@ -221,3 +221,120 @@ async def test_calendar_feed_for_samsung(client, user, browser):
     assert (await browser.get(path)).status_code == 404
     assert (await browser.get(renewed)).status_code == 200
     assert (await browser.get("/api/calendar/feed/short.ics")).status_code == 404
+
+
+# ---------- the second round of notes: repeats with an end, model failures ----------
+
+
+async def make_series(client, headers, rule: str, days_ahead: int = 1) -> dict:
+    start = datetime.now(TZ).replace(hour=8, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    created = await client.post(
+        "/api/events",
+        json={"title": "Пробежка", "start_at": start.isoformat(), "end_at": (start + timedelta(minutes=45)).isoformat(), "recurrence_rule": rule},
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    return created.json()
+
+
+async def series_starts(client, headers, title: str = "Пробежка") -> list[datetime]:
+    events = (await client.get("/api/events", params={"start": datetime.now(TZ).isoformat(), "limit": 1000}, headers=headers)).json()
+    return sorted(datetime.fromisoformat(event["start_at"]) for event in events if event["title"] == title)
+
+
+async def test_series_with_a_count_ends_after_that_many(client, user):
+    headers, _ = user
+    event = await make_series(client, headers, "FREQ=DAILY;COUNT=5")
+    assert event["recurrence"] == "каждый день, 5 раз"
+    assert len(await series_starts(client, headers)) == 5
+
+    # Refilling the series later does not start the count over
+    from app.services import tasks
+
+    async with session_factory() as session:
+        await tasks.extend_series(session, datetime.now(timezone.utc) + timedelta(days=200), force=True)
+    assert len(await series_starts(client, headers)) == 5
+
+
+async def test_series_until_a_date(client, user):
+    headers, _ = user
+    last = (datetime.now(TZ) + timedelta(days=15)).date()
+    event = await make_series(client, headers, f"FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL={last:%Y%m%d}")
+    assert event["recurrence_rule"].endswith(f"UNTIL={last:%Y%m%d}T235959Z")
+    assert ", до " in event["recurrence"]
+    starts = await series_starts(client, headers)
+    assert starts and all(start.date() <= last for start in starts)
+    # Started on any day, the series lands only on the chosen weekdays
+    assert {start.astimezone(TZ).weekday() for start in starts} <= {0, 2, 4}
+
+
+async def test_every_two_weeks_keeps_its_weeks_when_refilled(client, user):
+    from app.services import tasks
+
+    headers, _ = user
+    await make_series(client, headers, "FREQ=WEEKLY;INTERVAL=2")
+    async with session_factory() as session:
+        await tasks.extend_series(session, datetime.now(timezone.utc) + timedelta(days=120), force=True)
+    starts = await series_starts(client, headers)
+    assert len(starts) > 7
+    assert all((later - earlier).days == 14 for earlier, later in zip(starts, starts[1:]))
+
+
+async def test_changing_the_repeat_of_a_series_from_one_task_on(client, user):
+    headers, _ = user
+    first = await make_series(client, headers, "FREQ=DAILY")
+    starts = await series_starts(client, headers)
+    events = (await client.get("/api/events", params={"start": datetime.now(TZ).isoformat(), "limit": 1000}, headers=headers)).json()
+    third = sorted((event for event in events if event["title"] == "Пробежка"), key=lambda event: event["start_at"])[2]
+
+    changed = await client.put(f"/api/events/{third['id']}", json={"recurrence_rule": "FREQ=WEEKLY;COUNT=3"}, headers=headers)
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["recurrence"].endswith("3 раза")
+    after = await series_starts(client, headers)
+    # The first two stay, then three weekly ones from the third
+    assert after[:3] == starts[:3] and len(after) == 5
+    assert (after[3] - after[2]).days == 7 and (after[4] - after[3]).days == 7
+
+    # The ones before the change no longer repeat; the new weekly series belongs to the third one
+    assert (await client.get(f"/api/events/{first['id']}", headers=headers)).json()["recurrence"] is None
+
+    # Stopping the repeat of the new series keeps only its first task
+    stopped = await client.put(f"/api/events/{third['id']}", json={"recurrence_rule": None}, headers=headers)
+    assert stopped.status_code == 200 and stopped.json()["recurrence"] is None
+    assert len(await series_starts(client, headers)) == 3
+
+    # Other changes leave the repeat alone
+    assert (await client.put(f"/api/events/{first['id']}", json={"title": "Пробежка"}, headers=headers)).status_code == 200
+    bad = await client.put(f"/api/events/{first['id']}", json={"recurrence_rule": "FREQ=DAILY;COUNT=0"}, headers=headers)
+    assert bad.status_code == 422
+
+
+def test_rule_checks():
+    from app.services.dates import valid_rrule
+
+    assert valid_rrule("FREQ=DAILY;UNTIL=20261231") == "FREQ=DAILY;UNTIL=20261231T235959Z"
+    assert valid_rrule("FREQ=DAILY;COUNT=10") == "FREQ=DAILY;COUNT=10"
+    assert valid_rrule("FREQ=DAILY;COUNT=10;UNTIL=20261231") is None
+    assert valid_rrule("FREQ=DAILY;COUNT=100000") is None
+    assert valid_rrule("FREQ=DAILY;UNTIL=31.12.2026") is None
+
+
+async def test_a_failing_model_never_means_a_server_error(client, user, monkeypatch):
+    """"оценка в c++": the model request fails twice (the agent and the rules): the chat answers anyway."""
+    import dataclasses
+
+    from app.core.config import settings
+    from services import gigachat
+
+    headers, _ = user
+
+    async def broken(self, *args, **kwargs):
+        raise RuntimeError("provider said 400")
+
+    monkeypatch.setattr(chat, "settings", dataclasses.replace(settings, gigachat_credentials="fake", assistant_agent=True))
+    for name in ("agent_step", "process_message", "chat_reply"):
+        monkeypatch.setattr(gigachat.GigaChatClient, name, broken)
+    for text in ("оценка в c++", "напиши hello world на C++", "a+b"):
+        response = await client.post("/api/assistant/chat", json={"text": text}, headers=headers)
+        assert response.status_code == 200, (text, response.text)
+        assert response.json()["kind"] == "answer" and response.json()["text"] == chat.MODEL_FAILED_ANSWER

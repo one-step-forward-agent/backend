@@ -202,6 +202,8 @@ async def create_event(payload: EventCreate, user: User = Depends(get_current_us
     values["tag_ids"] = await tasks.owned_tag_ids(session, user, values.get("tag_ids"))
     calendar = await _owned_calendar(session, user, calendar_id) if calendar_id else await default_calendar(session, user, payload.timezone)
     event = Event(calendar_id=calendar.id, user_id=user.id, **values)
+    if event.recurrence_rule:
+        tasks.align_to_rule(event)
     session.add(event)
     created = [event]
     if event.recurrence_rule:
@@ -244,13 +246,22 @@ async def update_event(event_id: int, payload: EventUpdate, user: User = Depends
         values["tag_ids"] = await tasks.owned_tag_ids(session, user, values["tag_ids"])
     if values.get("is_fixed") is None:
         values.pop("is_fixed", None)
+    changes_repeat = "recurrence_rule" in values
+    rule = valid_rrule(values.pop("recurrence_rule", None))
+    if changes_repeat and payload.recurrence_rule and not rule:
+        raise HTTPException(status_code=422, detail="Не получилось разобрать повтор")
     for key, value in values.items():
         setattr(event, key, value)
     if event.end_at <= event.start_at:
         raise HTTPException(status_code=422, detail="end_at must be later than start_at")
     event.sync_status = "pending"
+    created = []
+    if changes_repeat and rule != event.recurrence_rule:
+        created = await tasks.change_series(session, user, event, rule)
     await session.commit()
     await push_pending_to_google(session, user.id)
+    if created:
+        await push_new_events_to_google(session, user.id, created)
     await session.refresh(event)
     return event
 

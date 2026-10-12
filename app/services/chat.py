@@ -113,6 +113,10 @@ OFF_TOPIC_ANSWER = (
     "Я лучше всего помогаю с планами: добавить задачу, перенести встречу, напомнить о деле или разобрать загрузку недели. "
     "Напишите, например, «созвон с Олей завтра в 15:00» или «что у меня на завтра?»."
 )
+MODEL_FAILED_ANSWER = (
+    "Не получилось ответить на это сообщение — попробуйте переформулировать или спросить чуть позже. "
+    "С планами помогу как обычно: например, «созвон с Олей завтра в 15:00» или «что у меня на завтра?»."
+)
 HONEST_ANSWER = (
     "Я ничего не меняла в календаре. Напишите, что сделать, — например, «удали встречу с Олей», "
     "«перенеси отчёт на пятницу» или «отметь отчёт выполненным», и я покажу изменение на подтверждение."
@@ -1520,7 +1524,14 @@ async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
     tz = tasks.local_tz(user)
     text = text.strip()[:50000]
     await prune_history(session, user.id)
-    reply = await route(session, user, text, tz)
+    try:
+        reply = await route(session, user, text, tz)
+    except AssistantUnavailable:
+        if not settings.llm_enabled:
+            raise
+        # A model request of the rules failed: an answer in the chat, not a server error
+        await session.rollback()
+        reply = {"kind": "answer", "text": MODEL_FAILED_ANSWER}
     await remember(session, user.id, "user", text)
     message = await remember(session, user.id, "assistant", summarize(reply), reply)
     await session.commit()
@@ -1567,7 +1578,13 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> d
     answer = intent = None
     if not items:
         calendar = await calendar_context(session, user, tz) if settings.llm_enabled else ""
-        items, answer, intent = await extract_items(text, tz, history, calendar)
+        try:
+            items, answer, intent = await extract_items(text, tz, history, calendar)
+        except AssistantUnavailable:
+            if not settings.llm_enabled:
+                raise
+            # The model failed on this message ("оценка в c++"): the chat still answers instead of an error page
+            return await small_talk(session, user, text, tz, history)
     if not items and intent in ("delete", "complete", "analyze", "change", "breakdown"):
         routed = {
             "delete": lambda: delete_request(session, user, text, tz, forced=True),
@@ -1600,6 +1617,7 @@ async def small_talk(session: AsyncSession, user: User, text: str, tz: ZoneInfo,
     """A message that is not about the plan ("как дела?", "кто написал «Войну и мир»?") still gets an answer:
     the model talks, and if it cannot, the chat says what it helps with instead of failing."""
     answer = None
+    failed = False
     if settings.llm_enabled:
         from services.gigachat import GigaChatClient
 
@@ -1613,7 +1631,8 @@ async def small_talk(session: AsyncSession, user: User, text: str, tz: ZoneInfo,
             answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name, calendar, known)
         except Exception:
             logger.exception("GigaChat chat reply failed")
-    return {"kind": "answer", "text": honest(answer) or OFF_TOPIC_ANSWER}
+            failed = True
+    return {"kind": "answer", "text": honest(answer) or (MODEL_FAILED_ANSWER if failed else OFF_TOPIC_ANSWER)}
 
 
 # ---------- deleting, completing and analysing ----------
