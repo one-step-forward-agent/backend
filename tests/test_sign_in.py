@@ -89,7 +89,7 @@ async def test_sign_up_with_google_creates_the_account_and_the_calendar_connects
 async def test_sign_up_needs_consent(browser, services):
     refused = await browser.post("/auth/oauth/google/start", json={"mode": "signup", "return_to": ONBOARDING})
     assert refused.status_code == 400 and "согласие" in refused.json()["detail"]
-    assert (await browser.post("/auth/oauth/notion/start", json={"mode": "login"})).status_code == 404
+    assert (await browser.post("/auth/oauth/apple/start", json={"mode": "login"})).status_code == 404
 
 
 async def test_password_account_logs_in_with_google_of_the_same_email(browser, client, services, google_account):

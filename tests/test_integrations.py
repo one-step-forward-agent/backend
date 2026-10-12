@@ -26,6 +26,9 @@ class FakeServices:
         self.calls: list[tuple[str, str]] = []
         self.created: dict[str, list] = {"google": [], "notion": [], "apple": []}
         self.atlassian_profile = True
+        # The person who connects Notion, as Notion's token response names them
+        self.notion_owner = {"id": "n-olga", "name": "Ольга", "person": {"email": "olga@notion.so"}}
+        self.atlassian_me = {"account_id": "atl-olga", "email": "olga@corp.com", "name": "Ольга", "email_verified": True}
         self.google_profile = {"sub": "g-olga", "email": "olga@gmail.com", "email_verified": True, "name": "Ольга"}
         # What the user allowed on Google's consent page; Google lets them untick the calendar
         self.google_scope = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly"
@@ -70,7 +73,7 @@ class FakeServices:
         # Notion
         if url == "https://api.notion.com/v1/oauth/token":
             assert request.headers["Authorization"] == "Basic " + base64.b64encode(b"n-client:n-secret").decode()
-            return httpx.Response(200, json={"access_token": "n-1", "bot_id": "bot-1", "workspace_name": "Olga WS", "owner": {"type": "user", "user": {"person": {"email": "olga@notion.so"}}}})
+            return httpx.Response(200, json={"access_token": "n-1", "bot_id": "bot-1", "workspace_name": "Olga WS", "owner": {"type": "user", "user": self.notion_owner}})
         if url.startswith("https://api.notion.com/"):
             assert request.headers["Authorization"] == "Bearer n-1"
             if url.endswith("/v1/users/me"):
@@ -99,7 +102,7 @@ class FakeServices:
         if url == "https://api.atlassian.com/oauth/token/accessible-resources":
             return httpx.Response(200, json=[{"id": "cloud-1", "url": "https://olga.atlassian.net", "name": "Olga"}])
         if url == "https://api.atlassian.com/me":
-            return httpx.Response(200, json={"email": "olga@corp.com"}) if self.atlassian_profile else httpx.Response(403)
+            return httpx.Response(200, json=self.atlassian_me) if self.atlassian_profile else httpx.Response(403)
         if url.startswith("https://api.atlassian.com/ex/jira/cloud-1/"):
             if request.headers["Authorization"] != f"Bearer {self.jira_token}":
                 return httpx.Response(401, json={"message": "expired"})

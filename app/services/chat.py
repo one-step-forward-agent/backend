@@ -106,6 +106,13 @@ ACTION_CLAIM = re.compile(
     r"|удален[ыо]?|удалён[ыо]?|перенесен[ыо]?|перенесён[ыо]?|отменен[ыо]?|отменён[ыо]?)\b",
     re.I,
 )
+# An answer about something else ("кто изменил ход истории?") uses these words too: a claim is about the calendar
+CALENDAR_WORDS = re.compile(r"задач|встреч|событи|календар|напомина|дел[оа]\b|план|созвон|черновик", re.I)
+CLAIM_ONLY_LIMIT = 80
+OFF_TOPIC_ANSWER = (
+    "Я лучше всего помогаю с планами: добавить задачу, перенести встречу, напомнить о деле или разобрать загрузку недели. "
+    "Напишите, например, «созвон с Олей завтра в 15:00» или «что у меня на завтра?»."
+)
 HONEST_ANSWER = (
     "Я ничего не меняла в календаре. Напишите, что сделать, — например, «удали встречу с Олей», "
     "«перенеси отчёт на пятницу» или «отметь отчёт выполненным», и я покажу изменение на подтверждение."
@@ -1486,9 +1493,16 @@ async def extract_items(text: str, tz: ZoneInfo, history: str, calendar: str = "
     return items, result.get("answer"), result.get("intent")
 
 
+def claims_action(answer: str | None) -> bool:
+    """The answer says the calendar was changed: "Удалила встречу", or just "Готово, перенесла"."""
+    if not answer or not ACTION_CLAIM.search(answer):
+        return False
+    return bool(CALENDAR_WORDS.search(answer)) or len(answer) <= CLAIM_ONLY_LIMIT
+
+
 def honest(answer: str | None) -> str | None:
     """The model may not report changes it cannot make; such a reply is replaced with the truth."""
-    if answer and ACTION_CLAIM.search(answer):
+    if claims_action(answer):
         logger.warning("Dropped an assistant reply that claimed an action")
         return HONEST_ANSWER
     return answer
@@ -1577,19 +1591,29 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> d
             return {**reply, "note": join_text(reply.get("note"), tags_note(created))} if created else reply
         # At night "завтра" is ambiguous: the tasks wait for confirmation with the date spelled out
         return proposal(draft, tz, answer=join_text(warning, honest(answer)), note=tags_note(created))
-    if not answer and settings.llm_enabled:
+    if answer:
+        return {"kind": "answer", "text": honest(answer)}
+    return await small_talk(session, user, text, tz, history)
+
+
+async def small_talk(session: AsyncSession, user: User, text: str, tz: ZoneInfo, history: str | None = None) -> dict:
+    """A message that is not about the plan ("как дела?", "кто написал «Войну и мир»?") still gets an answer:
+    the model talks, and if it cannot, the chat says what it helps with instead of failing."""
+    answer = None
+    if settings.llm_enabled:
         from services.gigachat import GigaChatClient
 
         try:
             from app.services import insights
 
+            if history is None:
+                history = await recent_context(session, user.id)
             calendar = await calendar_context(session, user, tz)
             known = insights.habits_text(await insights.habits(session, user, datetime.now(tz)))
             answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name, calendar, known)
         except Exception:
             logger.exception("GigaChat chat reply failed")
-    answer = honest(answer)
-    return {"kind": "answer", "text": answer} if answer else {"kind": "nothing"}
+    return {"kind": "answer", "text": honest(answer) or OFF_TOPIC_ANSWER}
 
 
 # ---------- deleting, completing and analysing ----------

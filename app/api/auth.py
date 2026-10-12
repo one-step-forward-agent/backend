@@ -250,11 +250,6 @@ def _oauth_state(user_id: int, return_to: str | None = None, mode: str = "connec
     return f"{payload}.{signature}"
 
 
-def _validate_oauth_state(state: str) -> tuple[int, str | None]:
-    data = _state_data(state)
-    return data["user_id"], data["return_to"]
-
-
 def _state_data(state: str) -> dict:
     """The signed state: user_id, return_to, mode and tz."""
     try:
@@ -318,7 +313,7 @@ def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: s
 NOTION_VERSION = "2022-06-28"
 
 
-def notion_authorization_url(user_id: int, return_to: str | None = None) -> str:
+def notion_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
     """Формирует ссылку на страницу авторизации Notion OAuth."""
     if not settings.notion_client_id:
         raise HTTPException(status_code=503, detail="Notion OAuth is not configured")
@@ -328,7 +323,7 @@ def notion_authorization_url(user_id: int, return_to: str | None = None) -> str:
             "redirect_uri": settings.notion_redirect_uri,
             "response_type": "code",
             "owner": "user",
-            "state": _oauth_state(user_id, return_to),
+            "state": _oauth_state(user_id, return_to, mode, tz, consent),
         }
     )
     return f"https://api.notion.com/v1/oauth/authorize?{query}"
@@ -337,7 +332,7 @@ def notion_authorization_url(user_id: int, return_to: str | None = None) -> str:
 JIRA_SCOPES = "read:jira-work read:jira-user offline_access read:me"
 
 
-def jira_authorization_url(user_id: int, return_to: str | None = None) -> str:
+def jira_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
     """Формирует ссылку на страницу авторизации Atlassian OAuth 2.0 (3LO)."""
     if not settings.jira_client_id:
         raise HTTPException(status_code=503, detail="Jira OAuth is not configured")
@@ -347,7 +342,7 @@ def jira_authorization_url(user_id: int, return_to: str | None = None) -> str:
             "client_id": settings.jira_client_id,
             "scope": JIRA_SCOPES,
             "redirect_uri": settings.jira_redirect_uri,
-            "state": _oauth_state(user_id, return_to),
+            "state": _oauth_state(user_id, return_to, mode, tz, consent),
             "response_type": "code",
             "prompt": "consent",
         }
@@ -373,14 +368,20 @@ async def jira_login(user: User = Depends(get_current_user)):
     return {"authorization_url": jira_authorization_url(user.id)}
 
 
-SIGN_IN_URLS = {"google": google_authorization_url, "yandex": yandex_authorization_url}
-SIGN_IN_TITLES = {"google": "Google", "yandex": "Яндекс"}
+SIGN_IN_URLS = {
+    "google": google_authorization_url,
+    "yandex": yandex_authorization_url,
+    "notion": notion_authorization_url,
+    "jira": jira_authorization_url,
+}
+SIGN_IN_TITLES = {"google": "Google", "yandex": "Яндекс", "notion": "Notion", "jira": "Atlassian"}
 OAUTH_START_MAX_PER_IP = 60
 
 
 @session_router.post("/oauth/{provider}/start")
 async def oauth_start(provider: str, payload: OAuthStart, request: Request):
-    """Sign up or log in through Google or Yandex: a link to the provider; the callback creates or finds the user."""
+    """Sign up or log in through Google, Yandex, Notion or Atlassian (Jira): a link to the provider; the callback
+    creates or finds the user."""
     builder = SIGN_IN_URLS.get(provider)
     if not builder:
         raise HTTPException(status_code=404, detail="Вход через этот сервис недоступен")
@@ -430,7 +431,8 @@ async def _callback_user(session: AsyncSession, entry: dict, provider: str, subj
     """The Dayla user of a callback. Connecting: the logged-in user. Logging in or signing up: the user this provider
     account signed in before, or whose email it is (a password account gets this way of signing in too), or a new
     account with the provider's email when the user accepted the terms. `email` is passed only when the provider
-    has verified it: Google and Yandex confirm the address belongs to the account, as a password reset by email would."""
+    has verified it: Google, Yandex, Notion and Atlassian confirm the address belongs to the account, as a password
+    reset by email would."""
     if entry["mode"] == "connect":
         user = await session.get(User, entry["user_id"])
         if not user:
@@ -487,6 +489,7 @@ async def _finish_callback(
     return response
 
 
+NO_JIRA_SITE = "Jira не подключена: у этого аккаунта Atlassian нет доступных сайтов Jira"
 CALENDAR_NOT_GRANTED = "Google Calendar не подключён: на странице Google отметьте доступ к календарю и попробуйте ещё раз"
 
 
@@ -519,6 +522,7 @@ async def google_callback(
             },
         )
     if response.is_error:
+        logger.warning("Google token exchange failed: %s %s", response.status_code, response.text[:500])
         raise HTTPException(status_code=400, detail="Google rejected the authorization code")
     token_data = response.json()
     async with httpx.AsyncClient(timeout=15) as client:
@@ -610,6 +614,7 @@ async def yandex_callback(
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
     if token_response.is_error:
+        logger.warning("Yandex token exchange failed: %s %s", token_response.status_code, token_response.text[:500])
         raise HTTPException(status_code=400, detail="Yandex rejected the authorization code")
     token_data = token_response.json()
 
@@ -682,19 +687,10 @@ async def notion_callback(
     if not settings.notion_client_id or not settings.notion_client_secret:
         raise HTTPException(status_code=503, detail="Notion OAuth is not configured")
 
-    user_id, return_to = _validate_oauth_state(state)
-
-    # Та же проверка, что и в Google/Yandex:
-    # подключение возможно только для аккаунта, залогиненного в браузере.
-    try:
-        session_user_id = decode_access_token(access_cookie or "")
-    except (jwt.InvalidTokenError, ValueError):
-        session_user_id = None
-    if session_user_id is None:
-        next_path = return_to or "/app/integrations"
-        return RedirectResponse(url=f"/login?next={quote(next_path, safe='/')}", status_code=303)
-    if session_user_id != user_id:
-        raise HTTPException(status_code=403, detail="Ссылка подключения Notion создана для другого аккаунта Dayla")
+    # Connecting links Notion only to the account logged in in this browser; signing up or logging in finds the user
+    entry = _callback_entry(state, access_cookie, "Notion")
+    if isinstance(entry, RedirectResponse):
+        return entry
 
     # 1. Обмен authorization code на access_token.
     #    Notion требует Basic Auth: base64(client_id:client_secret).
@@ -718,22 +714,27 @@ async def notion_callback(
             },
         )
     if token_response.is_error:
+        logger.warning("Notion token exchange failed: %s %s", token_response.status_code, token_response.text[:500])
         raise HTTPException(status_code=400, detail="Notion rejected the authorization code")
     token_data = token_response.json()
 
-    # 2. The token response names the workspace and the person who connected it; the email is only a label,
-    #    and there is none when the integration is owned by the workspace itself.
+    # 2. The token response names the person who connected it: their Notion user id signs in, and Notion's email
+    #    (confirmed at sign-up) makes the account. A workspace-owned integration has no person.
     owner = (token_data.get("owner") or {}).get("user") or {}
-    email = (owner.get("person") or {}).get("email")
-    if not email:
-        workspace = token_data.get("workspace_name") or "Notion Workspace"
-        email = f"{workspace} ({token_data.get('bot_id', 'unknown')})"
+    notion_email = (owner.get("person") or {}).get("email")
+    try:
+        user = await _callback_user(session, entry, "notion", owner.get("id"), notion_email, owner.get("name"))
+    except SignInRefused as refused:
+        await session.rollback()
+        return refused.redirect()
+    user_id = user.id
+    if entry["mode"] == "login":
+        await session.commit()
+        return await _finish_callback(session, entry, user_id, "notion")
+    # The email only labels the connection
+    email = notion_email or f"{token_data.get('workspace_name') or 'Notion Workspace'} ({token_data.get('bot_id', 'unknown')})"
 
     # 3. Сохраняем интеграцию.
-    user = await session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="Пользователь Dayla не найден")
-
     integration = await session.scalar(
         select(Integration).where(Integration.user_id == user_id, Integration.provider == "notion")
     )
@@ -760,11 +761,7 @@ async def notion_callback(
     await session.commit()
     # 5. Календарь "primary" создаёт синхронизация — сразу импортируем записи выбранных баз.
     await first_sync(session, user, integration)
-
-    if return_to:
-        separator = "&" if "?" in return_to else "?"
-        return RedirectResponse(url=f"{return_to}{separator}connected=notion", status_code=303)
-    return RedirectResponse(url="/?connected=notion", status_code=303)
+    return await _finish_callback(session, entry, user_id, "notion")
 
 
 @jira_router.get("/callback")
@@ -782,17 +779,9 @@ async def jira_callback(
     if not settings.jira_client_id or not settings.jira_client_secret:
         raise HTTPException(status_code=503, detail="Jira OAuth is not configured")
 
-    user_id, return_to = _validate_oauth_state(state)
-
-    try:
-        session_user_id = decode_access_token(access_cookie or "")
-    except (jwt.InvalidTokenError, ValueError):
-        session_user_id = None
-    if session_user_id is None:
-        next_path = return_to or "/app/integrations"
-        return RedirectResponse(url=f"/login?next={quote(next_path, safe='/')}", status_code=303)
-    if session_user_id != user_id:
-        raise HTTPException(status_code=403, detail="Ссылка подключения Jira создана для другого аккаунта Dayla")
+    entry = _callback_entry(state, access_cookie, "Jira")
+    if isinstance(entry, RedirectResponse):
+        return entry
 
     # 1. Обмен authorization code на access_token.
     async with httpx.AsyncClient(timeout=15) as client:
@@ -808,42 +797,47 @@ async def jira_callback(
             headers={"Content-Type": "application/json"},
         )
     if token_response.is_error:
+        logger.warning("Atlassian token exchange failed: %s %s", token_response.status_code, token_response.text[:500])
         raise HTTPException(status_code=400, detail="Atlassian rejected the authorization code")
     token_data = token_response.json()
 
-    # 2. Получаем список сайтов (cloudid), к которым дан доступ.
-    async with httpx.AsyncClient(timeout=15) as client:
-        resources_response = await client.get(
-            "https://api.atlassian.com/oauth/token/accessible-resources",
-            headers={"Authorization": f"Bearer {token_data['access_token']}"},
-        )
-    if resources_response.is_error:
-        raise HTTPException(status_code=400, detail="Failed to fetch accessible Jira resources")
-    resources = resources_response.json()
-    if not resources:
-        raise HTTPException(status_code=400, detail="No accessible Jira sites found")
-    # Берём первый сайт (Resource-level доступ)
-    cloud_id = resources[0]["id"]
-    site_url = resources[0].get("url", "")
-    site_name = resources[0].get("name", "Jira")
-
-    # 3. Профиль пользователя.
+    # 2. Профиль: the Atlassian account id signs in, its email (confirmed by Atlassian) makes the account.
     async with httpx.AsyncClient(timeout=15) as client:
         profile_response = await client.get(
             "https://api.atlassian.com/me",
             headers={"Authorization": f"Bearer {token_data['access_token']}"},
         )
-    # The email only labels the account: without it the site name does
     profile = {} if profile_response.is_error else profile_response.json()
-    email = profile.get("email")
-    if not email:
-        email = f"{site_name} ({cloud_id})"
+    atlassian_email = profile.get("email") if profile.get("email_verified") is not False else None
+    try:
+        user = await _callback_user(session, entry, "jira", profile.get("account_id"), atlassian_email, profile.get("name"))
+    except SignInRefused as refused:
+        await session.rollback()
+        return refused.redirect()
+    user_id = user.id
+    if entry["mode"] == "login":
+        await session.commit()
+        return await _finish_callback(session, entry, user_id, "jira")
+
+    # 3. Получаем список сайтов (cloudid), к которым дан доступ.
+    async with httpx.AsyncClient(timeout=15) as client:
+        resources_response = await client.get(
+            "https://api.atlassian.com/oauth/token/accessible-resources",
+            headers={"Authorization": f"Bearer {token_data['access_token']}"},
+        )
+    resources = [] if resources_response.is_error else resources_response.json()
+    if not resources:
+        # Signing up has made the account already: it stays, only Jira is not connected
+        await session.commit()
+        return await _finish_callback(session, entry, user_id, "jira", error=NO_JIRA_SITE)
+    # Берём первый сайт (Resource-level доступ)
+    cloud_id = resources[0]["id"]
+    site_url = resources[0].get("url", "")
+    site_name = resources[0].get("name", "Jira")
+    # The email only labels the connection: without it the site name does
+    email = profile.get("email") or f"{site_name} ({cloud_id})"
 
     # 4. Сохраняем интеграцию.
-    user = await session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="Пользователь Dayla не найден")
-
     integration = await session.scalar(
         select(Integration).where(Integration.user_id == user_id, Integration.provider == "jira")
     )
@@ -878,11 +872,7 @@ async def jira_callback(
     await session.commit()
     # Календарь "primary" создаёт синхронизация — сразу импортируем задачи со сроком.
     await first_sync(session, user, integration)
-
-    if return_to:
-        separator = "&" if "?" in return_to else "?"
-        return RedirectResponse(url=f"{return_to}{separator}connected=jira", status_code=303)
-    return RedirectResponse(url="/?connected=jira", status_code=303)
+    return await _finish_callback(session, entry, user_id, "jira")
 
 
 @google_router.post("/disconnect")

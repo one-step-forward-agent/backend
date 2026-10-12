@@ -1,6 +1,7 @@
+import calendar
 import html
 import secrets
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, bindparam, func, or_, select, text, update
@@ -30,6 +31,11 @@ CUSTOM_KIND = "custom"
 CUSTOM_GRACE = timedelta(hours=12)
 MAX_CUSTOM_AHEAD = timedelta(days=366)
 MAX_PENDING_CUSTOM = 100
+# A repeating reminder ("каждый день в 9", "по будням", "каждые 2 часа"): after each one the next is queued
+REPEATS = ("daily", "weekdays", "weekly", "monthly")
+MIN_REPEAT_MINUTES = 15
+MAX_REPEAT_MINUTES = 24 * 60
+WEEKDAYS_EVERY = ["каждый понедельник", "каждый вторник", "каждую среду", "каждый четверг", "каждую пятницу", "каждую субботу", "каждое воскресенье"]
 
 LEGACY_EVENTS = text(
     "UPDATE events SET user_id = :user_id, calendar_id = :calendar_id, start_at = starts_at, "
@@ -277,8 +283,11 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
             notification.status = NotificationStatus.FAILED
             notification.error = "Telegram is not linked"
             continue
+        repeating = notification.kind == CUSTOM_KIND and is_repeating(notification.payload)
         if notification.expires_at and notification.expires_at <= now:
             notification.status = NotificationStatus.EXPIRED
+            if repeating:
+                await queue_next(session, notification, user, now)
             continue
         local_time = now.astimezone(ZoneInfo(user_timezone(user))).time()
         # A test and a reminder the user asked for at a set time are sent even in quiet hours
@@ -287,6 +296,8 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
         notification.status = NotificationStatus.SENDING
         notification.claimed_at = now
         notification.attempts += 1
+        if repeating:
+            await queue_next(session, notification, user, now)
         claimed.append(
             {
                 "id": notification.id,
@@ -406,23 +417,96 @@ class ReminderError(ValueError):
     pass
 
 
-def custom_text(text: str) -> str:
-    return f"🔔 <b>Напоминание</b>\n\n{html.escape(text)}"
+def custom_text(text: str, repeat: str | None = None) -> str:
+    return f"🔔 <b>Напоминание</b>\n\n{html.escape(text)}" + (f"\n\n🔁 {html.escape(repeat)}" if repeat else "")
+
+
+def repeat_label(payload: dict | None, moment: datetime) -> str | None:
+    """"каждый день в 09:00", "по будням в 09:00", "каждую пятницу в 18:00", "каждые 2 часа"; None for a one-off reminder."""
+    payload = payload or {}
+    every = payload.get("every")
+    if every:
+        if every % 60 == 0:
+            hours = every // 60
+            return "каждый час" if hours == 1 else f"каждые {hours} {plural(hours, 'час', 'часа', 'часов')}"
+        return f"каждые {every} {plural(every, 'минуту', 'минуты', 'минут')}"
+    at = f"в {moment:%H:%M}"
+    return {
+        "daily": f"каждый день {at}",
+        "weekdays": f"по будням {at}",
+        "weekly": f"{WEEKDAYS_EVERY[moment.weekday()]} {at}",
+        "monthly": f"каждый месяц {payload.get('day') or moment.day}-го {at}",
+    }.get(payload.get("repeat"))
+
+
+def advance(moment: datetime, payload: dict) -> datetime:
+    """The next time of a repeating reminder after `moment` (local time: "every day at 9" stays at 9 across DST)."""
+    if payload.get("every"):
+        return (moment + timedelta(minutes=payload["every"])).astimezone(moment.tzinfo)
+    repeat, clock = payload.get("repeat"), moment.timetz().replace(tzinfo=None)
+    day = moment.date()
+    if repeat == "monthly":
+        year, month = (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
+        wanted = payload.get("day") or day.day
+        day = date(year, month, min(wanted, calendar.monthrange(year, month)[1]))
+    elif repeat == "weekly":
+        day += timedelta(days=7)
+    else:
+        day += timedelta(days=1)
+        while repeat == "weekdays" and day.weekday() >= 5:
+            day += timedelta(days=1)
+    return datetime.combine(day, clock, moment.tzinfo)
+
+
+def is_repeating(payload: dict | None) -> bool:
+    return bool(payload and (payload.get("every") or payload.get("repeat") in REPEATS))
+
+
+async def queue_next(session: AsyncSession, notification: Notification, user: User, now: datetime) -> None:
+    """A repeating reminder was sent (or missed): the next one waits in the queue, once per series."""
+    payload = notification.payload or {}
+    tz = ZoneInfo(user_timezone(user))
+    moment = notification.scheduled_for.astimezone(tz)
+    for _ in range(10000):
+        moment = advance(moment, payload)
+        if moment > now:
+            break
+    key = f"custom:{user.id}:{payload.get('series')}:{int(moment.timestamp())}"
+    if await session.scalar(select(Notification.id).where(Notification.dedupe_key == key)):
+        return
+    session.add(
+        Notification(
+            user_id=user.id,
+            kind=CUSTOM_KIND,
+            dedupe_key=key,
+            text=notification.text,
+            payload=payload,
+            scheduled_for=moment.astimezone(timezone.utc),
+            expires_at=moment.astimezone(timezone.utc) + min(CUSTOM_GRACE, timedelta(minutes=payload.get("every") or 24 * 60)),
+            status=NotificationStatus.PENDING,
+            attempts=0,
+        )
+    )
 
 
 def custom_view(notification: Notification, tz: ZoneInfo) -> dict:
     moment = notification.scheduled_for.astimezone(tz)
     today = datetime.now(tz).date()
+    payload = notification.payload or {}
     return {
         "id": notification.id,
-        "text": (notification.payload or {}).get("text") or notification.text,
+        "text": payload.get("text") or notification.text,
         "at": moment.isoformat(),
         "label": f"{relative_day(moment.date(), today)} в {moment:%H:%M}",
+        "repeat": repeat_label(payload, moment) if is_repeating(payload) else None,
     }
 
 
-async def create_custom(session: AsyncSession, user: User, text: str, moment: datetime) -> Notification:
-    """A reminder at `moment` sent to Telegram; raises ReminderError when it cannot be delivered."""
+async def create_custom(
+    session: AsyncSession, user: User, text: str, moment: datetime, repeat: str | None = None, every: int | None = None
+) -> Notification:
+    """A reminder at `moment` sent to Telegram, once or again and again: `repeat` is one of REPEATS, `every` is
+    a period in minutes. Raises ReminderError when it cannot be delivered."""
     text = " ".join(str(text or "").split()).strip(" .")[:500]
     if not text:
         raise ReminderError("Не понятно, о чём напомнить")
@@ -431,6 +515,8 @@ async def create_custom(session: AsyncSession, user: User, text: str, moment: da
         raise ReminderError("Это время уже прошло")
     if moment > now + MAX_CUSTOM_AHEAD:
         raise ReminderError("Напоминание можно поставить не дальше чем на год вперёд")
+    if every is not None and not MIN_REPEAT_MINUTES <= every <= MAX_REPEAT_MINUTES:
+        raise ReminderError(f"Повторять можно не чаще чем раз в {MIN_REPEAT_MINUTES} минут и не реже чем раз в сутки")
     if not user.telegram_chat_id:
         raise ReminderError("Telegram не подключён: напоминания приходят в Telegram-бот Dayla")
     pending = await session.scalar(
@@ -442,14 +528,27 @@ async def create_custom(session: AsyncSession, user: User, text: str, moment: da
         raise ReminderError("Слишком много активных напоминаний — отмените ненужные")
     moment = max(moment, now)
     text = text[:1].upper() + text[1:]
+    series = secrets.token_hex(8)
+    payload: dict = {"text": text}
+    if every:
+        payload |= {"every": every, "series": series}
+    elif repeat in REPEATS:
+        local = moment.astimezone(ZoneInfo(user_timezone(user)))
+        if repeat == "weekdays" and local.weekday() >= 5:
+            # "по будням в 9" said on Saturday starts on Monday
+            local = datetime.combine(local.date() + timedelta(days=7 - local.weekday()), local.timetz().replace(tzinfo=None), local.tzinfo)
+            moment = local.astimezone(timezone.utc)
+        payload |= {"repeat": repeat, "series": series, **({"day": local.day} if repeat == "monthly" else {})}
+    local = moment.astimezone(ZoneInfo(user_timezone(user)))
     notification = Notification(
         user_id=user.id,
         kind=CUSTOM_KIND,
-        dedupe_key=f"custom:{user.id}:{secrets.token_hex(8)}",
-        text=custom_text(text),
-        payload={"text": text},
+        # The ones after it are custom:<user>:<series>:<time> (see queue_next)
+        dedupe_key=f"custom:{user.id}:{series}",
+        text=custom_text(text, repeat_label(payload, local) if is_repeating(payload) else None),
+        payload=payload,
         scheduled_for=moment,
-        expires_at=moment + CUSTOM_GRACE,
+        expires_at=moment + (min(CUSTOM_GRACE, timedelta(minutes=every)) if every else CUSTOM_GRACE),
         status=NotificationStatus.PENDING,
         attempts=0,
     )
@@ -475,7 +574,19 @@ async def cancel_custom(session: AsyncSession, user: User, notification_id: int)
     notification = await session.get(Notification, notification_id)
     if not notification or notification.user_id != user.id or notification.kind != CUSTOM_KIND:
         return None
-    if notification.status != NotificationStatus.PENDING:
+    series = (notification.payload or {}).get("series")
+    if notification.status != NotificationStatus.PENDING and series:
+        # "Отменить" under a repeating reminder that has come already stops the ones after it
+        notification = await session.scalar(
+            select(Notification)
+            .where(
+                Notification.user_id == user.id,
+                Notification.dedupe_key.like(f"custom:{user.id}:{series}:%"),
+                Notification.status == NotificationStatus.PENDING,
+            )
+            .limit(1)
+        )
+    if not notification or notification.status != NotificationStatus.PENDING:
         return None
     notification.status = NotificationStatus.CANCELLED
     await session.flush()

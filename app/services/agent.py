@@ -167,12 +167,20 @@ FUNCTIONS = [
             "properties": {
                 "text": {"type": "string", "description": "О чём напомнить, коротко: «Помыть посуду»"},
                 "in_minutes": {"type": "integer", "description": "Через сколько минут от текущего момента"},
-                "at": {"type": "string", "description": "Когда: слова пользователя («завтра в 9:00», «в 18:30») или YYYY-MM-DDTHH:MM"},
+                "at": {"type": "string", "description": "Когда (первый раз): слова пользователя («завтра в 9:00», «в 18:30») или YYYY-MM-DDTHH:MM"},
+                "repeat": {
+                    "type": "string",
+                    "enum": ["daily", "weekdays", "weekly", "monthly"],
+                    "description": "Повтор, если пользователь просит напоминать регулярно: каждый день, по будням, каждую неделю, каждый месяц",
+                },
+                "every_minutes": {"type": "integer", "description": "Повтор через равные промежутки: «каждые 2 часа» — 120"},
             },
             "required": ["text"],
         },
         "few_shot_examples": [
             {"request": "напомни помыть посуду через 10 минут", "params": {"text": "Помыть посуду", "in_minutes": 10}},
+            {"request": "напоминай каждый день в 9:00 пить витамины", "params": {"text": "Пить витамины", "at": "в 9:00", "repeat": "daily"}},
+            {"request": "напоминай пить воду каждые 2 часа", "params": {"text": "Пить воду", "every_minutes": 120}},
             {"request": "через 2 часа напомни выключить духовку", "params": {"text": "Выключить духовку", "in_minutes": 120}},
             {"request": "напомни завтра в 9:00 позвонить в банк", "params": {"text": "Позвонить в банк", "at": "завтра в 9:00"}},
         ],
@@ -226,6 +234,8 @@ ADVICE_REQUEST = re.compile(
     re.I,
 )
 REMINDER_WORDS = re.compile(r"напомн|напомин|будильник", re.I)
+# The model's repeat is taken only when the user said something about it
+REPEAT_HINT = re.compile(r"кажд|ежедн|еженед|ежемес|ежечас|регулярн|повтор|по\s+будн|по\s+утрам|по\s+вечерам", re.I)
 DELETE_WORDS = re.compile(r"удал|сотр|стер|очист|почист|убер|убра|отмен|не\s+нужн|больше\s+не", re.I)
 
 
@@ -712,22 +722,72 @@ async def complete_events(turn: Turn, args: dict) -> dict:
     return {"status": "Готово: отмечены выполненными.", "titles": [event.title for event in events[:20]], "count": len(events)}
 
 
+EVERY_PERIOD = re.compile(r"кажды[ейх]\s+(\d+)\s*(мин|час)|кажд(?:ый|ые)\s+(полчаса|час)\b|ежечасно", re.I)
+REPEAT_WORDS = (
+    ("weekdays", re.compile(r"по\s+будн|в\s+будни|кажд\w*\s+будн", re.I)),
+    ("weekly", re.compile(r"кажд\w*\s+(?:недел|понедельник|вторник|сред|четверг|пятниц|суббот|воскресень)|еженедельн"
+                          r"|по\s+(?:понедельник|вторник|сред|четверг|пятниц|суббот|воскресень)ам", re.I)),
+    ("monthly", re.compile(r"кажд\w*\s+месяц|ежемесячн", re.I)),
+    ("daily", re.compile(r"кажд\w*\s+(?:день|утро|вечер|ночь)|ежедневн|каждодневн|по\s+утрам|по\s+вечерам", re.I)),
+)
+WEEKDAY_STEMS = ("понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресень")
+
+
+def repeat_of(text: str) -> tuple[str | None, int | None]:
+    """The repeat the user's own words name: ("daily", None), (None, 120) for "каждые 2 часа", or (None, None).
+    The model may miss or mix it up; the words decide."""
+    found = EVERY_PERIOD.search(text)
+    if found:
+        if found.group(1):
+            number = int(found.group(1))
+            return None, number * 60 if found.group(2).lower().startswith("час") else number
+        return None, 30 if (found.group(3) or "").lower() == "полчаса" else 60
+    for repeat, words in REPEAT_WORDS:
+        if words.search(text):
+            return repeat, None
+    return None, None
+
+
+def named_weekday(text: str) -> int | None:
+    found = re.search(r"(?:кажд\w*\s+|по\s+)(понедельник|вторник|сред|четверг|пятниц|суббот|воскресень)", text, re.I)
+    return WEEKDAY_STEMS.index(found.group(1).lower()) if found else None
+
+
 async def create_reminder(turn: Turn, args: dict) -> dict:
     text = args.get("text") if isinstance(args.get("text"), str) else ""
+    repeat, every = repeat_of(turn.text)
+    if repeat is None and every is None:
+        repeat = args.get("repeat") if args.get("repeat") in reminders.REPEATS else None
+        every = as_int(args.get("every_minutes")) if repeat is None and REPEAT_HINT.search(turn.text) else None
     minutes = as_int(args.get("in_minutes"))
     if minutes is not None and minutes > 0:
         moment = datetime.now(turn.tz) + timedelta(minutes=minutes)
     else:
         moment = parse_moment(args.get("at"), turn)
+    if moment is None and every:
+        # "каждые 2 часа" without a time: the first one in one period
+        moment = datetime.now(turn.tz) + timedelta(minutes=every)
     if moment is None:
         return {"error": "Не указано, когда напомнить: передай in_minutes или at (YYYY-MM-DDTHH:MM)."}
+    weekday = named_weekday(turn.text) if repeat == "weekly" else None
+    if weekday is not None and moment.weekday() != weekday:
+        # "каждую пятницу в 18:00": the first one is on the nearest Friday
+        moment += timedelta(days=(weekday - moment.weekday()) % 7)
+        if moment <= datetime.now(turn.tz):
+            moment += timedelta(days=7)
     try:
-        notification = await reminders.create_custom(turn.session, turn.user, text, moment.astimezone(timezone.utc))
+        notification = await reminders.create_custom(turn.session, turn.user, text, moment.astimezone(timezone.utc), repeat, every)
     except reminders.ReminderError as error:
         return {"error": str(error)}
     view = reminders.custom_view(notification, turn.tz)
     turn.reminders.append(view)
-    return {"status": "Напоминание поставлено, бот пришлёт его в Telegram.", "reminder_id": notification.id, "text": view["text"], "when": view["label"]}
+    return {
+        "status": "Напоминание поставлено, бот пришлёт его в Telegram.",
+        "reminder_id": notification.id,
+        "text": view["text"],
+        "when": view["label"],
+        **({"repeat": view["repeat"]} if view["repeat"] else {}),
+    }
 
 
 async def list_reminders(turn: Turn, args: dict) -> dict:
@@ -955,7 +1015,10 @@ async def tags_text(turn: Turn) -> str:
 
 async def reminders_text(turn: Turn) -> str:
     found = await reminders.pending_custom(turn.session, turn.user)
-    return "\n".join(f"[id {item['id']}] {item['label']}: {item['text']}" for item in (reminders.custom_view(row, turn.tz) for row in found[:10])) or "(нет)"
+    return "\n".join(
+        f"[id {item['id']}] {item['label']}{' (' + item['repeat'] + ')' if item['repeat'] else ''}: {item['text']}"
+        for item in (reminders.custom_view(row, turn.tz) for row in found[:10])
+    ) or "(нет)"
 
 
 async def system_prompt(turn: Turn) -> str:
@@ -1066,7 +1129,7 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
         if not call:
             answer = (message.get("content") or "").strip()
             # The model claimed a change without calling a function: once, ask it to do it for real
-            if not corrected and not turn.changed and answer and chat.ACTION_CLAIM.search(answer):
+            if not corrected and not turn.changed and chat.claims_action(answer):
                 corrected = True
                 messages.append({"role": "assistant", "content": answer})
                 messages.append(
@@ -1105,7 +1168,12 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
             return reply
     if answer and not turn.changed:
         answer = chat.honest(answer)
-    return await finish(turn, answer)
+    reply = await finish(turn, answer)
+    if reply["kind"] == "nothing":
+        # The model wrote nothing (a message about something else, an answer its filter dropped): the chat still answers
+        logger.info("Agent gave no answer; the chat model talks instead")
+        return await chat.small_talk(session, user, text, tz)
+    return reply
 
 
 async def by_rules(turn: Turn) -> dict | None:
@@ -1164,7 +1232,10 @@ async def finish(turn: Turn, answer: str | None) -> dict:
         }
     if turn.reminders:
         # The time is the app's: the model's wording about it may be off
-        text = "\n".join(f"Напомню {item['label']}: {item['text']} 🔔" for item in turn.reminders)
+        text = "\n".join(
+            f"Буду напоминать {item['repeat']}: {item['text']} 🔁 Первое — {item['label']}." if item.get("repeat") else f"Напомню {item['label']}: {item['text']} 🔔"
+            for item in turn.reminders
+        )
         return {"kind": "reminder", "reminders": turn.reminders, "text": text}
     if turn.shown and set(turn.tools) <= {"get_events"}:
         return {

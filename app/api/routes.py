@@ -1,8 +1,10 @@
 import hashlib
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Literal
 from uuid import uuid4
 
@@ -588,6 +590,64 @@ async def confirm_assistant_events(payload: AssistantConfirmation, user: User = 
         await session.refresh(event)
     await push_new_events_to_google(session, user.id, created_events)
     return AssistantResponse(answer="События добавлены.", created_events=created_events)
+
+
+FEED_PAST = timedelta(days=60)
+FEED_AHEAD = timedelta(days=400)
+
+
+def _feed_day(moment: datetime, zone: str | None) -> str:
+    """An all-day task's day in its own time zone (the feed writes it as a date)."""
+    try:
+        return moment.astimezone(ZoneInfo(zone or "UTC")).isoformat()
+    except (ValueError, KeyError):
+        return moment.isoformat()
+
+
+def _feed_path(user: User) -> str:
+    return f"/api/calendar/feed/{user.calendar_feed_token}.ics"
+
+
+@router.post("/calendar/feed")
+async def calendar_feed_link(reset: bool = False, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """The link of the user's private calendar feed: Samsung Calendar (through ICSx⁵), Outlook and other apps
+    subscribe to it. reset=true makes a new link, and the old one stops working."""
+    if reset or not user.calendar_feed_token:
+        user.calendar_feed_token = secrets.token_urlsafe(32)
+        await session.commit()
+    return {"path": _feed_path(user)}
+
+
+@router.get("/calendar/feed/{token}.ics")
+async def calendar_feed(token: str, session: AsyncSession = Depends(get_session)):
+    """The feed itself: no session, the secret in the link is the access. Tasks from two months back to a year ahead."""
+    user = await session.scalar(select(User).where(User.calendar_feed_token == token, User.is_active.is_(True))) if len(token) >= 32 else None
+    if not user:
+        raise HTTPException(status_code=404, detail="Ссылка на календарь устарела")
+    now = datetime.now(timezone.utc)
+    events = await session.scalars(
+        select(Event)
+        .where(Event.user_id == user.id, Event.end_at >= now - FEED_PAST, Event.start_at < now + FEED_AHEAD, Event.status != "cancelled")
+        .order_by(Event.start_at)
+        .limit(5000)
+    )
+    from services.calendar import build_calendar
+
+    content = build_calendar(
+        [
+            {
+                "uid": f"dayla-{event.id}@dayla.tech",
+                "title": ("✓ " if event.completed_at else "") + event.title,
+                "starts_at": _feed_day(event.start_at, event.timezone) if event.all_day else event.start_at.isoformat(),
+                "ends_at": (_feed_day(event.end_at, event.timezone) if event.all_day else event.end_at.isoformat()) if event.end_at else None,
+                "all_day": event.all_day,
+                "description": event.description,
+                "location": event.location,
+            }
+            for event in events
+        ]
+    )
+    return Response(content=content, media_type="text/calendar; charset=utf-8", headers={"Cache-Control": "private, max-age=300"})
 
 
 @router.get("/calendar/export.ics")

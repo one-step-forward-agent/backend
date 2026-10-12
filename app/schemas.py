@@ -4,7 +4,7 @@ from datetime import date, datetime, time
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from app.models.models import Priority, Provider
 
@@ -54,7 +54,8 @@ class LoginRequest(Credentials):
 
 
 class OAuthStart(BaseModel):
-    """Sign up or log in through Google or Yandex. Signing up also connects the calendar."""
+    """Sign up or log in through Google, Yandex, Notion or Jira. Signing up also connects the service (not Google:
+    its calendar is a step of its own)."""
 
     mode: Literal["signup", "login"]
     return_to: str | None = Field(default=None, max_length=300)
@@ -186,6 +187,14 @@ class EventRead(EventCreate):
     external_id: str | None = None
     series_id: str | None = None
     completed_at: datetime | None = None
+
+    @computed_field
+    @property
+    def recurrence(self) -> str | None:
+        """The repeat in words ("каждый день", "по будням") for the task's card and list."""
+        from app.services.dates import describe_rrule
+
+        return describe_rrule(self.recurrence_rule)
 
 
 TAG_COLORS = ("indigo", "blue", "green", "amber", "red", "pink", "violet", "slate")
