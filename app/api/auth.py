@@ -233,11 +233,14 @@ def safe_return_path(path: str | None) -> str | None:
     return path
 
 
-def _oauth_state(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None) -> str:
-    """user_id is 0 when signing up or logging in: the callback finds or creates the user."""
+def _oauth_state(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
+    """user_id is 0 when signing up or logging in: the callback finds or creates the user.
+    consent: the user accepted the terms before leaving, so a login may create the account too."""
     data = {"user_id": user_id, "expires": int(datetime.now(timezone.utc).timestamp()) + 600}
     if mode != "connect":
         data["mode"] = mode
+    if consent:
+        data["consent"] = 1
     if tz:
         data["tz"] = tz
     if safe_return_path(return_to):
@@ -265,12 +268,18 @@ def _state_data(state: str) -> dict:
         mode = data.get("mode", "connect")
         if mode not in ("connect", "signup", "login"):
             raise ValueError
-        return {"user_id": int(data["user_id"]), "return_to": safe_return_path(data.get("return_to")), "mode": mode, "tz": data.get("tz")}
+        return {
+            "user_id": int(data["user_id"]),
+            "return_to": safe_return_path(data.get("return_to")),
+            "mode": mode,
+            "tz": data.get("tz"),
+            "consent": data.get("consent") == 1 or mode == "signup",
+        }
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state") from None
 
 
-def google_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None) -> str:
+def google_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
     if not settings.google_client_id:
         raise HTTPException(status_code=503, detail="Google OAuth is not configured")
     params = {
@@ -280,16 +289,17 @@ def google_authorization_url(user_id: int, return_to: str | None = None, mode: s
         "scope": " ".join(("openid", "email", "profile", *CALENDAR_SCOPES)),
         "access_type": "offline",
         "prompt": "select_account consent",
-        "state": _oauth_state(user_id, return_to, mode, tz),
+        "state": _oauth_state(user_id, return_to, mode, tz, consent),
     }
-    if mode == "login":
-        # Logging in asks only for the account, not for the calendar
+    if mode != "connect":
+        # Signing up and logging in ask only for the account (name, email, profile): these scopes need no Google
+        # verification, so they work for everyone at once. The calendar is connected separately, by its own button.
         params.update(scope="openid email profile", prompt="select_account")
         del params["access_type"]
     query = urlencode(params)
     return f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
 
-def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None) -> str:
+def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
     """Формирует ссылку на страницу авторизации Яндекс ID."""
     if not settings.yandex_client_id:
         raise HTTPException(status_code=503, detail="Yandex OAuth is not configured")
@@ -300,7 +310,7 @@ def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: s
             "redirect_uri": settings.yandex_redirect_uri,
             "response_type": "code",
             "scope": "login:email" if mode == "login" else "calendar:all login:email",
-            "state": _oauth_state(user_id, return_to, mode, tz),
+            "state": _oauth_state(user_id, return_to, mode, tz, consent),
         }
     )
     return f"https://oauth.yandex.ru/authorize?{query}"
@@ -377,7 +387,7 @@ async def oauth_start(provider: str, payload: OAuthStart, request: Request):
     if payload.mode == "signup" and not payload.consent:
         raise HTTPException(status_code=400, detail="Для регистрации примите пользовательское соглашение и дайте согласие на обработку персональных данных")
     ratelimit.hit(f"oauth-start:{ratelimit.client_ip(request)}", OAUTH_START_MAX_PER_IP, REGISTER_WINDOW_SECONDS, "Слишком много попыток, попробуйте позже")
-    return {"authorization_url": builder(0, payload.return_to, payload.mode, payload.timezone)}
+    return {"authorization_url": builder(0, payload.return_to, payload.mode, payload.timezone, payload.consent)}
 
 
 class SignInRefused(Exception):
@@ -417,9 +427,10 @@ async def _link_identity(session: AsyncSession, provider: str, subject: str | No
 
 
 async def _callback_user(session: AsyncSession, entry: dict, provider: str, subject: str | None, email: str | None, name: str | None) -> User:
-    """The Dayla user of a callback. Connecting: the logged-in user. Logging in: the user this provider account
-    signed in before, or whose email it is. Signing up: the same, or a new account with the provider's email.
-    `email` is passed only when the provider has verified it."""
+    """The Dayla user of a callback. Connecting: the logged-in user. Logging in or signing up: the user this provider
+    account signed in before, or whose email it is (a password account gets this way of signing in too), or a new
+    account with the provider's email when the user accepted the terms. `email` is passed only when the provider
+    has verified it: Google and Yandex confirm the address belongs to the account, as a password reset by email would."""
     if entry["mode"] == "connect":
         user = await session.get(User, entry["user_id"])
         if not user:
@@ -440,33 +451,37 @@ async def _callback_user(session: AsyncSession, entry: dict, provider: str, subj
         raise SignInRefused(f"{title} не сообщил подтверждённый email. Зарегистрируйтесь по email.", "/register", return_to)
     existing = await session.scalar(select(User).where(User.email_hash.in_(email_lookup(email))))
     if existing:
-        # Not logged in by email alone: whoever controls a provider account with this email would get the Dayla account
-        if entry["mode"] == "signup":
-            message = f"Аккаунт {email} уже есть. Войдите в него — и сервис подключится."
-        else:
-            message = f"Аккаунт {email} создан с паролем. Войдите по паролю — потом вход через {title} тоже заработает."
-        raise SignInRefused(message, "/login", return_to)
-    if entry["mode"] == "login":
+        if not existing.is_active:
+            raise SignInRefused("Аккаунт отключён.", "/login", None)
+        # The account of this email, made with a password or another service: from now on this one signs in too
+        session.add(UserIdentity(user_id=existing.id, provider=provider, subject=subject))
+        return existing
+    if not entry["consent"]:
         raise SignInRefused(f"Аккаунта {email} ещё нет. Зарегистрируйтесь — это займёт минуту.", "/register", None)
     user = User(email=email, name=(name or "").strip()[:200] or None, timezone=entry["tz"] or settings.default_timezone, is_active=True)
     session.add(user)
     await session.flush()
     session.add(UserIdentity(user_id=user.id, provider=provider, subject=subject))
+    # A new account goes through onboarding first
+    entry["created"] = True
     return user
 
 
-async def _finish_callback(session: AsyncSession, entry: dict, user_id: int, provider: str, error: str | None = None) -> RedirectResponse:
+async def _finish_callback(
+    session: AsyncSession, entry: dict, user_id: int, provider: str, error: str | None = None, connected: bool = True
+) -> RedirectResponse:
     """The redirect back to the site; signing up or logging in also starts the Dayla session.
-    `error`: the account is there, but the service was not connected — the page shows why."""
+    `error`: the account is there, but the service was not connected — the page shows why.
+    connected=False: only the account (Google sign-up), the page connects the services it was asked to."""
     return_to = entry["return_to"]
-    result = urlencode({"error": error}) if error else f"connected={provider}"
+    result = urlencode({"error": error}) if error else f"connected={provider}" if connected else ""
     if entry["mode"] == "login":
-        response = RedirectResponse(url=return_to or "/app", status_code=303)
+        response = RedirectResponse(url="/onboarding/field-of-activity" if entry.get("created") else return_to or "/app", status_code=303)
     elif return_to:
         separator = "&" if "?" in return_to else "?"
-        response = RedirectResponse(url=f"{return_to}{separator}{result}", status_code=303)
+        response = RedirectResponse(url=f"{return_to}{separator}{result}" if result else return_to, status_code=303)
     else:
-        response = RedirectResponse(url=f"/?{result}", status_code=303)
+        response = RedirectResponse(url=f"/?{result}" if result else "/", status_code=303)
     if entry["mode"] != "connect":
         _set_session_cookies(response, await _issue_tokens(session, user_id))
     return response
@@ -521,9 +536,10 @@ async def google_callback(
         await session.rollback()
         return refused.redirect()
     user_id = user.id
-    if entry["mode"] == "login":
+    if entry["mode"] != "connect":
+        # Signing up with Google makes the account only: the calendar is connected by its own button
         await session.commit()
-        return await _finish_callback(session, entry, user_id, "google")
+        return await _finish_callback(session, entry, user_id, "google", connected=entry["mode"] == "login")
     # Google lets the user untick the calendar on its consent page: then there is no calendar to connect
     if not set(CALENDAR_SCOPES) <= set(token_data.get("scope", "").split()):
         await session.commit()
