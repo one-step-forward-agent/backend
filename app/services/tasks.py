@@ -221,6 +221,10 @@ async def create_tasks(
             break
         moments = occurrences(rule, begins, now + SERIES_HORIZON, limit=min(MAX_OCCURRENCES, budget)) if rule else [begins]
         group = [_copy(template, moment, ends - begins) for moment in moments or [begins]]
+        if not push_google:
+            # Kept in Dayla only: the Google catch-up leaves them alone
+            for event in group:
+                event.sync_status = "skipped"
         session.add_all(group)
         groups.append(group)
     if not groups:
@@ -255,7 +259,13 @@ async def extend_series(session: AsyncSession, now: datetime, force: bool = Fals
             continue
         first_start = await session.scalar(select(func.min(Event.start_at)).where(Event.series_id == series_id))
         moments = following(latest, first_start, now + SERIES_HORIZON)
-        session.add_all(_copy(latest, moment, latest.end_at - latest.start_at) for moment in moments)
+        copies = [_copy(latest, moment, latest.end_at - latest.start_at) for moment in moments]
+        for copy in copies:
+            # A series is made in Dayla; its sent days say "google", the new ones are Dayla's until sent too
+            if copy.source == "google":
+                copy.source = "local"
+            copy.sync_status = "skipped" if latest.sync_status == "skipped" else "not_synced"
+        session.add_all(copies)
         added += len(moments)
     if added:
         await session.commit()

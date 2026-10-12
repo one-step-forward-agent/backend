@@ -1,5 +1,9 @@
+from datetime import datetime, timezone
+from typing import Literal
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,7 +12,7 @@ from app.core.config import settings
 from app.core.database import get_session
 from app.models.models import Notification, User
 from app.schemas import ReminderSettingsRead, ReminderSettingsUpdate, TelegramLinkResponse, TelegramStatus
-from app.services import reminders
+from app.services import reminders, tasks
 
 router = APIRouter(prefix="/api", tags=["reminders"])
 _bot_username: str | None = None
@@ -90,4 +94,53 @@ async def telegram_unlink(user: User = Depends(get_current_user), session: Async
     user.telegram_chat_id = None
     user.telegram_username = None
     user.telegram_linked_at = None
+    await session.commit()
+
+
+class CustomReminder(BaseModel):
+    """A reminder made on the reminders screen: once, or again and again."""
+
+    text: str = Field(min_length=1, max_length=500)
+    # Local time of the (first) reminder, "YYYY-MM-DDTHH:MM"
+    at: datetime
+    repeat: Literal["daily", "weekdays", "weekly", "monthly"] | None = None
+    every_minutes: int | None = Field(default=None, ge=reminders.MIN_REPEAT_MINUTES, le=reminders.MAX_REPEAT_MINUTES)
+
+
+@router.get("/reminders/custom")
+async def list_custom(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    tz = tasks.local_tz(user)
+    return [reminders.custom_view(item, tz) for item in await reminders.pending_custom(session, user)]
+
+
+async def _create(session: AsyncSession, user: User, payload: CustomReminder) -> dict:
+    tz = tasks.local_tz(user)
+    moment = payload.at if payload.at.tzinfo else payload.at.replace(tzinfo=tz)
+    try:
+        notification = await reminders.create_custom(
+            session, user, payload.text, moment.astimezone(timezone.utc), None if payload.every_minutes else payload.repeat, payload.every_minutes
+        )
+    except reminders.ReminderError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    await session.commit()
+    return reminders.custom_view(notification, tz)
+
+
+@router.post("/reminders/custom", status_code=status.HTTP_201_CREATED)
+async def create_custom(payload: CustomReminder, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return await _create(session, user, payload)
+
+
+@router.put("/reminders/custom/{reminder_id}")
+async def change_custom(reminder_id: int, payload: CustomReminder, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """A changed reminder replaces the old one (the rest of its series too)."""
+    if not await reminders.cancel_custom(session, user, reminder_id):
+        raise HTTPException(status_code=404, detail="Напоминание уже пришло или отменено")
+    return await _create(session, user, payload)
+
+
+@router.delete("/reminders/custom/{reminder_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_custom(reminder_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    if not await reminders.cancel_custom(session, user, reminder_id):
+        raise HTTPException(status_code=404, detail="Напоминание уже пришло или отменено")
     await session.commit()

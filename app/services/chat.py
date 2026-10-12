@@ -806,7 +806,9 @@ def default_calendars(user: User, targets: list[dict]) -> list[str]:
     Notion is a database, not a calendar: tasks go there only when it is ticked."""
     slugs = [item["slug"] for item in targets]
     if user.calendar_targets is not None:
-        return [slug for slug in user.calendar_targets if slug in slugs]
+        # Google, once connected, gets every new task unless it is unticked in that very draft
+        chosen = [slug for slug in user.calendar_targets if slug in slugs]
+        return (["google"] if "google" in slugs and "google" not in chosen else []) + chosen
     return next(([slug] for slug in DEFAULT_CALENDARS if slug in slugs), [])
 
 
@@ -1557,6 +1559,11 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> d
         except agent.AgentFailed:
             # GigaChat is unreachable before anything was done: the rules below still handle the usual requests
             pass
+    from app.services import agent as reminder_rules
+
+    reminder = await reminder_rules.reminder_by_rules(session, user, text, tz)
+    if reminder is not None:
+        return reminder
     # Only the rules' model requests read the conversation as text; the agent reads it itself
     history = await recent_context(session, user.id)
     reply = None

@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
@@ -13,6 +14,7 @@ from app.core.config import settings
 from app.core.database import engine
 from app.core.make_admin import grant_listed
 from app.models import models  # noqa: F401
+from app.services.events import google_catch_up_loop
 
 settings.validate()
 
@@ -30,7 +32,10 @@ WRITES_PER_IP_PER_MINUTE = 120
 async def lifespan(_: FastAPI):
     settings.storage_path.mkdir(parents=True, exist_ok=True)
     await grant_listed(settings.admin_emails)
+    catch_up = asyncio.create_task(google_catch_up_loop()) if settings.google_client_id else None
     yield
+    if catch_up:
+        catch_up.cancel()
     await engine.dispose()
 
 

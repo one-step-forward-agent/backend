@@ -499,6 +499,9 @@ def custom_view(notification: Notification, tz: ZoneInfo) -> dict:
         "at": moment.isoformat(),
         "label": f"{relative_day(moment.date(), today)} в {moment:%H:%M}",
         "repeat": repeat_label(payload, moment) if is_repeating(payload) else None,
+        # For the edit form of the reminders screen
+        "repeat_kind": payload.get("repeat") if payload.get("repeat") in REPEATS else None,
+        "every_minutes": payload.get("every"),
     }
 
 

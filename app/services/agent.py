@@ -722,7 +722,7 @@ async def complete_events(turn: Turn, args: dict) -> dict:
     return {"status": "Готово: отмечены выполненными.", "titles": [event.title for event in events[:20]], "count": len(events)}
 
 
-EVERY_PERIOD = re.compile(r"кажды[ейх]\s+(\d+)\s*(мин|час)|кажд(?:ый|ые)\s+(полчаса|час)\b|ежечасно", re.I)
+EVERY_PERIOD = re.compile(r"кажды[ейх]\s+(\d+)\s*(мин\w*|час\w*)|кажд(?:ый|ые)\s+(полчаса|час)\b|ежечасно", re.I)
 REPEAT_WORDS = (
     ("weekdays", re.compile(r"по\s+будн|в\s+будни|кажд\w*\s+будн", re.I)),
     ("weekly", re.compile(r"кажд\w*\s+(?:недел|понедельник|вторник|сред|четверг|пятниц|суббот|воскресень)|еженедельн"
@@ -788,6 +788,41 @@ async def create_reminder(turn: Turn, args: dict) -> dict:
         "when": view["label"],
         **({"repeat": view["repeat"]} if view["repeat"] else {}),
     }
+
+
+REMINDER_VERB = re.compile(r"(?:поставь(?:те)?\s+)?(?:напомни(?:те)?|напоминай(?:те)?|напоминание)(?:\s+(?:мне|нам))?", re.I)
+WHAT_LEAD = re.compile(r"^(?:о|об|про|что|чтобы|что\s+надо|что\s+нужно)\s+", re.I)
+
+
+async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict | None:
+    """"напомни …" / "напоминай …" set without the model: when it is down or answered without calling create_reminder.
+    The time, the repeat and what to remind of come from the user's words."""
+    if not REMINDER_VERB.search(text) or re.search(r"напоминани[яей]\b.*\?|какие\s+у\s+меня|отмени", text, re.I):
+        return None
+    now = datetime.now(tz)
+    parsed = dates.parse(text, now)
+    what = dates.strip_spans(text, parsed.spans)
+    for pattern in (REMINDER_VERB, EVERY_PERIOD, *(words for _, words in REPEAT_WORDS)):
+        what = pattern.sub(" ", what)
+    what = re.sub(r"\b(?:в|во|на|к|до)\s*$|^\s*(?:в|во|на|к)\s+", " ", " ".join(what.split())).strip(" ,.:;!-—")
+    what = WHAT_LEAD.sub("", what).strip(" ,.:;!-—")
+    args: dict = {"text": what}
+    if parsed.time:
+        moment = datetime.combine(parsed.date or now.date(), parsed.time, tz)
+        if parsed.date is None and moment <= now:
+            moment += timedelta(days=1)
+        args["at"] = moment.strftime("%Y-%m-%dT%H:%M")
+    turn = Turn(session=session, user=user, tz=tz, now=now, text=text)
+    result = await create_reminder(turn, args)
+    if result.get("error"):
+        problem = result["error"]
+        if "in_minutes" in problem:
+            problem = "Когда напомнить? Например: «напомни завтра в 9:00 позвонить в банк» или «напоминай каждый день в 21:00 выпить таблетку»."
+        elif problem == "Не понятно, о чём напомнить":
+            problem = "О чём напомнить? Например: «напомни через 10 минут выключить духовку»."
+        return {"kind": "answer", "text": problem}
+    logger.info("Reminder set by the rules")
+    return await finish(turn, None)
 
 
 async def list_reminders(turn: Turn, args: dict) -> dict:
@@ -1181,6 +1216,9 @@ async def by_rules(turn: Turn) -> dict | None:
     with words instead of a function call: the rule-based handler does what was asked."""
     session, user, text, tz = turn.session, turn.user, turn.text, turn.tz
     reply = None
+    if not turn.reminders and not turn.cancelled and REMINDER_WORDS.search(text) and (reminder := await reminder_by_rules(session, user, text, tz)):
+        # "напомни …" the model answered with words: the reminder is set all the same
+        return reminder if reminder.get("kind") == "reminder" else None
     if chat.is_delete_request(text):
         reply = await chat.delete_request(session, user, text, tz)
     elif chat.is_complete_request(text):

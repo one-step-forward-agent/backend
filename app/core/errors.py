@@ -31,7 +31,8 @@ def plain(detail: object) -> str | None:
     if not isinstance(detail, str) or not re.search(r"[а-яё]", detail, re.I):
         return None
     outside_quotes = re.sub(r"«[^»]*»", "", detail)
-    latin = {word.lower() for word in re.findall(r"[A-Za-z][A-Za-z_-]*", outside_quotes)}
+    # "Telegram-бот": the hyphen joins a known name to a Russian word
+    latin = {word.lower().strip("-_") for word in re.findall(r"[A-Za-z][A-Za-z_-]*", outside_quotes)}
     # Unknown Latin words, status codes, IP addresses, braces and links are internals
     if latin - KNOWN_WORDS or re.search(r"\b[1-5]\d\d\b|\b\d{1,3}(?:\.\d{1,3}){3}\b|[{}<>\[\]]|https?:", outside_quotes):
         return None

@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy import select
@@ -83,6 +85,65 @@ async def push_new_events_to_google(session: AsyncSession, user_id: int, events:
     await session.commit()
     for event in events:
         await session.refresh(event)
+
+
+# Tasks made in Dayla that have not reached Google yet (a series' later days, a moment Google was unreachable)
+# are sent by a loop; tasks the user kept in Dayla only are "skipped" and stay out of it
+CATCH_UP_EVERY = 60
+CATCH_UP_BATCH = 50
+CATCH_UP_PAST = timedelta(days=1)
+CATCH_UP_FRESH = timedelta(days=2)
+DAYLA_SOURCES = ("local", "ai", "manual")
+
+
+async def push_unsent_to_google(session: AsyncSession, user_id: int) -> int:
+    integration = await session.scalar(select(Integration).where(Integration.user_id == user_id, Integration.provider == "google"))
+    if not integration or integration.status != "connected":
+        return 0
+    events = list(
+        await session.scalars(
+            select(Event)
+            .where(
+                Event.user_id == user_id,
+                Event.external_id.is_(None),
+                Event.source.in_(DAYLA_SOURCES),
+                Event.sync_status == "not_synced",
+                Event.end_at >= datetime.now(timezone.utc) - CATCH_UP_PAST,
+                # Only fresh ones: tasks from before Google was connected are not sent all at once
+                Event.created_at >= datetime.now(timezone.utc) - CATCH_UP_FRESH,
+            )
+            .order_by(Event.start_at)
+            .limit(CATCH_UP_BATCH)
+        )
+    )
+    if events:
+        await push_new_events_to_google(session, user_id, events)
+    return len(events)
+
+
+async def google_catch_up_loop() -> None:
+    """Runs with the app: every minute the unsent Dayla tasks of each Google user go to Google."""
+    from app.core.database import session_factory
+
+    while True:
+        await asyncio.sleep(CATCH_UP_EVERY)
+        try:
+            async with session_factory() as session:
+                users = list(
+                    await session.scalars(
+                        select(Event.user_id)
+                        .join(Integration, (Integration.user_id == Event.user_id) & (Integration.provider == "google"))
+                        .where(Event.external_id.is_(None), Event.sync_status == "not_synced", Event.source.in_(DAYLA_SOURCES))
+                        .distinct()
+                        .limit(200)
+                    )
+                )
+                for user_id in users:
+                    await push_unsent_to_google(session, user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Sending unsent tasks to Google failed")
 
 
 async def push_pending_to_google(session: AsyncSession, user_id: int) -> None:

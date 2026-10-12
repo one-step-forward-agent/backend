@@ -338,3 +338,84 @@ async def test_a_failing_model_never_means_a_server_error(client, user, monkeypa
         response = await client.post("/api/assistant/chat", json={"text": text}, headers=headers)
         assert response.status_code == 200, (text, response.text)
         assert response.json()["kind"] == "answer" and response.json()["text"] == chat.MODEL_FAILED_ANSWER
+
+
+# ---------- the third round: reminders without the model, the reminders screen, Google catch-up ----------
+
+
+async def test_reminder_with_a_repeat_is_set_without_the_model(client, user):
+    """The model is off (as when it fails): "напоминай каждый день в 21:00 …" is still a repeating reminder."""
+    headers, _ = user
+    reply = await say(client, headers, "напоминай каждый день в 21:00 выпить таблетку")
+    assert reply["kind"] == "reminder", reply
+    item = reply["reminders"][0]
+    assert item["text"] == "Выпить таблетку" and item["repeat"] == "каждый день в 21:00"
+
+    reply = await say(client, headers, "напомни через 10 минут выключить духовку")
+    assert reply["kind"] == "reminder" and reply["reminders"][0]["text"] == "Выключить духовку"
+    assert reply["reminders"][0]["repeat"] is None
+
+    reply = await say(client, headers, "напоминай пить воду каждые 2 часа")
+    assert reply["reminders"][0]["repeat"] == "каждые 2 часа" and reply["reminders"][0]["text"] == "Пить воду"
+
+    asked = await say(client, headers, "напомни позвонить маме")
+    assert asked["kind"] == "answer" and "Когда напомнить" in asked["text"]
+
+
+async def test_agent_that_only_talks_still_sets_the_reminder(client, user, agent):
+    headers, _ = user
+    agent(["Хорошо, буду напоминать каждый будний день!"])
+    reply = await say(client, headers, "напоминай по будням в 8:00 сделать зарядку")
+    assert reply["kind"] == "reminder" and reply["reminders"][0]["repeat"] == "по будням в 08:00"
+
+
+async def test_reminders_screen(client, user):
+    headers, _ = user
+    at = (datetime.now(TZ) + timedelta(days=1)).replace(hour=9, minute=0).strftime("%Y-%m-%dT%H:%M")
+    created = await client.post("/api/reminders/custom", json={"text": "Полить цветы", "at": at, "repeat": "weekly"}, headers=headers)
+    assert created.status_code == 201, created.text
+    item = created.json()
+    assert item["repeat"].endswith("в 09:00") and item["repeat_kind"] == "weekly"
+
+    listed = (await client.get("/api/reminders/custom", headers=headers)).json()
+    assert [entry["text"] for entry in listed] == ["Полить цветы"]
+
+    changed = await client.put(f"/api/reminders/custom/{item['id']}", json={"text": "Полить цветы", "at": at, "every_minutes": 180}, headers=headers)
+    assert changed.status_code == 200 and changed.json()["repeat"] == "каждые 3 часа"
+    listed = (await client.get("/api/reminders/custom", headers=headers)).json()
+    assert len(listed) == 1 and listed[0]["id"] == changed.json()["id"]
+
+    assert (await client.delete(f"/api/reminders/custom/{listed[0]['id']}", headers=headers)).status_code == 204
+    assert (await client.get("/api/reminders/custom", headers=headers)).json() == []
+    too_often = await client.post("/api/reminders/custom", json={"text": "x", "at": at, "every_minutes": 5}, headers=headers)
+    assert too_often.status_code == 422
+
+
+async def test_unsent_tasks_reach_google(client, user, services):
+    from app.services.events import push_unsent_to_google
+    from tests.test_integrations import oauth_connect
+
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    start = datetime.now(TZ).replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=2)
+    created = await client.post("/api/events", json={"title": "Дело", "start_at": start.isoformat(), "end_at": (start + timedelta(hours=1)).isoformat()}, headers=headers)
+    event_id = created.json()["id"]
+    async with session_factory() as session:
+        from app.models.models import Event
+
+        # As if Google had been unreachable when it was made
+        event = await session.get(Event, event_id)
+        event.external_id, event.sync_status, event.source = None, "not_synced", "local"
+        await session.commit()
+        before = len(services.created["google"])
+        assert await push_unsent_to_google(session, event.user_id) == 1
+        assert len(services.created["google"]) == before + 1
+        assert (await session.get(Event, event_id)).sync_status == "synced"
+        assert await push_unsent_to_google(session, event.user_id) == 0
+
+
+def test_telegram_bot_message_is_shown_as_is():
+    from app.core.errors import plain
+
+    message = "Telegram не подключён: напоминания приходят в Telegram-бот Dayla"
+    assert plain(message) == message
