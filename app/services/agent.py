@@ -527,6 +527,13 @@ def new_item(raw: dict, turn: Turn, whole: dates.Parsed | None = None) -> tuple[
         rule = dates.parse(raw["date"], turn.now).rrule
         if rule:
             day = None
+    if rule and "UNTIL=" not in rule and "COUNT=" not in rule:
+        # "… до 1 января": the end the user named, which the model tends to put into the date instead
+        said = dates.parse(turn.text, turn.now).rrule or ""
+        if until := re.search(r"UNTIL=[0-9TZ]+", said):
+            rule = f"{rule};{until.group(0)}"
+            if day and day.strftime("%Y%m%d") == until.group(0)[6:14]:
+                day = None
     parsed = dates.Parsed(date=day, time=start, end_time=end if start else None, rrule=rule, end_date=parse_day(raw.get("end_date"), turn))
     deadline = None
     if isinstance(raw.get("deadline"), str) and raw["deadline"].strip():

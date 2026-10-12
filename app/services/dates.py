@@ -335,6 +335,22 @@ def _date_range(low: str, today: date) -> tuple[date | None, date | None, tuple[
     return None, None, None
 
 
+def _series_end(low: str, today: date) -> tuple[date, tuple[int, int]] | None:
+    """The last day of a repetition: "до 1 января", "по 15.12", "до конца месяца / года"."""
+    if match := re.search(r"\b(?:до|по)\s+конца\s+(месяца|года)\b", low):
+        if match.group(1) == "года":
+            return date(today.year, 12, 31), match.span()
+        return (today.replace(day=1) + relativedelta(months=1)) - timedelta(days=1), match.span()
+    for index, match in enumerate(re.finditer(r"\b(?:до|по)\s+", low)):
+        if index >= 20:
+            break
+        # A date right after "до": a short window keeps long messages fast
+        found, span = _explicit_date(low[match.end() : match.end() + 30], today)
+        if found and span and span[0] == 0:
+            return found, (match.start(), match.end() + span[1])
+    return None
+
+
 def parse(text: str, now: datetime) -> Parsed:
     """Date, time, end time and recurrence mentioned in text, relative to now (user's local time)."""
     low = text.lower()
@@ -344,6 +360,12 @@ def parse(text: str, now: datetime) -> Parsed:
     result.spans += spans
     result.time, result.end_time, spans = parse_time(text)
     result.spans += spans
+    if result.rrule and (found := _series_end(low, today)):
+        # "каждую среду … до 1 января": the day ends the series, it is not the day of the task
+        until, span = found
+        result.rrule += f";UNTIL={until:%Y%m%d}T235959Z"
+        result.spans.append(span)
+        low = low[: span[0]] + " " * (span[1] - span[0]) + low[span[1]:]
 
     if match := re.search(rf"\bчерез\s+(?:({NUMBER})\s+)?(полчаса|минут\w*|мин\b|час\w*)", low):
         if match.group(2) == "полчаса":

@@ -419,3 +419,34 @@ def test_telegram_bot_message_is_shown_as_is():
 
     message = "Telegram не подключён: напоминания приходят в Telegram-бот Dayla"
     assert plain(message) == message
+
+
+# ---------- "Каждую среду в 10:00 зал до 1 января" ----------
+
+
+def test_until_ends_the_series_and_is_not_its_day():
+    from app.services import dates
+
+    now = datetime(2026, 10, 12, 20, 0, tzinfo=TZ)
+    parsed = dates.parse("Каждую среду в 10:00 зал до 1 января", now)
+    assert parsed.date is None and parsed.time.strftime("%H:%M") == "10:00"
+    assert parsed.rrule == "FREQ=WEEKLY;BYDAY=WE;UNTIL=20270101T235959Z"
+    assert dates.parse("по будням до конца месяца созвон в 9", now).rrule.endswith("UNTIL=20261031T235959Z")
+    # Without a repetition "до 1 января" is still a day
+    assert dates.parse("сдать отчёт до 1 января", now).rrule is None
+
+
+async def test_weekly_until_january_from_the_chat(client, user, agent):
+    headers, _ = user
+    # The model puts the end into the date, as it did for the testers
+    agent([call("create_events", events=[{"title": "Зал", "date": "2027-01-01", "start_time": "10:00", "repeat": "каждую среду"}]), "Готово"])
+    reply = await say(client, headers, "Каждую среду в 10:00 зал до 1 января")
+    assert reply["kind"] in ("proposal", "created"), reply
+    if reply["kind"] == "proposal":
+        reply = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    starts = await series_starts(client, headers, "Зал")
+    assert len(starts) > 5
+    assert starts[0].date() < datetime(2026, 10, 30).date() + timedelta(days=60)
+    assert {start.astimezone(TZ).weekday() for start in starts} == {2}
+    assert all(start.astimezone(TZ).date() <= datetime(2027, 1, 1).date() for start in starts)
+    assert all(start.astimezone(TZ).strftime("%H:%M") == "10:00" for start in starts)
