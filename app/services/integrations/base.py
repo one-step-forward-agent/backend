@@ -3,8 +3,9 @@ import ipaddress
 import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, ClassVar
+from zoneinfo import ZoneInfo
 
 import httpcore
 import httpx
@@ -107,6 +108,13 @@ class EventPayload:
     all_day: bool = False
     description: str | None = None
     location: str | None = None
+
+    def days(self) -> tuple[date, date]:
+        """An all-day event's first day and the day after its last, in its own time zone: a task for 13 October
+        starts at 00:00 Moscow time, which is still 12 October in UTC, the zone it is read back from the database in."""
+        tz = ZoneInfo(self.timezone)
+        first = self.start_at.astimezone(tz).date()
+        return first, max(self.end_at.astimezone(tz).date(), first + timedelta(days=1))
 
 
 @dataclass

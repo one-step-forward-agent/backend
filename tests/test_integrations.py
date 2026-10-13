@@ -25,6 +25,7 @@ class FakeServices:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
         self.created: dict[str, list] = {"google": [], "notion": [], "apple": []}
+        self.deleted_google: list[str] = []
         self.atlassian_profile = True
         # The person who connects Notion, as Notion's token response names them
         self.notion_owner = {"id": "n-olga", "name": "Ольга", "person": {"email": "olga@notion.so"}}
@@ -65,6 +66,9 @@ class FakeServices:
                 return httpx.Response(200, json={"id": f"g-new-{len(self.created['google'])}", "htmlLink": "https://calendar.google.com/x"})
             start = self.google_start
             return httpx.Response(200, json={"items": [{"id": "g-ev-1", "summary": "Стендап в Google", "start": {"dateTime": start.isoformat()}, "end": {"dateTime": (start + timedelta(hours=1)).isoformat()}}]})
+        if url.startswith("https://www.googleapis.com/calendar/v3/calendars/primary/events/") and method == "DELETE":
+            self.deleted_google.append(url.rsplit("/", 1)[1])
+            return httpx.Response(204)
         if url == "https://www.googleapis.com/calendar/v3/calendars/primary/events/g-ev-1" and method == "PATCH":
             self.google_patches.append(body)
             if self.google_patch_status == 200:

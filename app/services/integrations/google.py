@@ -1,4 +1,4 @@
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -10,8 +10,8 @@ from app.services.integrations.base import EventPayload, IntegrationError, Integ
 
 def google_event_body(event: EventPayload) -> dict[str, Any]:
     if event.all_day:
-        start = {"date": event.start_at.date().isoformat()}
-        end = {"date": max(event.end_at.date(), event.start_at.date() + timedelta(days=1)).isoformat()}
+        first, after = event.days()
+        start, end = {"date": first.isoformat()}, {"date": after.isoformat()}
     else:
         start = {"dateTime": event.start_at.isoformat(), "timeZone": event.timezone}
         end = {"dateTime": event.end_at.isoformat(), "timeZone": event.timezone}

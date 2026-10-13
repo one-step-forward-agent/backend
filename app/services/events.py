@@ -52,6 +52,26 @@ def remember_google_token(integration: Integration, provider: GoogleCalendarProv
     store_secrets(integration, {"access_token": provider.access_token})
 
 
+async def delete_from_google(session: AsyncSession, user_id: int, events: list[Event]) -> None:
+    """Remove the Google copies of events deleted in Dayla; otherwise they stay in Google (and the next import brings them back)."""
+    synced = [event for event in events if event.external_id and event.source == "google"]
+    if not synced:
+        return
+    integration, provider = await google_provider(session, user_id)
+    if not provider:
+        return
+    for event in synced:
+        try:
+            await provider.delete_event("primary", event.external_id)
+        except httpx.HTTPStatusError as error:
+            # 404 and 410: already deleted in Google
+            if error.response.status_code not in (404, 410):
+                logger.warning("Could not delete Google event %s: %s", event.external_id, error.response.status_code)
+        except Exception:
+            logger.warning("Could not delete Google event %s", event.external_id)
+    remember_google_token(integration, provider)
+
+
 async def push_new_events_to_google(session: AsyncSession, user_id: int, events: list[Event]) -> None:
     integration, provider = await google_provider(session, user_id)
     if not events:

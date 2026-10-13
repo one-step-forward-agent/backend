@@ -49,7 +49,7 @@ from app.services import chat, insights, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
 from app.services.google_calendar import revoke_google_access
-from app.services.events import default_calendar, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
+from app.services.events import default_calendar, delete_from_google, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets
 
@@ -277,6 +277,7 @@ async def delete_event(
     if scope == "series":
         await tasks.delete_series(session, user, event)
         return
+    await delete_from_google(session, user.id, [event])
     await session.delete(event)
     await session.commit()
 

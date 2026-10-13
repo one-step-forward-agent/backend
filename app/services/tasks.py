@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Event, Tag, User
 from app.services.dates import describe_rrule, valid_rrule
-from app.services.events import default_calendar, push_new_events_to_google, push_pending_to_google
+from app.services.events import default_calendar, delete_from_google, push_new_events_to_google, push_pending_to_google
 from app.services.integrations.service import user_timezone
 
 logger = logging.getLogger(__name__)
@@ -296,9 +296,10 @@ async def change_series(session: AsyncSession, user: User, event: Event, rule: s
     """A new repeat from this occurrence on: the later ones of the old series go, this one starts the new series
     (or stays alone when `rule` is None). The earlier ones stay as they were, no longer repeating."""
     if event.series_id:
-        later = await session.scalars(
+        later = list(await session.scalars(
             select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at > event.start_at, Event.id != event.id)
-        )
+        ))
+        await delete_from_google(session, user.id, later)
         for item in later:
             await session.delete(item)
         await session.execute(
@@ -316,10 +317,12 @@ async def change_series(session: AsyncSession, user: User, event: Event, rule: s
 async def delete_series(session: AsyncSession, user: User, event: Event) -> int:
     """Delete this and later occurrences; earlier ones stay as history but stop the series from refilling."""
     if not event.series_id:
+        await delete_from_google(session, user.id, [event])
         await session.delete(event)
         await session.commit()
         return 1
     later = list(await session.scalars(select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at >= event.start_at)))
+    await delete_from_google(session, user.id, later)
     for item in later:
         await session.delete(item)
     await session.execute(update(Event).where(Event.user_id == user.id, Event.series_id == event.series_id).values(recurrence_rule=None))

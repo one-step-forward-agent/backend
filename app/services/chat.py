@@ -15,7 +15,7 @@ from app.services import dates, tasks, usage
 from app.services.integrations import service as integrations
 from app.services.integrations.base import IntegrationError
 from app.services.integrations.registry import PROVIDERS
-from app.services.events import GOOGLE_ACCESS_LOST, google_provider, push_pending_to_google, remember_google_token
+from app.services.events import GOOGLE_ACCESS_LOST, delete_from_google, push_pending_to_google
 from app.services.ru import MONTHS, RELATIVE_DAYS, WEEKDAYS, day_label, plural
 
 logger = logging.getLogger(__name__)
@@ -1722,16 +1722,7 @@ async def delete_events(session: AsyncSession, user: User, event_ids: list[int])
     events = list(await session.scalars(select(Event).where(Event.user_id == user.id, Event.id.in_(event_ids[:MAX_DELETE]))))
     if not events:
         return 0
-    synced = [event for event in events if event.external_id and event.source == "google"]
-    if synced:
-        integration, provider = await google_provider(session, user.id)
-        if provider:
-            for event in synced:
-                try:
-                    await provider.delete_event("primary", event.external_id)
-                except Exception:
-                    logger.warning("Could not delete Google event %s", event.external_id)
-            remember_google_token(integration, provider)
+    await delete_from_google(session, user.id, events)
     for event in events:
         await session.delete(event)
     await session.commit()
@@ -1914,16 +1905,7 @@ async def undo(session: AsyncSession, user: User, event_ids: list[int]) -> int:
     events = list(await session.scalars(select(Event).where(Event.id.in_(event_ids), Event.user_id == user.id, Event.created_at >= since)))
     if not events:
         return 0
-    synced = [event for event in events if event.external_id and event.source == "google"]
-    if synced:
-        integration, provider = await google_provider(session, user.id)
-        if provider:
-            for event in synced:
-                try:
-                    await provider.delete_event("primary", event.external_id)
-                except Exception:
-                    logger.warning("Could not delete Google event %s", event.external_id)
-            remember_google_token(integration, provider)
+    await delete_from_google(session, user.id, events)
     for event in events:
         await session.delete(event)
     await session.commit()

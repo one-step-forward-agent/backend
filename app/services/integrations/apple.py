@@ -159,8 +159,9 @@ class AppleCalendarIntegration(IntegrationProvider):
         component.add("summary", event.title)
         component.add("dtstamp", datetime.now(timezone.utc))
         if event.all_day:
-            component.add("dtstart", event.start_at.date())
-            component.add("dtend", max(event.end_at.date(), event.start_at.date() + timedelta(days=1)))
+            first, after = event.days()
+            component.add("dtstart", first)
+            component.add("dtend", after)
         else:
             component.add("dtstart", event.start_at.astimezone(timezone.utc))
             component.add("dtend", event.end_at.astimezone(timezone.utc))
