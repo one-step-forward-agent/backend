@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from app.core.database import session_factory
 from app.models.models import Event, Notification, ReminderSettings, User
-from app.services import reminders
+from app.services import agent as agent_service, chat as chat_service, reminders
 from tests.conftest import BOT_HEADERS
 
 TZ = ZoneInfo("Europe/Moscow")
@@ -141,9 +141,10 @@ async def test_reminder_can_be_cancelled_from_the_chat_and_the_bot(client, user,
 async def test_reminder_needs_telegram(client, agent):
     response = await client.post("/auth/register", json={"email": f"web-{uuid.uuid4().hex[:10]}@example.com", "password": "password-123", "timezone": "Europe/Moscow"})
     headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
-    requests = agent([act(op("remind", text="Помыть посуду", in_minutes=10)), lambda messages: "Подключите Telegram: " + result_of(messages)])
+    requests = agent([act(op("remind", text="Помыть посуду", in_minutes=10)), "Может, напомню прямо здесь? Согласны?"])
     reply = await say(client, headers, "напомни помыть посуду через 10 минут")
-    assert reply["kind"] == "answer" and "Telegram не подключён" in reply["text"]
+    # The app says what to do; the model gets no second request to make up an answer
+    assert reply == {**reply, "kind": "answer", "text": agent_service.NO_TELEGRAM} and len(requests) == 1
     assert "НЕ подключён" in requests[0][0]["content"]
 
 
@@ -399,7 +400,7 @@ async def test_move_everything_to_tomorrow_takes_todays_open_tasks(client, user,
     assert reply["kind"] == "proposal" and len(requests) == 1
     assert {item["event_id"] for item in reply["events"]} == {first, second}
     assert {item["date"] for item in reply["events"]} == {tomorrow.isoformat()}
-    assert reply["answer"] == "Изменю 2 задачи. Проверьте и подтвердите."
+    assert reply["answer"] == f"Перенесу 2 задачи на {chat_service.date_day(tomorrow)}. Проверьте и подтвердите."
     assert finished not in {item["event_id"] for item in reply["events"]} and later not in {item["event_id"] for item in reply["events"]}
 
 
@@ -478,3 +479,56 @@ async def test_a_question_about_an_empty_day_says_so(client, user, agent):
     agent([act(op("find", filter={"date_from": "в воскресенье"}))])
     reply = await say(client, headers, "что у меня в воскресенье?")
     assert reply["kind"] == "answer" and "задач не нашла" in reply["text"]
+
+
+async def test_a_whole_request_is_never_saved_as_one_task(client, user, agent):
+    headers, _ = user
+    await add(client, headers, "подарок батьке сегодня в 18:00")
+    text = "добавь 2 задачи на завтра «задача 1», «задача 2», а также перенеси «подарок батьке» на завтра"
+    requests = agent(
+        [
+            act(op("create", events=[{"title": "2 задачи «задача 1», «задача 2», а также перенеси «подарок батьке»", "date": "завтра"}])),
+            act(
+                op("create", events=[{"title": "задача 1", "date": "завтра"}, {"title": "задача 2", "date": "завтра"}]),
+                op("change", filter={"query": "подарок батьке"}, to_date="завтра"),
+            ),
+        ]
+    )
+    reply = await say(client, headers, text)
+    # The first call is sent back to the model; nothing is added without confirmation
+    assert "весь запрос" in result_of(requests[1])
+    assert reply["kind"] == "proposal"
+    assert [event["title"] for event in reply["events"]] == ["Задача 1", "Задача 2", "Подарок батьке"]
+
+
+async def test_one_task_out_of_a_multi_part_message_waits_for_confirmation(client, user, agent):
+    headers, _ = user
+    agent([act(op("create", events=[{"title": "Купить хлеб", "date": "завтра"}]))])
+    reply = await say(client, headers, "добавь купить хлеб завтра и ещё кое-что")
+    assert reply["kind"] == "proposal"
+
+
+async def test_a_failed_part_is_retried_and_otherwise_reported(client, user, agent):
+    headers, _ = user
+    await add(client, headers, "подарок батьке сегодня в 18:00")
+    text = "добавь на завтра задачу 1 и перенеси подарок батьке на завтра"
+    create = op("create", events=[{"title": "Задача 1", "date": "завтра"}])
+    requests = agent([act(create, op("change", filter={"ids": [-1]}, to_date="завтра")), act(create, op("change", filter={"query": "подарок батьке"}, to_date="завтра"))])
+    reply = await say(client, headers, text)
+    # The model fixed the failed part; the resent create is not doubled
+    assert "не повторяй" in result_of(requests[1])
+    assert [event["title"] for event in reply["events"]] == ["Задача 1", "Подарок батьке"]
+
+    agent([act(create, op("change", filter={"ids": [-1]}, to_date="завтра")), "Не нашла задачу."])
+    reply = await say(client, headers, text)
+    assert [event["title"] for event in reply["events"]] == ["Задача 1"]
+    assert "Не получилось изменить или перенести задачу" in reply["answer"]
+
+
+async def test_moving_everything_keeps_tasks_without_time(client, user, agent):
+    headers, _ = user
+    await add(client, headers, "подарок батьке сегодня в 18:00")
+    await add(client, headers, "купить продукты сегодня")
+    agent([act(op("change", filter={"date_from": "сегодня", "timed": "timed"}, to_date="завтра"))])
+    reply = await say(client, headers, "перенеси всё с сегодня на завтра")
+    assert sorted(event["title"] for event in reply["events"]) == ["Купить продукты", "Подарок батьке"]

@@ -109,7 +109,7 @@ async def test_move_all_after_adding_moves_the_whole_day(client, user):
     await chat(client, headers, "что ты умеешь?")
     reply = await chat(client, headers, "перенеси всё на послезавтра")
     assert reply["kind"] == "proposal" and len(reply["events"]) == 2, reply
-    assert f"с {chat_service.short_day(tomorrow)}" in reply["answer"]
+    assert f"с {chat_service.date_day(tomorrow)}" in reply["answer"]
 
 
 async def test_one_task_still_moves_alone(client, user):
@@ -196,7 +196,7 @@ async def test_move_buttons_in_the_web_chat(client, user):
     assert history[-1]["reply"]["kind"] == "updated"
 
     same = (await client.post(f"/api/assistant/events/{event_id}/move", json={"date": after.isoformat()}, headers=headers)).json()
-    assert same == {"kind": "answer", "text": f"«Созвон с Олегом» уже стоит на {chat_service.short_day(after)}."}
+    assert same == {"kind": "answer", "text": f"«Созвон с Олегом» уже стоит на {chat_service.date_day(after)}."}
     back = (await client.post(f"/api/assistant/events/{event_id}/move", json={"date": moved["moved"]["from"]}, headers=headers)).json()
     assert back["events"][0]["date"] == tomorrow.isoformat()
 

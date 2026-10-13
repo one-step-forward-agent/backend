@@ -161,6 +161,7 @@ ADVICE_REQUEST = re.compile(
     r"|что\s+(?:мне\s+)?(?:можно\s+|стоит\s+|лучше\s+)?перенест|как\s+(?:лучше\s+)?(?:спланир|распредел|организ)",
     re.I,
 )
+TIMED_HINT = re.compile(r"врем|весь\s+день|целый\s+день|встреч|созвон", re.I)
 REMINDER_WORDS = re.compile(r"напомн|напомин|будильник", re.I)
 # The model's repeat is taken only when the user said something about it
 REPEAT_HINT = re.compile(r"кажд|ежедн|еженед|ежемес|ежечас|регулярн|повтор|по\s+будн|по\s+утрам|по\s+вечерам", re.I)
@@ -246,7 +247,11 @@ class Turn:
     analysis: str | None = None
     breakdown: str | None = None
     shown_title: str | None = None
+    # A request the app cannot do at all (a reminder without Telegram): the app's own answer, not the model's
+    blocked: str | None = None
     tools: list[str] = field(default_factory=list)
+    # Actions of the latest act call that failed: said to the user when the model does not fix them
+    failed: list[str] = field(default_factory=list)
     # A small model misreads long ids (2950 → 3950): tasks get short numbers for this turn, alias → event id
     refs: dict[int, int] = field(default_factory=dict)
     aliases: dict[int, int] = field(default_factory=dict)
@@ -371,6 +376,9 @@ async def pick(turn: Turn, args: dict, default_day: date | None = None, status: 
     Returns (events, problem). `default_day` is the period when nothing else narrows the tasks down ("перенеси всё
     на завтра" is about today's), `status` the state when the filter names none."""
     status = args.get("status") if args.get("status") in STATUSES else status
+    if args.get("timed") and not TIMED_HINT.search(turn.text):
+        # "перенеси всё": the model narrows it down to timed tasks on its own and leaves the rest behind
+        args = {key: value for key, value in args.items() if key != "timed"}
     if args.get("event_ids"):
         found = await owned(turn, args["event_ids"])
         if found:
@@ -425,6 +433,14 @@ async def narrowed_down(turn: Turn, events: list[Event], args: dict, status: str
         ids = set(await turn.session.scalars(select(Tag.id).where(Tag.user_id == turn.user.id, func.lower(Tag.name).in_(names))))
         events = [event for event in events if ids & set(event.tag_ids or [])]
     return events
+
+
+# A day named in English: the model's date is taken as is (dates.py reads Russian only)
+FOREIGN_DAY = re.compile(
+    r"\b(?:today|tomorrow|tonight|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next\s+week|weekend|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*",
+    re.I,
+)
 
 
 # Words of a request that do not name the task: what to do with it and by how much
@@ -493,8 +509,11 @@ def new_item(raw: dict, turn: Turn, whole: dates.Parsed | None = None) -> tuple[
     title = chat.clean_title(raw.get("title") or "")
     if not title:
         return None, "нет названия"
+    if chat.COMMAND_IN_TITLE.search(title) and (len(title) > 40 or len(title) >= len(turn.text) * 0.6):
+        # The whole request became one task: "2 задачи «…» «…» и перенеси …"
+        return None, f"«{title[:60]}…» — это весь запрос, а не название: передай каждое дело отдельным элементом events, а перенос — операцией change"
     day = parse_day(raw.get("date"), turn)
-    if day and day != turn.today and re.match(r"\d{4}-\d{2}-\d{2}", str(raw.get("date")).strip()) and not chat.mentions_day(turn.text, turn.now):
+    if day and day != turn.today and re.match(r"\d{4}-\d{2}-\d{2}", str(raw.get("date")).strip()) and not chat.mentions_day(turn.text, turn.now) and not FOREIGN_DAY.search(turn.text):
         # A day the model made up: the user named none, and a task without a day is for today
         day = None
     start, end = parse_clock(raw.get("start_time")), parse_clock(raw.get("end_time"))
@@ -562,11 +581,15 @@ async def create_events(turn: Turn, args: dict) -> dict:
         whole = None if whole.rrule or whole.end_date else whole
     for value in raw[: chat.MAX_DRAFT_ITEMS]:
         item, problem = new_item(value, turn, whole) if isinstance(value, dict) else (None, "неверный формат")
+        if item and any(not existing.get("event_id") and all(existing.get(key) == item.get(key) for key in ("title", "date", "time")) for existing in turn.items):
+            continue
         if item:
             turn.items.append(item)
             added.append({"title": item["title"], "date": item["date"], "time": item["time"] or "без времени", "repeat": dates.describe_rrule(item.get("rrule"))})
         else:
             problems.append(problem)
+    if not added:
+        return {"error": "Ничего не добавлено: " + "; ".join(problems)}
     result = {"status": "Черновик показан пользователю: он проверит и нажмёт «Сохранить». Ещё ничего не сохранено.", "items": added}
     if problems:
         result["skipped"] = problems
@@ -814,6 +837,8 @@ async def create_reminder(turn: Turn, args: dict) -> dict:
     try:
         notification = await reminders.create_custom(turn.session, turn.user, text, moment.astimezone(timezone.utc), repeat, every)
     except reminders.ReminderError as error:
+        if "Telegram" in str(error):
+            turn.blocked = NO_TELEGRAM
         return {"error": str(error)}
     view = reminders.custom_view(notification, turn.tz)
     turn.reminders.append(view)
@@ -826,6 +851,10 @@ async def create_reminder(turn: Turn, args: dict) -> dict:
     }
 
 
+NO_TELEGRAM = (
+    "Напоминания приходят в Telegram-бот Dayla, а он у вас ещё не подключён. "
+    "Подключите его в разделе «Интеграции» и повторите просьбу — напоминание придёт вовремя."
+)
 REMINDER_VERB = re.compile(r"(?:поставь(?:те)?\s+)?(?:напомни(?:те)?|напоминай(?:те)?|напоминание)(?:\s+(?:мне|нам))?", re.I)
 WHAT_LEAD = re.compile(r"^(?:о|об|про|что|чтобы|что\s+надо|что\s+нужно)\s+", re.I)
 
@@ -854,6 +883,8 @@ async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
         problem = result["error"]
         if "in_minutes" in problem:
             problem = "Когда напомнить? Например: «напомни завтра в 9:00 позвонить в банк» или «напоминай каждый день в 21:00 выпить таблетку»."
+        elif "Telegram" in problem:
+            problem = NO_TELEGRAM
         elif problem == "Не понятно, о чём напомнить":
             problem = "О чём напомнить? Например: «напомни через 10 минут выключить духовку»."
         return {"kind": "answer", "text": problem}
@@ -1055,6 +1086,9 @@ async def act(turn: Turn, args: dict) -> dict:
                 logger.exception("Assistant operation %s failed", action)
                 result = {"error": "Внутренняя ошибка, попробуй по-другому или извинись перед пользователем."}
         results.append({"action": action, **result})
+    turn.failed = [item["action"] for item in results if item.get("error") and item["action"] in OPERATIONS and item["action"] in turn.allowed]
+    if turn.failed and len(turn.failed) < len(results):
+        results.append({"note": "Операции без error уже выполнены — не повторяй их. Исправь и повтори только операции с error, или ответь текстом."})
     return {"results": results}
 
 
@@ -1273,9 +1307,12 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
         logger.info("Agent operations %s -> %s", json.dumps(args, ensure_ascii=False)[:400], [item.get("error") or "ok" for item in result["results"]])
         messages.append({"role": "assistant", "content": message.get("content") or "", "function_call": {"name": "act", "arguments": args}, **({"functions_state_id": message["functions_state_id"]} if message.get("functions_state_id") else {})})
         messages.append({"role": "function", "name": "act", "content": json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))})
-        if not all(item.get("error") for item in result["results"]):
+        operations = [item for item in result["results"] if "action" in item]
+        if turn.blocked or not any(item.get("error") for item in operations) or (not turn.failed and not all(item.get("error") for item in operations)):
             # The app words the reply itself (see finish): another request would only pay for unused text
             break
+    if turn.blocked and not turn.changed:
+        return {"kind": "answer", "text": turn.blocked}
     if not turn.changed and not turn.analysed:
         reply = await by_rules(turn)
         if reply is not None:
@@ -1333,7 +1370,7 @@ async def finish(turn: Turn, answer: str | None) -> dict:
         draft = await chat.create_draft(session, user, turn.items)
         new = [item for item in turn.items if not item.get("event_id")]
         warning = chat.night_note(turn.text, turn.now) if any(item["date"] > turn.today.isoformat() for item in turn.items) else None
-        if chat.ADD_REQUEST.match(turn.text) and len(turn.items) == 1 and new and not warning and not turn.notes:
+        if chat.ADD_REQUEST.match(turn.text) and len(turn.items) == 1 and new and not warning and not turn.notes and not chat.is_multi_part(turn.text):
             # "Добавь …" with one task: added at once, "Отменить" is under the answer
             reply = await chat.confirm_draft(session, user, draft.id)
             return {**reply, "answer": None, **({"text": chat.join_text(reply.get("text"), *done)} if done else {})}
@@ -1392,7 +1429,21 @@ def done_lines(turn: Turn) -> list[str]:
         for item in turn.reminders
     ]
     lines += [f"Напоминание отменено: {item['text']}" for item in turn.cancelled]
+    if turn.changed or turn.shown is not None:
+        # Part of the request worked and part did not: the user must not think it is all done
+        lines += [f"Не получилось {NOT_DONE[action]} — уточните, пожалуйста." for action in dict.fromkeys(turn.failed) if action in NOT_DONE]
     return lines
+
+
+NOT_DONE = {
+    "create": "добавить часть задач",
+    "change": "изменить или перенести задачу: не поняла, о какой речь",
+    "delete": "удалить задачу: не поняла, о какой речь",
+    "complete": "отметить задачу выполненной: не поняла, о какой речь",
+    "reopen": "вернуть задачу в невыполненные",
+    "remind": "поставить напоминание",
+    "cancel_reminder": "отменить напоминание",
+}
 
 
 def proposal_text(turn: Turn) -> str:
@@ -1406,7 +1457,10 @@ def proposal_text(turn: Turn) -> str:
             when = day_label(date.fromisoformat(item["date"]), turn.today)
             parts.append(f"Изменю «{item['before']['title']}»: {when[:1].lower() + when[1:]}{', ' + item['time'] if item.get('time') else ''}.")
         else:
-            parts.append(f"Изменю {len(changes)} {plural(len(changes), 'задачу', 'задачи', 'задач')}.")
+            count = f"{len(changes)} {plural(len(changes), 'задачу', 'задачи', 'задач')}"
+            days = {item["date"] for item in changes}
+            moved = all(item["date"] != item["before"].get("date") for item in changes)
+            parts.append(f"Перенесу {count} на {chat.date_day(date.fromisoformat(days.pop()))}." if len(days) == 1 and moved else f"Изменю {count}.")
     if new:
         parts.append(f"Добавлю {len(new)} {plural(len(new), 'задачу', 'задачи', 'задач')}." if len(new) > 1 else f"Добавлю «{new[0]['title']}».")
     return " ".join(parts) + " Проверьте и подтвердите."

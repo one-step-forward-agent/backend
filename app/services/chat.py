@@ -148,6 +148,17 @@ HELP_SECTIONS = [
     {"title": "Быстрые команды", "examples": ["Сегодня", "Завтра", "Неделя", "Выполнено", "Статистика", "Напоминания"]},
 ]
 SIMPLE_TEXT_LIMIT = 100
+# A message that holds more than one request or task: "добавь X, Y и перенеси Z", "две задачи: …"
+MULTI_PART = re.compile(
+    r"[,;\n]|\s(?:и|а|а\s+также|также|потом|затем|плюс|ещ[её]|напомни)\s|\b(?:[2-9]|дв[ае]|три|четыре|пять|несколько)\s+(?:задач|дел|встреч|событ)",
+    re.I,
+)
+# Commands inside a new task's title mean the model put the whole request into one task
+COMMAND_IN_TITLE = re.compile(r"\b(?:перенес|перенест|перенос|удал|сотри|отмет|сдвин|измени|добав|reschedul|delete|move\b)", re.I)
+
+
+def is_multi_part(text: str) -> bool:
+    return bool(MULTI_PART.search(f" {text} "))
 EDIT_WORDS = {"время", "времени", "дату", "дата", "даты", "окончание", "окончания", "начало", "начала", "конец", "срок", "её", "его", "ее"}
 NOTHING_CHANGES = "Так и стоит — менять нечего."
 
@@ -337,6 +348,11 @@ def match_keywords(events: list[Event], keywords: list[str]) -> list[Event]:
 
 def short_day(day: date) -> str:
     return f"{WEEKDAYS[day.weekday()]}, {day.day} {MONTHS[day.month - 1]}"
+
+
+def date_day(day: date) -> str:
+    """A day after "на" or "с": "14 октября (среда)", not "на среда, 14 октября"."""
+    return f"{day.day} {MONTHS[day.month - 1]} ({WEEKDAYS[day.weekday()]})"
 
 
 def night_note(text: str, now: datetime) -> str | None:
@@ -749,7 +765,9 @@ FILLER = re.compile(
 
 def clean_title(value: str) -> str:
     value = " ".join(str(value or "").split()).strip(" ,.;:—-")
-    value = FILLER.sub("", value).strip(" ,.;:—-")
+    stripped = FILLER.sub("", value).strip(" ,.;:—-")
+    # "Задача 1" is a name, not "задача" + "1"
+    value = stripped if not re.fullmatch(r"[№#]?\s*\d+", stripped) else re.sub(r"^.*?(задач[аиу]?)", "Задача", value, count=1, flags=re.I)
     value = re.sub(r"\s+(?:в|во|на|к|с|до)$", "", value, flags=re.I).strip(" ,.;:—-")
     return (value[:1].upper() + value[1:])[:300] if value else ""
 
@@ -1516,7 +1534,7 @@ def honest(answer: str | None) -> str | None:
 
 def simple_task(text: str, now: datetime) -> list[dict]:
     """A short single task ("купить хлеб завтра в 18:00") is parsed here without waiting for the model."""
-    if len(text) > SIMPLE_TEXT_LIMIT or re.search(r"[,;\n]|\s(?:и|а\s+также|потом|затем|напомни)\s", f" {text.lower()} "):
+    if len(text) > SIMPLE_TEXT_LIMIT or is_multi_part(text):
         return []
     return local_items(text, now)
 
@@ -1609,7 +1627,7 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> d
         draft = await create_draft(session, user, items)
         now = datetime.now(tz)
         warning = night_note(text, now) if any(item["date"] > now.date().isoformat() for item in items) else None
-        if ADD_REQUEST.match(text) and len(items) == 1 and not warning:
+        if ADD_REQUEST.match(text) and len(items) == 1 and not warning and not is_multi_part(text):
             # The user already said "добавь": add it now; "Отменить" is under the answer
             reply = await confirm_draft(session, user, draft.id)
             return {**reply, "note": join_text(reply.get("note"), tags_note(created))} if created else reply
@@ -2045,7 +2063,7 @@ async def move_draft(session: AsyncSession, user: User, draft: AssistantDraft, d
         items.append(moved)
     draft.items = items
     draft.awaiting = None
-    reply = proposal(draft, tz, note=f"Перенесла на {short_day(day)} ✓")
+    reply = proposal(draft, tz, note=f"Перенесла на {date_day(day)} ✓")
     await update_draft_messages(session, user, draft.id, reply)
     await session.commit()
     return reply
@@ -2104,15 +2122,15 @@ async def move_many(session: AsyncSession, user: User, text: str, tz: ZoneInfo) 
         events = [event for event in candidates if all(stem in searchable(event) for stem in keywords)]
     events = list({event.id: event for event in events if event.completed_at is None}.values())
     if not events:
-        where = f" на {short_day(source_day)}" if source_day else ""
+        where = f" на {date_day(source_day)}" if source_day else ""
         return {"kind": "not_found", "text": f"Не нашла невыполненных задач{where}, которые можно перенести. Уточните, например: «перенеси все задачи с 9 на 8 октября»."}
     items = [item for item in (change_item(event, {"date": day}, tz)[0] for event in events[:MAX_DRAFT_ITEMS]) if item]
     if not items:
-        return {"kind": "answer", "text": f"Эти задачи уже стоят на {short_day(day)}."}
+        return {"kind": "answer", "text": f"Эти задачи уже стоят на {date_day(day)}."}
     draft = await create_draft(session, user, items)
     count = len(items)
-    origin = f" с {short_day(source_day)}" if source_day else ""
-    answer = f"Перенесу {count} {plural(count, 'задачу', 'задачи', 'задач')}{origin} на {short_day(day)} — время сохранится. Проверьте и сохраните:"
+    origin = f" с {date_day(source_day)}" if source_day else ""
+    answer = f"Перенесу {count} {plural(count, 'задачу', 'задачи', 'задач')}{origin} на {date_day(day)} — время сохранится. Проверьте и сохраните:"
     if len(events) > MAX_DRAFT_ITEMS:
         answer += f"\nЗадач больше {MAX_DRAFT_ITEMS}: здесь первые {MAX_DRAFT_ITEMS}, остальные перенесите следующим сообщением."
     note = "Среди них есть неперемещаемые задачи — проверьте." if any(event.is_fixed for event in events[:MAX_DRAFT_ITEMS]) else None
@@ -2139,7 +2157,7 @@ async def move_event(session: AsyncSession, user: User, event_id: int, day: date
     old_day = event.start_at.astimezone(tz).date()
     item, problem = change_item(event, {"date": day}, tz)
     if problem:
-        text = f"«{title}» уже стоит на {short_day(day)}." if problem == NOTHING_CHANGES else problem
+        text = f"«{title}» уже стоит на {date_day(day)}." if problem == NOTHING_CHANGES else problem
         return {"kind": "answer", "text": text}
     changed = await apply_changes(session, user, [item], tz)
     reply = {
@@ -2147,7 +2165,7 @@ async def move_event(session: AsyncSession, user: User, event_id: int, day: date
         "events": [event_view(found, tz) for found in changed],
         "event_ids": [found.id for found in changed],
         "answer": None,
-        "text": f"Перенесла «{title}» на {short_day(day)}.",
+        "text": f"Перенесла «{title}» на {date_day(day)}.",
         # "Вернуть" moves it back to this day
         "moved": {"event_id": event_id, "from": old_day.isoformat(), "to": day.isoformat(), "from_label": short_day(old_day)},
     }
