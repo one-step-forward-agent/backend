@@ -6,7 +6,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Calendar, Event, Integration, User
+from app.models.models import Calendar, Event, EventLink, Integration, User
 from app.services.google_calendar import GoogleCalendarProvider
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets, store_secrets
@@ -70,6 +70,40 @@ async def delete_from_google(session: AsyncSession, user_id: int, events: list[E
         except Exception:
             logger.warning("Could not delete Google event %s", event.external_id)
     remember_google_token(integration, provider)
+
+
+async def delete_from_calendars(session: AsyncSession, user_id: int, events: list[Event]) -> None:
+    """Remove the copies of events deleted in Dayla from every connected calendar: Google, and the Yandex and Apple
+    copies Dayla sent there (event links) or imported from there. A calendar that fails never stops the deletion."""
+    await delete_from_google(session, user_id, events)
+    from app.services.integrations.registry import PROVIDERS
+    from app.services.integrations.service import build_provider, user_timezone
+
+    ids = [event.id for event in events]
+    if not ids:
+        return
+    integrations = {item.id: item for item in await session.scalars(select(Integration).where(Integration.user_id == user_id))}
+    if not integrations:
+        return
+    by_provider = {item.provider: item for item in integrations.values()}
+    copies: list[tuple[Integration, str, str | None]] = [
+        (integrations[link.integration_id], link.external_id, link.url)
+        for link in await session.scalars(select(EventLink).where(EventLink.event_id.in_(ids)))
+        if link.integration_id in integrations
+    ]
+    # Imported from Yandex or Apple: the event itself is their copy
+    copies += [(by_provider[event.source], event.external_id, None) for event in events if event.external_id and event.source in by_provider and event.source != "google"]
+    user = await session.get(User, user_id)
+    for integration, external_id, url in copies:
+        if integration.provider == "google" or integration.provider not in PROVIDERS:
+            continue
+        try:
+            provider = build_provider(integration, user_timezone(user))
+            await provider.delete_event(external_id, url)
+            if provider.context.updated_secrets:
+                store_secrets(integration, provider.context.updated_secrets)
+        except Exception:
+            logger.warning("Could not delete event %s from %s", external_id, integration.provider)
 
 
 async def push_new_events_to_google(session: AsyncSession, user_id: int, events: list[Event]) -> None:

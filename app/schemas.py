@@ -205,6 +205,7 @@ TAG_COLORS = ("indigo", "blue", "green", "amber", "red", "pink", "violet", "slat
 class TagCreate(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     color: Literal[TAG_COLORS] = "indigo"
+    counts_progress: bool = True
 
     @field_validator("name")
     @classmethod
@@ -218,6 +219,7 @@ class TagCreate(BaseModel):
 class TagUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=40)
     color: Literal[TAG_COLORS] | None = None
+    counts_progress: bool | None = None
 
     @field_validator("name")
     @classmethod
@@ -230,6 +232,7 @@ class TagRead(BaseModel):
     id: int
     name: str
     color: str
+    counts_progress: bool = True
 
 
 class AssistantMessage(BaseModel):
@@ -418,9 +421,15 @@ class BotCompleteRequest(BaseModel):
     completed: bool = True
 
 
+class BotImageRequest(BaseModel):
+    # A Telegram photo is at most a few MB; base64 makes it a third larger
+    image: str = Field(min_length=1, max_length=14_000_000)
+    mime: Literal["image/jpeg", "image/png", "image/webp"] = "image/jpeg"
+
+
 class BotEditRequest(BaseModel):
     index: int = Field(ge=0, lt=40)
-    field: Literal["title", "date", "time"]
+    field: Literal["title", "date", "time", "repeat", "period", "reminder"]
 
 
 class BotRemoveRequest(BaseModel):

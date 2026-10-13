@@ -81,6 +81,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `BASE_URL` | Its address with `/v1`, e.g. `https://shared1.multitool.works:4000/v1` |
 | `OPENAI_MODEL` | Model name at `BASE_URL` (see `BASE_URL/models`); required with `LLM_PROVIDER=openai` |
 | `OPENAI_AGENT_MODEL` | Model of the assistant agent (default: `OPENAI_MODEL`) |
+| `OPENAI_VISION_MODEL` | Model that reads photos sent to the bot (tickets, screenshots); default `OPENAI_MODEL` |
+| `OPENAI_THINKING` | Reasoning of models like DeepSeek V4: `off`, `low` or `high` (more room is given for it); empty sends nothing, for APIs without these parameters. DeepSeek: `BASE_URL=https://api.deepseek.com/v1`, `OPENAI_AGENT_MODEL=deepseek-flash`, `OPENAI_MODEL=deepseek-v4-pro`, `OPENAI_VISION_MODEL=deepseek-flash`, `OPENAI_THINKING=low` |
 | `SBER_AUTHORIZATION_KEY` | GigaChat authorization key |
 | `SBER_SCOPE` | GigaChat scope (default `GIGACHAT_API_PERS`) |
 | `GIGACHAT_MODEL` | GigaChat model name (default `GigaChat`) |

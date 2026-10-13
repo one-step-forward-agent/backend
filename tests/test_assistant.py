@@ -359,3 +359,40 @@ async def test_free_form_answers_get_the_real_calendar(client, user, fake_gigach
     await client.post("/api/assistant/chat", json={"text": "посоветуй, как лучше распределить нагрузку"}, headers=headers)
     assert "Сходить к стоматологу" in seen["calendar"] and "09:00" in seen["calendar"]
     assert (await client.post("/api/assistant/chat", json={"text": "расскажи про мои планы на завтра"}, headers=headers)).json()["kind"] == "agenda"
+
+
+async def test_bot_draft_edits_repeat_period_and_reminder(client, user):
+    _, chat_id = user
+    reply = await bot_chat(client, chat_id, "спортзал завтра в 19:00")
+    url = f"/internal/bot/chat/{chat_id}/drafts/{reply['draft_id']}"
+
+    prompt = (await client.post(f"{url}/edit", json={"index": 0, "field": "repeat"}, headers=BOT_HEADERS)).json()
+    assert "повторять" in prompt["prompt"]
+    reply = await bot_chat(client, chat_id, "каждую неделю 5 раз")
+    assert reply["note"] == "Изменено ✓" and reply["events"][0]["rrule"].endswith("COUNT=5")
+    await client.post(f"{url}/edit", json={"index": 0, "field": "repeat"}, headers=BOT_HEADERS)
+    reply = await bot_chat(client, chat_id, "до 1 декабря")
+    assert "FREQ=WEEKLY" in reply["events"][0]["rrule"] and "UNTIL=" in reply["events"][0]["rrule"] and "COUNT" not in reply["events"][0]["rrule"]
+    await client.post(f"{url}/edit", json={"index": 0, "field": "repeat"}, headers=BOT_HEADERS)
+    reply = await bot_chat(client, chat_id, "не повторять")
+    assert reply["events"][0]["rrule"] is None
+
+    await client.post(f"{url}/edit", json={"index": 0, "field": "reminder"}, headers=BOT_HEADERS)
+    reply = await bot_chat(client, chat_id, "за 2 часа")
+    assert reply["events"][0]["reminder_minutes"] == 120
+
+    await client.post(f"{url}/edit", json={"index": 0, "field": "period"}, headers=BOT_HEADERS)
+    reply = await bot_chat(client, chat_id, "3 дня")
+    first = date.fromisoformat(reply["events"][0]["date"])
+    assert reply["events"][0]["end_date"] == (first + timedelta(days=2)).isoformat()
+
+
+def test_a_date_at_the_end_of_a_sentence_is_read():
+    from zoneinfo import ZoneInfo
+
+    from app.services import dates
+
+    now = datetime(2026, 10, 13, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+    parsed = dates.parse("Дата: 05.12.2026. Время вылета: 21:55.", now)
+    assert (parsed.date, parsed.time) == (date(2026, 12, 5), time(21, 55))
+    assert dates.parse("версия 1.2.3", now).date is None

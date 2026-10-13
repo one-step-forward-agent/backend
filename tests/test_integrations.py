@@ -26,6 +26,7 @@ class FakeServices:
         self.calls: list[tuple[str, str]] = []
         self.created: dict[str, list] = {"google": [], "notion": [], "apple": []}
         self.deleted_google: list[str] = []
+        self.deleted: list[str] = []
         self.atlassian_profile = True
         # The person who connects Notion, as Notion's token response names them
         self.notion_owner = {"id": "n-olga", "name": "Ольга", "person": {"email": "olga@notion.so"}}
@@ -136,6 +137,9 @@ class FakeServices:
         elif request.method == "PUT":
             self.created["apple"].append(request.content.decode())
             return httpx.Response(201)
+        elif request.method == "DELETE":
+            self.deleted.append(path)
+            return httpx.Response(204)
         else:
             raise AssertionError(f"unexpected CalDAV request {request.method} {path}")
         return httpx.Response(207, text=MULTI.format(body))
@@ -190,7 +194,7 @@ async def connection(client, headers, slug: str) -> dict:
 
 async def test_every_integration_of_the_app_starts_its_sign_in(client, user, services):
     headers, _ = user
-    hosts = {"google": "accounts.google.com", "yandex": "oauth.yandex.ru", "notion": "api.notion.com", "jira": "auth.atlassian.com"}
+    hosts = {"google": "accounts.google.com", "yandex": "oauth.yandex.ru"}
     listed = {item["slug"]: item for item in (await client.get("/api/integrations", headers=headers)).json()}
     for slug, host in hosts.items():
         assert listed[slug]["auth_type"] == "oauth", slug
@@ -290,40 +294,7 @@ async def test_a_change_google_refused_is_not_undone_by_the_import(client, user,
     assert (await google_standup(client, headers))["sync_status"] == "synced"
 
 
-async def test_notion(client, user, services):
-    headers, _ = user
-    await oauth_connect(client, headers, "notion")
-    assert await titles(client, headers) == ["Сдать отчёт"]
-    assert (await connection(client, headers, "notion"))["account_email"] == "olga@notion.so"
-    assert (await client.post("/api/integrations/notion/test", headers=headers)).json() == {"status": "ok", "account": "База «Задачи»"}
-    assert (await client.post("/api/integrations/notion/sync", headers=headers)).json()["created"] == 0
-    reply = (await client.post("/api/assistant/chat", json={"text": "позвонить маме послезавтра"}, headers=headers)).json()
-    event_id = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()["event_ids"][0]
-    exported = await client.post(f"/api/integrations/notion/export/{event_id}", headers=headers)
-    assert exported.status_code == 201, exported.text
-    assert services.created["notion"] == ["Позвонить маме"]
 
-
-async def test_jira_with_token_refresh(client, user, services):
-    headers, _ = user
-    await oauth_connect(client, headers, "jira")
-    assert await titles(client, headers) == ["[FD-7] Починить вход"]
-    # The hour-long access token expires: the refresh token gets a new one, and the rotated pair is stored
-    services.jira_token = "j-expired"
-    synced = await client.post("/api/integrations/jira/sync", headers=headers)
-    assert synced.status_code == 200, synced.text
-    assert services.jira_token == "j-2"
-    assert (await client.post("/api/integrations/jira/test", headers=headers)).json()["account"] == "Olga · olga@corp.com · Olga"
-    assert await titles(client, headers) == ["[FD-7] Починить вход"]
-
-
-async def test_jira_without_profile(client, user, services):
-    # The profile only labels the account: the site name does when Atlassian refuses it
-    headers, _ = user
-    services.atlassian_profile = False
-    await oauth_connect(client, headers, "jira")
-    assert (await connection(client, headers, "jira"))["account_email"] == "Olga (cloud-1)"
-    assert await titles(client, headers) == ["[FD-7] Починить вход"]
 
 
 async def test_apple_with_app_password(client, user, services):
@@ -340,6 +311,13 @@ async def test_apple_with_app_password(client, user, services):
     created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
     assert created["note"] == "Добавлено в Apple Calendar"
     assert "SUMMARY:Позвонить маме" in services.created["apple"][0]
+
+    # Deleted in Dayla — deleted in Apple too: the copy Dayla sent by its address, the imported one found by UID
+    events = (await client.get("/api/events", params={"limit": 50}, headers=headers)).json()
+    for event in events:
+        assert (await client.delete(f"/api/events/{event['id']}", headers=headers)).status_code in (200, 204)
+    assert any(path.startswith("/1/calendars/home/") and path != "/1/calendars/home/ic-1.ics" for path in services.deleted)
+    assert "/1/calendars/home/ic-1.ics" in services.deleted
 
 
 async def test_google_meeting_shared_by_two_users(client, user, services):
@@ -366,28 +344,25 @@ async def test_draft_offers_the_connected_calendars(client, user, services):
     headers, _ = user
     connected = await client.post("/api/integrations/apple/connect", json={"values": {"username": "olga@icloud.com", "app_password": "app-pass"}}, headers=headers)
     assert connected.status_code == 200, connected.text
-    await oauth_connect(client, headers, "notion")
+    await oauth_connect(client, headers, "google")
     reply = await draft(client, headers, "позвонить маме послезавтра в 18:00")
-    # A connected calendar is ticked by default: it was connected to get the tasks; Notion only when ticked
-    assert [item["slug"] for item in reply["targets"]] == ["apple", "notion"] and reply["calendars"] == ["apple"]
+    # Every connected calendar is offered; Google, connected to get the tasks, is ticked by default
+    assert [item["slug"] for item in reply["targets"]] == ["google", "apple"] and reply["calendars"] == ["google"]
     # The draft shows the end its task gets: an hour after the start when none was said
     item = reply["events"][0]
     assert item["end_time"] is None and item["end"][11:16] == "19:00"
 
-    ticked = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": ["notion", "apple"]}, headers=headers)
-    assert ticked.status_code == 200 and ticked.json()["calendars"] == ["apple", "notion"]
-    assert (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": ["google"]}, headers=headers)).status_code == 422
+    ticked = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": ["apple", "google"]}, headers=headers)
+    assert ticked.status_code == 200 and sorted(ticked.json()["calendars"]) == ["apple", "google"]
+    assert (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": ["notion"]}, headers=headers)).status_code == 422
     created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
-    assert created["note"] == "Добавлено в Apple Calendar и Notion"
-    assert "SUMMARY:Позвонить маме" in services.created["apple"][0] and services.created["notion"] == ["Позвонить маме"]
+    assert "Apple Calendar" in created["note"] and "Google Calendar" in created["note"]
+    assert "SUMMARY:Позвонить маме" in services.created["apple"][0] and "Позвонить маме" in services.created["google"]
     links = (await client.get(f"/api/events/{created['event_ids'][0]}/links", headers=headers)).json()
-    assert sorted(link["provider"] for link in links) == ["apple", "notion"]
+    assert "apple" in {link["provider"] for link in links}
 
-    # The choice is remembered for the next draft, also "Dayla only" (nothing ticked)
-    assert (await draft(client, headers, "купить хлеб завтра"))["calendars"] == ["apple", "notion"]
-    reply = await draft(client, headers, "купить хлеб завтра")
-    await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": []}, headers=headers)
-    assert (await draft(client, headers, "полить цветы завтра"))["calendars"] == []
+    # The choice is remembered for the next draft
+    assert sorted((await draft(client, headers, "купить хлеб завтра"))["calendars"]) == ["apple", "google"]
 
 
 async def test_draft_to_google_by_default_or_dayla_only(client, user, services):

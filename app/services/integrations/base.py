@@ -150,6 +150,10 @@ class IntegrationProvider(ABC):
     async def push_event(self, event: EventPayload) -> PushResult:
         raise PushNotSupported(f"{self.title} does not support export")
 
+    async def delete_event(self, external_id: str, url: str | None = None) -> None:
+        """Remove an event from the service (one Dayla pushed there, or one imported from it). Not every service can."""
+        return None
+
     @classmethod
     def split_values(cls, values: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         config, secrets = {}, {}

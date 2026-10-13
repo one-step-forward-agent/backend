@@ -15,7 +15,7 @@ from app.services import dates, tasks, usage
 from app.services.integrations import service as integrations
 from app.services.integrations.base import IntegrationError
 from app.services.integrations.registry import PROVIDERS
-from app.services.events import GOOGLE_ACCESS_LOST, delete_from_google, push_pending_to_google
+from app.services.events import GOOGLE_ACCESS_LOST, delete_from_calendars, push_pending_to_google
 from app.services.ru import MONTHS, RELATIVE_DAYS, WEEKDAYS, day_label, plural
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,14 @@ EDIT_PROMPTS = {
     "title": "Напишите новое название",
     "date": "Напишите новую дату: «завтра», «в пятницу», «через 2 дня», «15 октября»",
     "time": "Напишите новое время: «18:00», «с 10 до 12» — или «без времени»",
+    "repeat": "Как повторять: «каждый день», «по будням», «каждую неделю 5 раз», «каждый месяц до 1 мая» — или «не повторять»",
+    "period": "До какого дня длится: «по 20 октября», «3 дня» — или «один день»",
+    "reminder": "Когда напомнить: «за 30 минут», «за 2 часа», «за день» — или «не напоминать»",
 }
+NO_REPEAT_WORDS = re.compile(r"^\s*(не\s+повтор\w*|без\s+повтор\w*|один\s+раз|однократно|убрать(\s+повтор\w*)?|нет)\s*\.?\s*$", re.I)
+NO_REMINDER_WORDS = re.compile(r"^\s*(не\s+напомина\w*|без\s+напомина\w*|убрать|нет|не\s+надо)\s*\.?\s*$", re.I)
+ONE_DAY_WORDS = re.compile(r"^\s*(один\s+день|1\s+день|только\s+этот\s+день|убрать)\s*\.?\s*$", re.I)
+LEAD_UNITS = {"мин": 1, "час": 60, "ч": 60, "дн": 1440, "день": 1440, "дня": 1440, "сут": 1440, "недел": 10080}
 CANCEL_WORDS = {"отмена", "отменить", "стоп", "/cancel"}
 NO_TIME_WORDS = re.compile(r"^\s*(без\s+времени|весь\s+день|убрать(\s+время)?|нет|не\s+важно|любое)\s*\.?\s*$", re.I)
 DEADLINE_PHRASE = re.compile(
@@ -934,6 +941,67 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
             return None, "Не поняла время. Напишите, например: «18:00», «в 9 утра», «с 10 до 12» или «без времени»"
         item["time"] = start.strftime("%H:%M")
         item["end_time"] = end.strftime("%H:%M") if end else None
+    elif field == "repeat":
+        return edit_repeat(item, value, now)
+    elif field == "period":
+        if ONE_DAY_WORDS.match(value):
+            item["end_date"] = None
+            return item, None
+        first = date.fromisoformat(item["date"])
+        if days := re.search(r"(\d+)\s*(?:дн|день|дня|сут)", value, re.I):
+            last = first + timedelta(days=max(1, int(days.group(1))) - 1)
+        else:
+            parsed = dates.parse(value, now)
+            last = parsed.end_date or parsed.date
+        if last is None:
+            return None, "Не поняла. Напишите, например: «по 20 октября», «3 дня» — или «один день»"
+        if last < first:
+            return None, "Последний день раньше первого — напишите другой"
+        item["end_date"] = last.isoformat() if last > first else None
+        item["rrule"] = None if last > first else item.get("rrule")
+    elif field == "reminder":
+        if NO_REMINDER_WORDS.match(value):
+            item["reminder_minutes"] = None
+            return item, None
+        found = re.search(r"(\d+(?:[.,]\d+)?)?\s*(мин|час|ч\b|дн|день|дня|сут|недел)", value.lower())
+        if not found and re.search(r"в\s+момент|при\s+начале|сразу", value.lower()):
+            item["reminder_minutes"] = 0
+            return item, None
+        if not found:
+            return None, "Не поняла. Напишите, например: «за 30 минут», «за 2 часа», «за день» — или «не напоминать»"
+        number = float((found.group(1) or "1").replace(",", "."))
+        unit = next(minutes for stem, minutes in LEAD_UNITS.items() if found.group(2).startswith(stem))
+        minutes = round(number * unit)
+        if not 0 <= minutes <= tasks.MAX_REMINDER_MINUTES:
+            return None, "Напомнить можно не раньше чем за неделю"
+        item["reminder_minutes"] = minutes
+    return item, None
+
+
+def edit_repeat(item: dict, value: str, now: datetime) -> tuple[dict | None, str | None]:
+    """The repeat of a draft item from words: a new rule, the same rule with a count or an end, or none."""
+    if NO_REPEAT_WORDS.match(value):
+        item["rrule"] = None
+        return item, None
+    rule = dates.parse(value, now).rrule
+    current = item.get("rrule")
+    if not rule and current:
+        # "5 раз", "до 1 декабря": the end of the repeat the item already has
+        ending = dates.parse(f"каждый день {value}", now).rrule or ""
+        rule = re.sub(r";(?:COUNT|UNTIL)=[^;]+", "", current) + "".join(f";{part}" for part in re.findall(r"(?:UNTIL)=[^;]+", ending))
+    if not rule:
+        return None, "Не поняла повтор. Напишите, например: «каждый день», «по будням», «каждую неделю 5 раз» — или «не повторять»"
+    if count := re.search(r"(\d+)\s*раз", value, re.I):
+        rule = re.sub(r";(?:COUNT|UNTIL)=[^;]+", "", rule) + f";COUNT={min(int(count.group(1)), dates.MAX_COUNT)}"
+    rule = dates.valid_rrule(rule)
+    if not rule:
+        return None, "Такой повтор не получится — напишите по-другому"
+    clock = time.fromisoformat(item["time"]) if item.get("time") else time.min
+    first = dates.first_occurrence(rule, datetime.combine(date.fromisoformat(item["date"]), clock, now.tzinfo), now)
+    item["rrule"] = rule
+    item["end_date"] = None
+    if first:
+        item["date"] = first.date().isoformat()
     return item, None
 
 
@@ -1740,7 +1808,7 @@ async def delete_events(session: AsyncSession, user: User, event_ids: list[int])
     events = list(await session.scalars(select(Event).where(Event.user_id == user.id, Event.id.in_(event_ids[:MAX_DELETE]))))
     if not events:
         return 0
-    await delete_from_google(session, user.id, events)
+    await delete_from_calendars(session, user.id, events)
     for event in events:
         await session.delete(event)
     await session.commit()
@@ -1923,7 +1991,7 @@ async def undo(session: AsyncSession, user: User, event_ids: list[int]) -> int:
     events = list(await session.scalars(select(Event).where(Event.id.in_(event_ids), Event.user_id == user.id, Event.created_at >= since)))
     if not events:
         return 0
-    await delete_from_google(session, user.id, events)
+    await delete_from_calendars(session, user.id, events)
     for event in events:
         await session.delete(event)
     await session.commit()

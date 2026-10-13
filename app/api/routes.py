@@ -49,7 +49,7 @@ from app.services import chat, insights, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
 from app.services.google_calendar import revoke_google_access
-from app.services.events import default_calendar, delete_from_google, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
+from app.services.events import default_calendar, delete_from_calendars, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets
 
@@ -277,7 +277,7 @@ async def delete_event(
     if scope == "series":
         await tasks.delete_series(session, user, event)
         return
-    await delete_from_google(session, user.id, [event])
+    await delete_from_calendars(session, user.id, [event])
     await session.delete(event)
     await session.commit()
 
@@ -328,7 +328,7 @@ async def create_tag(payload: TagCreate, user: User = Depends(get_current_user),
     if await session.scalar(select(func.count()).select_from(Tag).where(Tag.user_id == user.id)) >= MAX_TAGS:
         raise HTTPException(status_code=422, detail=f"Можно создать не больше {MAX_TAGS} тегов")
     await _ensure_unique_tag(session, user, payload.name)
-    tag = Tag(user_id=user.id, name=payload.name, color=payload.color)
+    tag = Tag(user_id=user.id, name=payload.name, color=payload.color, counts_progress=payload.counts_progress)
     session.add(tag)
     await session.commit()
     await session.refresh(tag)
@@ -343,6 +343,8 @@ async def update_tag(tag_id: int, payload: TagUpdate, user: User = Depends(get_c
         tag.name = payload.name
     if payload.color:
         tag.color = payload.color
+    if payload.counts_progress is not None:
+        tag.counts_progress = payload.counts_progress
     await session.commit()
     await session.refresh(tag)
     return tag

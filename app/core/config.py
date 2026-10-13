@@ -82,6 +82,11 @@ class Settings:
     openai_base_url: str = os.getenv("BASE_URL", "").strip().rstrip("/")
     openai_model: str = os.getenv("OPENAI_MODEL", "").strip()
     openai_agent_model: str = (os.getenv("OPENAI_AGENT_MODEL") or os.getenv("OPENAI_MODEL", "")).strip()
+    # Reasoning models (DeepSeek V4): "off" sends thinking disabled, "low"/"high" a reasoning effort with room for it;
+    # empty sends neither, for APIs that do not know these parameters
+    openai_thinking: str = os.getenv("OPENAI_THINKING", "").strip().lower()
+    # Reads photos sent to the bot (a ticket, a screenshot of a chat); empty: OPENAI_MODEL
+    openai_vision_model: str = (os.getenv("OPENAI_VISION_MODEL") or os.getenv("OPENAI_MODEL", "")).strip()
     jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
     jwt_expire_minutes: int = int(os.getenv("JWT_EXPIRE_MINUTES", "15"))
     jwt_refresh_expire_days: int = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "30"))

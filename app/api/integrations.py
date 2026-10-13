@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth import first_sync, google_authorization_url, yandex_authorization_url, notion_authorization_url, jira_authorization_url
+from app.api.auth import first_sync, google_authorization_url, yandex_authorization_url
 from app.api.deps import get_current_user
 from app.core.crypto import decrypt_json, encrypt_json
 from app.core.database import get_session
@@ -54,8 +54,6 @@ async def connect_integration(slug: str, payload: IntegrationConnect, user: User
         builders = {
             "google": google_authorization_url,
             "yandex": yandex_authorization_url,
-            "notion": notion_authorization_url,
-            "jira":   jira_authorization_url,
         }
         builder = builders.get(slug)
         if not builder:

@@ -250,7 +250,8 @@ def _explicit_date(low: str, today: date, earliest: date | None = None) -> tuple
         if found and not match.group(4) and found < earliest:
             found = _safe_date(found.year + 1, found.month, found.day)
         return found, match.span()
-    for match in re.finditer(r"(?<![\d.:])(\d{1,2})[./](\d{1,2})(?:[./](\d{4}|\d{2}))?(?![\d.:])", low):
+    # A full stop after the date ends the sentence ("Дата: 05.12.2026. Время: 21:55"); a dot and a digit is something else
+    for match in re.finditer(r"(?<![\d.:])(\d{1,2})[./](\d{1,2})(?:[./](\d{4}|\d{2}))?(?![\d:]|[./]\d)", low):
         before = low[: match.start()].rstrip()
         if not match.group(3) and (before.endswith((" в", " к")) or before in ("в", "к")):
             continue  # "в 18.30" is a time

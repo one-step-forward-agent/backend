@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Event, Tag, User
 from app.services.dates import describe_rrule, valid_rrule
-from app.services.events import default_calendar, delete_from_google, push_new_events_to_google, push_pending_to_google
+from app.services.events import default_calendar, delete_from_calendars, push_new_events_to_google, push_pending_to_google
 from app.services.integrations.service import user_timezone
 
 logger = logging.getLogger(__name__)
@@ -299,7 +299,7 @@ async def change_series(session: AsyncSession, user: User, event: Event, rule: s
         later = list(await session.scalars(
             select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at > event.start_at, Event.id != event.id)
         ))
-        await delete_from_google(session, user.id, later)
+        await delete_from_calendars(session, user.id, later)
         for item in later:
             await session.delete(item)
         await session.execute(
@@ -317,12 +317,12 @@ async def change_series(session: AsyncSession, user: User, event: Event, rule: s
 async def delete_series(session: AsyncSession, user: User, event: Event) -> int:
     """Delete this and later occurrences; earlier ones stay as history but stop the series from refilling."""
     if not event.series_id:
-        await delete_from_google(session, user.id, [event])
+        await delete_from_calendars(session, user.id, [event])
         await session.delete(event)
         await session.commit()
         return 1
     later = list(await session.scalars(select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at >= event.start_at)))
-    await delete_from_google(session, user.id, later)
+    await delete_from_calendars(session, user.id, later)
     for item in later:
         await session.delete(item)
     await session.execute(update(Event).where(Event.user_id == user.id, Event.series_id == event.series_id).values(recurrence_rule=None))
@@ -368,6 +368,12 @@ def is_overdue(event: Event, today: date, tz: ZoneInfo) -> bool:
     )
 
 
+async def counted(session: AsyncSession, user: User, events: list[Event]) -> list[Event]:
+    """The tasks that count in the progress: without a tag the user marked «не считать в прогрессе»."""
+    skipped = set(await session.scalars(select(Tag.id).where(Tag.user_id == user.id, Tag.counts_progress.is_(False))))
+    return [event for event in events if not skipped & set(event.tag_ids or [])] if skipped else events
+
+
 def _percent(done: int, total: int) -> int:
     return round(done * 100 / total) if total else 0
 
@@ -379,7 +385,7 @@ async def daily_stats(session: AsyncSession, user: User, days: int = 7) -> dict:
     today = now.date()
     first = today - timedelta(days=days - 1)
     start = datetime.combine(first, time.min, tz)
-    events = await events_between(session, user, start, datetime.combine(today + timedelta(days=1), time.min, tz), limit=5000)
+    events = await counted(session, user, await events_between(session, user, start, datetime.combine(today + timedelta(days=1), time.min, tz), limit=5000))
     per_day = {first + timedelta(days=offset): [0, 0] for offset in range(days)}
     for event in events:
         day = event.start_at.astimezone(tz).date()
@@ -409,7 +415,7 @@ async def streaks(session: AsyncSession, user: User, now: datetime) -> tuple[int
     tz = now.tzinfo
     today = now.date()
     first = today - timedelta(days=STREAK_DAYS - 1)
-    events = await events_between(session, user, datetime.combine(first, time.min, tz), datetime.combine(today + timedelta(days=1), time.min, tz), limit=10000)
+    events = await counted(session, user, await events_between(session, user, datetime.combine(first, time.min, tz), datetime.combine(today + timedelta(days=1), time.min, tz), limit=10000))
     per_day: dict[date, list[int]] = {}
     for event in events:
         day = event.start_at.astimezone(tz).date()

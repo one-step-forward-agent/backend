@@ -41,54 +41,19 @@ async def log_in(browser, provider: str) -> httpx.Response:
     return await browser.get(f"/auth/{provider}/callback", params={"code": "code-1", "state": query["state"][0]})
 
 
-async def test_sign_up_with_notion_makes_the_account_and_connects_notion(browser, services):
-    email = f"new-{uuid.uuid4().hex[:10]}@notion.so"
-    services.notion_owner = {"id": f"n-{uuid.uuid4().hex}", "name": "Ольга", "person": {"email": email}}
-    response = await sign_up(browser, "notion")
-    path, params = redirect(response)
-    assert path == "/onboarding/integrations" and params == {"resume": "1", "connected": "notion"}
-    headers = session_headers(response)
-    me = (await browser.get("/api/me", headers=headers)).json()
-    assert me["email"] == email and me["name"] == "Ольга"
-    listed = {item["slug"]: item for item in (await browser.get("/api/integrations", headers=headers)).json()}
-    assert listed["notion"]["connection"]["account_email"] == email
-
-    # The same Notion account logs in later, to the same Dayla account
-    again = await log_in(browser, "notion")
-    assert again.headers["location"] == "/app"
-    assert (await browser.get("/api/me", headers=session_headers(again))).json()["id"] == me["id"]
 
 
-async def test_sign_up_with_jira_makes_the_account_and_connects_jira(browser, services):
-    email = f"new-{uuid.uuid4().hex[:10]}@corp.com"
-    services.atlassian_me = {"account_id": f"atl-{uuid.uuid4().hex}", "email": email, "name": "Ольга", "email_verified": True}
-    response = await sign_up(browser, "jira")
-    path, params = redirect(response)
-    assert path == "/onboarding/integrations" and params["connected"] == "jira"
-    headers = session_headers(response)
-    assert (await browser.get("/api/me", headers=headers)).json()["email"] == email
-    listed = {item["slug"]: item for item in (await browser.get("/api/integrations", headers=headers)).json()}
-    assert listed["jira"]["connection"]["account_email"] == email
 
 
-async def test_an_unconfirmed_atlassian_email_does_not_make_an_account(browser, services):
-    services.atlassian_me = {"account_id": f"atl-{uuid.uuid4().hex}", "email": "someone@corp.com", "email_verified": False}
-    path, params = redirect(await sign_up(browser, "jira"))
-    assert path == "/register" and "email" in params["error"]
 
-
-async def test_a_workspace_notion_without_a_person_cannot_sign_in(browser, services):
-    services.notion_owner = {}
-    path, params = redirect(await sign_up(browser, "notion"))
-    assert path == "/login" and "Notion" in params["error"]
-
-
-async def test_connecting_notion_still_needs_the_logged_in_account(client, user, services):
-    from tests.test_integrations import oauth_connect
-
+async def test_jira_and_notion_can_no_longer_be_used(browser, client, user):
     headers, _ = user
-    services.notion_owner = {"id": f"n-{uuid.uuid4().hex}", "person": {"email": "olga@notion.so"}}
-    await oauth_connect(client, headers, "notion")
+    for provider in ("notion", "jira"):
+        started = await browser.post(f"/auth/oauth/{provider}/start", json={"mode": "signup", "consent": True})
+        assert started.status_code == 404
+        assert (await client.post(f"/api/integrations/{provider}/connect", json={"values": {}}, headers=headers)).status_code == 404
+    listed = {item["slug"] for item in (await client.get("/api/integrations", headers=headers)).json()}
+    assert not listed & {"notion", "jira"}
 
 
 async def test_reminder_every_day_repeats_and_says_so(client, user, agent):

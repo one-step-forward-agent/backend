@@ -1,3 +1,5 @@
+import base64
+import logging
 from datetime import date
 from typing import Literal
 
@@ -17,6 +19,7 @@ from app.schemas import (
     BotClaimRequest,
     BotCompleteRequest,
     BotEditRequest,
+    BotImageRequest,
     BotRatingRequest,
     BotTopicRequest,
     BotRemoveRequest,
@@ -31,6 +34,7 @@ from app.schemas import (
 from app.services import chat, reminders, tasks, usage
 from app.services.integrations.service import user_timezone
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/internal/bot", tags=["bot"], dependencies=[Depends(require_bot)], include_in_schema=False)
 
 
@@ -72,6 +76,27 @@ async def chat_message(chat_id: int, payload: BotChatRequest, session: AsyncSess
     try:
         return await chat.handle_message(session, user, payload.text)
     except chat.AssistantUnavailable:
+        raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
+
+
+@router.post("/chat/{chat_id}/image-text")
+async def chat_image_text(chat_id: int, payload: BotImageRequest, session: AsyncSession = Depends(get_session)):
+    """The text of a photo sent to the bot; the bot then sends it on as a message, like the text of a document."""
+    from services.gigachat import GigaChatClient, ImagesNotSupported
+
+    user = await _user_by_chat(session, chat_id)
+    await limit_assistant(session, user, None)
+    usage.current_user_id.set(user.id)
+    try:
+        data = base64.b64decode(payload.image, validate=True)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Не получилось открыть картинку") from None
+    try:
+        return {"text": await GigaChatClient().image_text(data, payload.mime)}
+    except ImagesNotSupported:
+        raise HTTPException(status_code=422, detail="Картинки пока не читаю — перешлите текст или PDF") from None
+    except Exception:
+        logger.exception("Image of chat %s could not be read", chat_id)
         raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
 
 

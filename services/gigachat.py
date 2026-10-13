@@ -201,6 +201,25 @@ def gigachat_message(message: dict) -> dict:
     return result
 
 
+# Tokens a reasoning model may spend thinking before it writes the answer: without them a 1500-token limit
+# is used up by the reasoning and the answer comes back empty
+THINKING_ROOM = {"low": 4000, "high": 12000}
+
+
+def with_thinking(payload: dict) -> dict:
+    """The OpenAI-compatible request with the reasoning setting of OPENAI_THINKING."""
+    mode = settings.openai_thinking
+    if mode == "off":
+        return {**payload, "thinking": {"type": "disabled"}}
+    if mode in THINKING_ROOM:
+        return {**payload, "reasoning_effort": mode, "max_tokens": payload.get("max_tokens", 1000) + THINKING_ROOM[mode]}
+    return payload
+
+
+class ImagesNotSupported(Exception):
+    """The model in use cannot read images."""
+
+
 class GigaChatClient:
     """Language model client. Despite the name it also talks to an OpenAI-compatible API when LLM_PROVIDER=openai."""
 
@@ -242,6 +261,7 @@ class GigaChatClient:
         client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else aiohttp.ClientTimeout(total=300)
         async with aiohttp.ClientSession(timeout=client_timeout) as session:
             if settings.uses_openai:
+                payload = with_thinking(payload)
                 url = f"{settings.openai_base_url}/chat/completions"
                 headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
                 ssl_context = True
@@ -476,7 +496,7 @@ class GigaChatClient:
             "(habits.most_done); если подходящее время не известно — time null. Оставь запас: последний подготовительный шаг — "
             "не позже чем за день до deadline, если дней хватает. "
             "Верни только JSON без markdown: {\"answer\": 1–2 предложения для пользователя о том, как ты разложила шаги "
-            "и почему так (с опорой на его загрузку), "
+            "и почему так (с опорой на его загрузку) — на «вы», обычными словами, без названий полей вроде busy_days или free_time, "
             "\"steps\": [{\"title\": до 60 символов, \"date\": \"YYYY-MM-DD\", \"time\": \"HH:MM\" или null, "
             "\"duration_minutes\": число}]}.\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False, default=str)}"
@@ -489,6 +509,34 @@ class GigaChatClient:
         }
         result = await self._complete(payload, "breakdown")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
+
+    async def image_text(self, data: bytes, mime: str) -> str:
+        """What a photo says about plans: a ticket, an invitation, a screenshot of a chat. Only an OpenAI-compatible
+        model with image input can read it (LLM_PROVIDER=openai); GigaChat raises ImagesNotSupported."""
+        if not settings.uses_openai:
+            raise ImagesNotSupported
+        prompt = (
+            "Перепиши с картинки всё, что относится к делам и событиям: что, дата, время, место, адрес, номер рейса или "
+            "брони, кто прислал и о чём просит. Обычным текстом по-русски, без markdown и без своих выводов. "
+            "Если на картинке нет ничего о планах — ответь одним словом: НЕТ."
+        )
+        payload = {
+            "model": settings.openai_vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}},
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 800,
+        }
+        result = await self._complete(payload, "image", timeout=90)
+        text = (result["choices"][0]["message"].get("content") or "").strip()
+        return "" if text.upper().startswith("НЕТ") and len(text) < 10 else text[:4000]
 
     async def agent_step(self, messages: list[dict], functions: list[dict]) -> dict:
         """One step of the assistant agent: the model either calls one of `functions` or answers.

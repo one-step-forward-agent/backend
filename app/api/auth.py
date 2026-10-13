@@ -371,8 +371,6 @@ async def jira_login(user: User = Depends(get_current_user)):
 SIGN_IN_URLS = {
     "google": google_authorization_url,
     "yandex": yandex_authorization_url,
-    "notion": notion_authorization_url,
-    "jira": jira_authorization_url,
 }
 SIGN_IN_TITLES = {"google": "Google", "yandex": "Яндекс", "notion": "Notion", "jira": "Atlassian"}
 OAUTH_START_MAX_PER_IP = 60
@@ -380,7 +378,7 @@ OAUTH_START_MAX_PER_IP = 60
 
 @session_router.post("/oauth/{provider}/start")
 async def oauth_start(provider: str, payload: OAuthStart, request: Request):
-    """Sign up or log in through Google, Yandex, Notion or Atlassian (Jira): a link to the provider; the callback
+    """Sign up or log in through Google or Yandex: a link to the provider; the callback
     creates or finds the user."""
     builder = SIGN_IN_URLS.get(provider)
     if not builder:

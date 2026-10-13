@@ -155,6 +155,8 @@ class Tag(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(EncryptedText("tags.name"))
     color: Mapped[str] = mapped_column(String(20), default="indigo", server_default="indigo")
+    # False for tags like «прогулка»: their tasks are not counted in the progress and the streak
+    counts_progress: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -1,7 +1,9 @@
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urljoin
 from uuid import uuid4
 from xml.etree import ElementTree
+from xml.sax.saxutils import escape
 
 from defusedxml import ElementTree as SafeElementTree
 from zoneinfo import ZoneInfo
@@ -32,6 +34,17 @@ EVENTS_QUERY = """<?xml version="1.0" encoding="utf-8"?>
     <c:time-range start="{start}" end="{end}"/>
   </c:comp-filter></c:comp-filter></c:filter>
 </c:calendar-query>"""
+
+
+UID_QUERY = """<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/></d:prop>
+  <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">
+    <c:prop-filter name="UID"><c:text-match collation="i;octet">{uid}</c:text-match></c:prop-filter>
+  </c:comp-filter></c:comp-filter></c:filter>
+</c:calendar-query>"""
+# An imported occurrence of a series: "<uid>@20261014T100000Z" (see _to_item)
+RECURRENCE_SUFFIX = re.compile(r"@\d{8}(?:T\d{6}Z?)?$")
 
 
 class CalDAVUnauthorized(IntegrationError):
@@ -191,4 +204,29 @@ class AppleCalendarIntegration(IntegrationProvider):
                 raise IntegrationError("CalDAV сервер недоступен") from error
         if response.status_code not in (200, 201, 204):
             raise IntegrationError(f"CalDAV сервер отклонил событие ({response.status_code})")
-        return PushResult(external_id=uid)
+        # The address of the .ics is what a later deletion needs
+        return PushResult(external_id=uid, url=url)
+
+    async def delete_event(self, external_id: str, url: str | None = None) -> None:
+        if RECURRENCE_SUFFIX.search(external_id):
+            # One occurrence of a series made in the calendar itself: deleting its file would delete the whole series
+            return
+        async with self._client() as client:
+            addresses = [url] if url else await self._find(client, external_id)
+            for address in addresses:
+                try:
+                    response = await client.delete(address)
+                except (httpx.HTTPError, httpx.InvalidURL) as error:
+                    raise IntegrationError("CalDAV сервер недоступен") from error
+                # 404 and 410: already deleted there
+                if response.status_code not in (200, 204, 404, 410):
+                    raise IntegrationError(f"CalDAV сервер не удалил событие ({response.status_code})")
+
+    async def _find(self, client: httpx.AsyncClient, uid: str) -> list[str]:
+        """The addresses of the calendar files that hold the event with this UID."""
+        body = UID_QUERY.format(uid=escape(uid))
+        found = []
+        for calendar_url, _ in await self._calendars(client):
+            url, tree = await self._multistatus(client, "REPORT", calendar_url, body, "1")
+            found += [urljoin(url, href.text) for href in tree.iterfind("d:response/d:href", NS) if href.text]
+        return found

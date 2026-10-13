@@ -129,3 +129,20 @@ async def test_a_parallel_tool_call_is_taken_one_at_a_time():
         }
     )
     assert message == {"role": "assistant", "content": "", "function_call": {"name": "get_events", "arguments": {"query": "отчёт"}}}
+
+
+def test_thinking_setting_shapes_the_request(monkeypatch):
+    import dataclasses
+
+    from app.core.config import settings
+    from services import gigachat
+
+    payload = {"model": "m", "max_tokens": 1500, "messages": []}
+    monkeypatch.setattr(gigachat, "settings", dataclasses.replace(settings, openai_thinking=""))
+    assert gigachat.with_thinking(payload) == payload
+    monkeypatch.setattr(gigachat, "settings", dataclasses.replace(settings, openai_thinking="off"))
+    assert gigachat.with_thinking(payload)["thinking"] == {"type": "disabled"}
+    monkeypatch.setattr(gigachat, "settings", dataclasses.replace(settings, openai_thinking="low"))
+    low = gigachat.with_thinking(payload)
+    # The reasoning gets its own room: the answer is not cut off at the old limit
+    assert low["reasoning_effort"] == "low" and low["max_tokens"] == 1500 + gigachat.THINKING_ROOM["low"]

@@ -532,3 +532,18 @@ async def test_moving_everything_keeps_tasks_without_time(client, user, agent):
     agent([act(op("change", filter={"date_from": "сегодня", "timed": "timed"}, to_date="завтра"))])
     reply = await say(client, headers, "перенеси всё с сегодня на завтра")
     assert sorted(event["title"] for event in reply["events"]) == ["Купить продукты", "Подарок батьке"]
+
+
+async def test_tasks_with_a_tag_outside_the_progress_are_not_counted(client, user):
+    headers, _ = user
+    walk = (await client.post("/api/tags", json={"name": "прогулка", "counts_progress": False}, headers=headers)).json()
+    assert walk["counts_progress"] is False
+    start = datetime.now(TZ).replace(hour=23, minute=0, second=0, microsecond=0)
+    body = {"start_at": start.isoformat(), "end_at": (start + timedelta(minutes=30)).isoformat(), "timezone": "Europe/Moscow"}
+    await client.post("/api/events", json={**body, "title": "Спортзал"}, headers=headers)
+    await client.post("/api/events", json={**body, "title": "Прогулка", "tag_ids": [walk["id"]]}, headers=headers)
+    stats = (await client.get("/api/stats", headers=headers)).json()
+    assert stats["today"]["total"] == 1
+    turned = await client.patch(f"/api/tags/{walk['id']}", json={"counts_progress": True}, headers=headers)
+    assert turned.json()["counts_progress"] is True
+    assert (await client.get("/api/stats", headers=headers)).json()["today"]["total"] == 2
