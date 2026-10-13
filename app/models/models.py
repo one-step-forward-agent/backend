@@ -201,6 +201,23 @@ class Integration(Base):
     user: Mapped[User] = relationship(back_populates="integrations")
     calendars: Mapped[list[Calendar]] = relationship(back_populates="integration")
 
+class RemoteDeletion(Base):
+    """An event deleted in Dayla whose copy a connected calendar has not deleted yet (no access, the service was
+    down). It is retried every minute and its copy is never imported back meanwhile."""
+
+    __tablename__ = "remote_deletions"
+    __table_args__ = (UniqueConstraint("user_id", "provider", "external_id", name="uq_remote_deletions_copy"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(50))
+    # The id the calendar knows the event by (a Google event id, a CalDAV UID), without Dayla's prefix
+    external_id: Mapped[str] = mapped_column(String(255))
+    url: Mapped[str | None] = mapped_column(String(1000))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class EventLink(Base):
     __tablename__ = "event_links"
     __table_args__ = (UniqueConstraint("event_id", "integration_id", name="uq_event_links_event_integration"),)

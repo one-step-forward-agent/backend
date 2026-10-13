@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.errors import SERVER_ERROR, plain
 from app.core.crypto import decrypt_json, encrypt_json
-from app.models.models import Calendar, Event, EventLink, Integration, SyncStatus, User
+from app.models.models import Calendar, Event, EventLink, Integration, RemoteDeletion, SyncStatus, User
 from app.services.integrations.base import EventPayload, IntegrationError, IntegrationProvider, ProviderContext
 from app.services.integrations.registry import PROVIDERS
 
@@ -117,6 +117,8 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
     _persist_rotated_secrets(integration, provider)
     calendar = await import_calendar(session, user, integration)
     exported = set(await session.scalars(select(EventLink.external_id).where(EventLink.integration_id == integration.id)))
+    # Deleted in Dayla, not yet in the calendar: not brought back
+    exported |= set(await session.scalars(select(RemoteDeletion.external_id).where(RemoteDeletion.user_id == user.id, RemoteDeletion.provider == integration.provider)))
     created = updated = skipped = 0
     for item in items:
         if item.external_id in exported:

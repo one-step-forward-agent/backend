@@ -58,3 +58,81 @@ async def test_deleting_a_series_deletes_its_google_copies(client, user, service
     response = await client.delete(f"/api/events/{event_id}", params={"scope": "series"}, headers=headers)
     assert response.status_code == 204
     assert "g-series-1" in services.deleted_google
+
+
+async def google_ids(event_ids: list[int]) -> list[str | None]:
+    async with session_factory() as session:
+        return [(await session.get(Event, event_id)).external_id for event_id in event_ids]
+
+
+async def test_a_task_added_by_the_assistant_is_deleted_in_google(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    reply = (await client.post("/api/assistant/chat", json={"text": "позвонить маме послезавтра в 18:00"}, headers=headers)).json()
+    created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    [external] = await google_ids(created["event_ids"])
+    assert external
+    assert (await client.delete(f"/api/events/{created['event_ids'][0]}", headers=headers)).status_code == 204
+    assert external in services.deleted_google
+
+
+async def test_a_moved_task_is_deleted_in_google(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    event_id = await synced_task(client, headers, "Отчёт")
+    [external] = await google_ids([event_id])
+    start = datetime.now(TZ).replace(hour=15, minute=0, second=0, microsecond=0) + timedelta(days=3)
+    moved = await client.put(f"/api/events/{event_id}", json={"start_at": start.isoformat(), "end_at": (start + timedelta(hours=1)).isoformat()}, headers=headers)
+    assert moved.status_code == 200, moved.text
+    assert (await client.delete(f"/api/events/{event_id}", headers=headers)).status_code == 204
+    assert external in services.deleted_google
+
+
+async def test_an_imported_google_event_is_deleted_in_google(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    events = (await client.get("/api/events", params={"limit": 50}, headers=headers)).json()
+    [imported] = [event for event in events if event["title"] == "Стендап в Google"]
+    assert (await client.delete(f"/api/events/{imported['id']}", headers=headers)).status_code == 204
+    assert "g-ev-1" in services.deleted_google
+
+
+async def test_later_days_of_a_series_are_deleted_in_google(client, user, services):
+    from app.services import events as events_service, tasks
+
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    event_id = await synced_task(client, headers, "Зарядка", recurrence_rule="FREQ=DAILY")
+    async with session_factory() as session:
+        await tasks.extend_series(session, datetime.now(timezone.utc) + timedelta(days=60), force=True)
+        user_id = (await session.get(Event, event_id)).user_id
+        await events_service.push_unsent_to_google(session, user_id)
+    sent = len(services.created["google"])
+    assert (await client.delete(f"/api/events/{event_id}", params={"scope": "series"}, headers=headers)).status_code == 204
+    # Every day Google got is deleted there
+    assert len(services.deleted_google) == sent
+
+
+async def test_a_deletion_google_refused_is_retried_and_not_imported_back(client, user, services):
+    from sqlalchemy import select
+
+    from app.models.models import RemoteDeletion
+    from app.services import events as events_service
+
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    events = (await client.get("/api/events", params={"limit": 50}, headers=headers)).json()
+    [imported] = [event for event in events if event["title"] == "Стендап в Google"]
+    services.google_delete_status = 503
+    assert (await client.delete(f"/api/events/{imported['id']}", headers=headers)).status_code == 204
+    assert services.deleted_google == []
+    # The next import does not bring the deleted event back
+    await client.post("/api/integrations/google/sync", headers=headers)
+    titles = [event["title"] for event in (await client.get("/api/events", params={"limit": 50}, headers=headers)).json()]
+    assert "Стендап в Google" not in titles
+
+    services.google_delete_status = 204
+    async with session_factory() as session:
+        assert await events_service.retry_remote_deletions(session) == 1
+        assert not list(await session.scalars(select(RemoteDeletion)))
+    assert services.deleted_google == ["g-ev-1"]

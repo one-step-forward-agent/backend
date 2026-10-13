@@ -6,7 +6,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Calendar, Event, EventLink, Integration, User
+from app.models.models import Calendar, Event, EventLink, Integration, RemoteDeletion, User
 from app.services.google_calendar import GoogleCalendarProvider
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets, store_secrets
@@ -52,29 +52,61 @@ def remember_google_token(integration: Integration, provider: GoogleCalendarProv
     store_secrets(integration, {"access_token": provider.access_token})
 
 
+# A deletion a calendar has not taken is retried every minute this long, then given up
+REMOTE_DELETION_DAYS = 30
+
+
+def remember_deletion(session: AsyncSession, user_id: int, provider: str, external_id: str, url: str | None = None) -> None:
+    """The copy could not be deleted now (no access, the service is down): the retry loop deletes it later, and
+    until then the import does not bring it back into Dayla."""
+    session.add(RemoteDeletion(user_id=user_id, provider=provider, external_id=external_id[:255], url=url))
+
+
+async def delete_in_google(provider: GoogleCalendarProvider, external_id: str) -> None:
+    try:
+        await provider.delete_event("primary", external_id)
+    except httpx.HTTPStatusError as error:
+        # 404 and 410: already deleted in Google
+        if error.response.status_code not in (404, 410):
+            raise
+
+
 async def delete_from_google(session: AsyncSession, user_id: int, events: list[Event]) -> None:
     """Remove the Google copies of events deleted in Dayla; otherwise they stay in Google (and the next import brings them back)."""
     synced = [event for event in events if event.external_id and event.source == "google"]
     if not synced:
         return
     integration, provider = await google_provider(session, user_id)
-    if not provider:
+    if not integration:
         return
     for event in synced:
+        if not provider:
+            remember_deletion(session, user_id, "google", event.external_id)
+            continue
         try:
-            await provider.delete_event("primary", event.external_id)
-        except httpx.HTTPStatusError as error:
-            # 404 and 410: already deleted in Google
-            if error.response.status_code not in (404, 410):
-                logger.warning("Could not delete Google event %s: %s", event.external_id, error.response.status_code)
-        except Exception:
-            logger.warning("Could not delete Google event %s", event.external_id)
-    remember_google_token(integration, provider)
+            await delete_in_google(provider, event.external_id)
+        except httpx.HTTPError as error:
+            status = error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
+            logger.warning("Could not delete Google event %s now, will retry: %s", event.external_id, status or error)
+            remember_deletion(session, user_id, "google", event.external_id)
+            if access_lost(error):
+                # The integration card asks to reconnect; the deletion goes through after that
+                mark_access_lost(integration)
+                provider = None
+    if provider:
+        remember_google_token(integration, provider)
+
+
+def remote_id(integration: Integration, external_id: str) -> str:
+    """The calendar's own id of an imported event: Dayla keeps it as "<provider>:<integration id>:<id>"."""
+    prefix = f"{integration.provider}:{integration.id}:"
+    return external_id[len(prefix):] if external_id.startswith(prefix) else external_id
 
 
 async def delete_from_calendars(session: AsyncSession, user_id: int, events: list[Event]) -> None:
     """Remove the copies of events deleted in Dayla from every connected calendar: Google, and the Yandex and Apple
-    copies Dayla sent there (event links) or imported from there. A calendar that fails never stops the deletion."""
+    copies Dayla sent there (event links) or imported from there. A calendar that fails never stops the deletion:
+    its copy is deleted later by retry_remote_deletions."""
     await delete_from_google(session, user_id, events)
     from app.services.integrations.registry import PROVIDERS
     from app.services.integrations.service import build_provider, user_timezone
@@ -92,7 +124,11 @@ async def delete_from_calendars(session: AsyncSession, user_id: int, events: lis
         if link.integration_id in integrations
     ]
     # Imported from Yandex or Apple: the event itself is their copy
-    copies += [(by_provider[event.source], event.external_id, None) for event in events if event.external_id and event.source in by_provider and event.source != "google"]
+    copies += [
+        (by_provider[event.source], remote_id(by_provider[event.source], event.external_id), None)
+        for event in events
+        if event.external_id and event.source in by_provider and event.source != "google"
+    ]
     user = await session.get(User, user_id)
     for integration, external_id, url in copies:
         if integration.provider == "google" or integration.provider not in PROVIDERS:
@@ -103,7 +139,46 @@ async def delete_from_calendars(session: AsyncSession, user_id: int, events: lis
             if provider.context.updated_secrets:
                 store_secrets(integration, provider.context.updated_secrets)
         except Exception:
-            logger.warning("Could not delete event %s from %s", external_id, integration.provider)
+            logger.warning("Could not delete event %s from %s now, will retry", external_id, integration.provider)
+            remember_deletion(session, user_id, integration.provider, external_id, url)
+
+
+async def retry_remote_deletions(session: AsyncSession, limit: int = 200) -> int:
+    """Delete the copies a calendar did not take earlier; gives up on one after REMOTE_DELETION_DAYS."""
+    from app.services.integrations.registry import PROVIDERS
+    from app.services.integrations.service import build_provider, user_timezone
+
+    pending = list(await session.scalars(select(RemoteDeletion).order_by(RemoteDeletion.id).limit(limit)))
+    done = 0
+    for row in pending:
+        if row.created_at < datetime.now(timezone.utc) - timedelta(days=REMOTE_DELETION_DAYS):
+            await session.delete(row)
+            continue
+        row.attempts += 1
+        try:
+            if row.provider == "google":
+                integration, provider = await google_provider(session, row.user_id)
+                if not provider or (integration.last_sync_error == GOOGLE_ACCESS_LOST):
+                    continue
+                await delete_in_google(provider, row.external_id)
+                remember_google_token(integration, provider)
+            else:
+                integration = await session.scalar(select(Integration).where(Integration.user_id == row.user_id, Integration.provider == row.provider))
+                if not integration or row.provider not in PROVIDERS:
+                    await session.delete(row)
+                    continue
+                provider = build_provider(integration, user_timezone(await session.get(User, row.user_id)))
+                await provider.delete_event(row.external_id, row.url)
+                if provider.context.updated_secrets:
+                    store_secrets(integration, provider.context.updated_secrets)
+        except Exception:
+            continue
+        await session.delete(row)
+        done += 1
+    await session.commit()
+    if done:
+        logger.info("Deleted %d copies in connected calendars on retry", done)
+    return done
 
 
 async def push_new_events_to_google(session: AsyncSession, user_id: int, events: list[Event]) -> None:
@@ -194,6 +269,7 @@ async def google_catch_up_loop() -> None:
                 )
                 for user_id in users:
                     await push_unsent_to_google(session, user_id)
+                await retry_remote_deletions(session)
         except asyncio.CancelledError:
             raise
         except Exception:
