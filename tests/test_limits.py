@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.core.database import session_factory
 from app.models.models import ConversationMessage, LlmUsage
 from app.services import chat
-from tests.test_agent import agent, call, say  # noqa: F401 - the fixture is used by name
+from tests.test_agent import act, agent, op, say  # noqa: F401 - the fixture is used by name
 
 
 async def user_id(client, headers) -> int:
@@ -56,7 +56,7 @@ async def test_agent_sees_only_the_recent_conversation_and_stops_after_an_action
         session.add(ConversationMessage(user_id=uid, role="user", content="старый разговор", created_at=old))
         session.add(ConversationMessage(user_id=uid, role="assistant", content="старый ответ", created_at=old))
         await session.commit()
-    requests = agent([call("create_events", events=[{"title": "Созвон", "date": "завтра", "start_time": "11:00"}]), "не нужен"])
+    requests = agent([act(op("create", events=[{"title": "Созвон", "date": "завтра", "start_time": "11:00"}])), "не нужен"])
     reply = await say(client, headers, "Созвон завтра в 11")
     assert reply["kind"] == "proposal"
     # The app words the reply to an action itself, so the model is not asked again

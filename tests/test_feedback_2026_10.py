@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.core.database import session_factory
 from app.models.models import ConversationMessage, Event, User
-from tests.test_agent import agent, call, say  # noqa: F401 — the fixture is used by name
+from tests.test_agent import act, agent, op, say  # noqa: F401 — the fixture is used by name
 
 TZ = ZoneInfo("Europe/Moscow")
 
@@ -69,7 +69,7 @@ async def test_hashtag_becomes_the_users_tag(client, user):
 async def test_agent_tags_new_and_existing_tasks(client, user, agent):  # noqa: F811
     headers, _ = user
     await client.post("/api/tags", json={"name": "Дом"}, headers=headers)
-    agent([call("create_events", events=[{"title": "Купить лампу", "date": "завтра", "tags": ["дом", "покупки"]}]), "Показала черновик."])
+    agent([act(op("create", events=[{"title": "Купить лампу", "date": "завтра", "tags": ["дом", "покупки"]}])), "Показала черновик."])
     reply = await say(client, headers, "завтра купить лампу, теги дом и покупки")
     tags = {tag["name"]: tag["id"] for tag in (await client.get("/api/tags", headers=headers)).json()}
     assert set(tags) == {"Дом", "покупки"} and sorted(reply["events"][0]["tag_ids"]) == sorted(tags.values())
@@ -80,7 +80,7 @@ async def test_agent_tags_new_and_existing_tasks(client, user, agent):  # noqa: 
 
         ref = re.search(r"\[id (\d+)\][^\n]*Купить лампу", messages[0]["content"]).group(1)
         assert "ТЕГИ пользователя: Дом, покупки" in messages[0]["content"]
-        return call("update_event", event_id=int(ref), tags=["срочное"])
+        return act(op("change", filter={"ids": [int(ref)]}, tags=["срочное"]))
 
     agent([tag_it, "Показала изменение."])
     reply = await say(client, headers, "поставь лампе тег срочное")
@@ -112,6 +112,6 @@ async def test_unmarked_past_tasks_are_not_done(client, user):
 async def test_task_without_a_day_is_for_today(client, user, agent):  # noqa: F811
     headers, _ = user
     tomorrow = (today() + timedelta(days=1)).isoformat()
-    agent([call("create_events", events=[{"title": "Купить хлеб", "date": tomorrow}]), "Показала черновик."])
+    agent([act(op("create", events=[{"title": "Купить хлеб", "date": tomorrow}])), "Показала черновик."])
     reply = await say(client, headers, "купить хлеб")
     assert reply["events"][0]["date"] == today().isoformat() and reply["events"][0]["time"] is None

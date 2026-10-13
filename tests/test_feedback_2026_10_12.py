@@ -13,7 +13,7 @@ from app.core.database import session_factory
 from app.main import app
 from app.models.models import Notification
 from app.services import chat, reminders
-from tests.test_agent import TZ, agent, call, say  # noqa: F401 - agent is a fixture
+from tests.test_agent import TZ, act, agent, op, say  # noqa: F401 - agent is a fixture
 from tests.test_integrations import services  # noqa: F401 - services is a fixture
 from tests.test_sign_in import redirect, session_headers
 
@@ -93,7 +93,7 @@ async def test_connecting_notion_still_needs_the_logged_in_account(client, user,
 
 async def test_reminder_every_day_repeats_and_says_so(client, user, agent):
     headers, _ = user
-    agent([call("create_reminder", text="Пить витамины", at="в 9:00"), "Готово"])
+    agent([act(op("remind", text="Пить витамины", at="в 9:00")), "Готово"])
     reply = await say(client, headers, "напоминай каждый день в 9:00 пить витамины")
     assert reply["kind"] == "reminder"
     item = reply["reminders"][0]
@@ -128,7 +128,7 @@ async def test_reminder_every_day_repeats_and_says_so(client, user, agent):
 
 async def test_reminder_every_two_hours(client, user, agent):
     headers, _ = user
-    agent([call("create_reminder", text="Пить воду"), "Готово"])
+    agent([act(op("remind", text="Пить воду")), "Готово"])
     item = (await say(client, headers, "напоминай пить воду каждые 2 часа"))["reminders"][0]
     assert item["repeat"] == "каждые 2 часа"
     moment = datetime.fromisoformat(item["at"])
@@ -439,7 +439,7 @@ def test_until_ends_the_series_and_is_not_its_day():
 async def test_weekly_until_january_from_the_chat(client, user, agent):
     headers, _ = user
     # The model puts the end into the date, as it did for the testers
-    agent([call("create_events", events=[{"title": "Зал", "date": "2027-01-01", "start_time": "10:00", "repeat": "каждую среду"}]), "Готово"])
+    agent([act(op("create", events=[{"title": "Зал", "date": "2027-01-01", "start_time": "10:00", "repeat": "каждую среду"}])), "Готово"])
     reply = await say(client, headers, "Каждую среду в 10:00 зал до 1 января")
     assert reply["kind"] in ("proposal", "created"), reply
     if reply["kind"] == "proposal":

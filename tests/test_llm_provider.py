@@ -74,14 +74,17 @@ def test_the_provider_needs_its_own_settings():
 
 async def test_the_agent_calls_functions_through_openai_tools(client, user, openai_api):
     headers, _ = user
-    tool_call = {"id": "call_abc", "type": "function", "function": {"name": "create_events", "arguments": json.dumps({"events": [{"title": "Купить хлеб", "date": "завтра"}]})}}
+
+    def tool_call(call_id: str, operations: list) -> dict:
+        return {"id": call_id, "type": "function", "function": {"name": "act", "arguments": json.dumps({"operations": operations})}}
+
     received = openai_api(
         [
-            {"role": "assistant", "content": None, "tool_calls": [tool_call]},
-            {"role": "assistant", "content": "Добавила в черновик."},
+            # A call that does nothing: the model sees why and calls again
+            {"role": "assistant", "content": None, "tool_calls": [tool_call("call_a", [{"action": "create", "events": []}])]},
+            {"role": "assistant", "content": None, "tool_calls": [tool_call("call_b", [{"action": "create", "events": [{"title": "Купить хлеб", "date": "завтра"}]}])]},
         ]
     )
-    # Two requests in one message: after the first action the model is asked again, with the function's result
     response = await client.post("/api/assistant/chat", json={"text": "завтра купить хлеб, потом посмотрим"}, headers=headers)
     assert response.status_code == 200, response.text
     reply = response.json()
@@ -91,14 +94,14 @@ async def test_the_agent_calls_functions_through_openai_tools(client, user, open
     assert first["model"] == "test-agent-model" and first["tool_choice"] == "auto"
     assert "functions" not in first and "function_call" not in first
     tools = {tool["function"]["name"]: tool["function"] for tool in first["tools"]}
-    assert all(tool["type"] == "function" for tool in first["tools"]) and "create_events" in tools
+    assert all(tool["type"] == "function" for tool in first["tools"]) and list(tools) == ["act"]
     # GigaChat's few-shot examples are not an OpenAI field: they are folded into the description
-    assert "few_shot_examples" not in tools["create_events"] and "Примеры:" in tools["create_events"]["description"]
-    # The function's result goes back as a tool message tied to the call
+    assert "few_shot_examples" not in tools["act"] and "Примеры:" in tools["act"]["description"]
+    # The result of the call goes back as a tool message tied to it
     calling, result = second["messages"][-2:]
-    assert calling["role"] == "assistant" and calling["tool_calls"][0]["function"]["name"] == "create_events"
-    assert json.loads(calling["tool_calls"][0]["function"]["arguments"])["events"][0]["title"] == "Купить хлеб"
-    assert result["role"] == "tool" and result["tool_call_id"] == calling["tool_calls"][0]["id"]
+    assert calling["role"] == "assistant" and calling["tool_calls"][0]["function"]["name"] == "act"
+    assert json.loads(calling["tool_calls"][0]["function"]["arguments"])["operations"][0]["action"] == "create"
+    assert result["role"] == "tool" and result["tool_call_id"] == calling["tool_calls"][0]["id"] and "events" in result["content"]
 
     async with session_factory() as session:
         row = await session.scalar(select(LlmUsage).where(LlmUsage.purpose == "agent").order_by(LlmUsage.id.desc()))

@@ -1,9 +1,10 @@
 """The chat assistant as an agent.
 
 GigaChat reads the user's message together with what Dayla knows about them (the onboarding profile, habits,
-the plan for the coming days) and decides which of the app's functions to call: find tasks, add, change, move,
-delete or complete them, set a reminder, analyse the plan, split a big task into steps. Every function runs here,
-in the app, and returns the real result to the model, which then writes the answer.
+the plan for the coming days) and says, in one call of the function `act`, what the user wants: a list of operations
+(find, create, change, delete, complete, remind, analyse, …), each with a filter of the tasks it is about (ids,
+a period, words of the title, a state, tags, a time of day). The app finds the tasks by the filter and does the work
+itself, so "перенеси всё на завтра" moves every open task of today, and the reply says what was really done.
 
 Changes of the calendar (new, changed, moved and deleted tasks) are collected into one draft that the user
 confirms, as everywhere in the chat. Marking tasks done and reminders apply at once: they are what the user said
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import ConversationMessage, Event, Tag, User
@@ -26,7 +27,9 @@ from app.services.ru import MONTHS, WEEKDAYS, WEEKDAYS_SHORT, day_label, plural
 
 logger = logging.getLogger(__name__)
 
-MAX_STEPS = 5
+# One request does the work; another one or two only when every operation failed and the model may fix the call
+MAX_STEPS = 3
+MAX_OPERATIONS = 10
 # Every step resends the whole conversation, so the model sees only the recent part of it, in short:
 # a request a few hours old is a new conversation, and the plan above already shows what was done
 HISTORY_MESSAGES = 6
@@ -35,10 +38,6 @@ HISTORY_USER_CHARS = 600
 HISTORY_ASSISTANT_CHARS = 300
 PLAN_DAYS = 7
 PLAN_LINES = 40
-# Functions whose result the app words itself: after them the model's closing text is not shown
-ACTIONS = {"create_events", "update_event", "move_events", "delete_events", "complete_events", "create_reminder", "cancel_reminder"}
-# A message that may hold a second request ("добавь созвон и удали отчёт") lets the model go on after an action
-MORE_REQUESTS = re.compile(r"[,;\n]|\s(и|а\s+также|потом|затем|плюс|ещ[её])\s", re.I)
 TABLE_DAYS = 14
 MAX_FOUND = 40
 MAX_SELECTED = 500
@@ -55,175 +54,104 @@ class AgentFailed(Exception):
     """The model could not be reached or did not finish; the caller falls back to the rule-based assistant."""
 
 
-# ---------- the functions the model may call ----------
+# ---------- what the model may ask for ----------
 
-SELECTOR = {
-    "event_ids": {"type": "array", "items": {"type": "integer"}, "description": "id задач из плана или из get_events"},
-    "date_from": {"type": "string", "description": "Первый день периода: слова пользователя о дне дословно («завтра», «в пятницу», «15 октября», «через 2 дня») или YYYY-MM-DD"},
-    "date_to": {"type": "string", "description": "Последний день периода (для одного дня — тот же день или пусто)"},
-    "query": {"type": "string", "description": "Слова из названия задачи, например «встреча с Олей»"},
+# The model says what the user wants and which tasks it is about; the app finds the tasks and does the work.
+# "перенеси всё на завтра" is {"action": "change", "filter": {"date_from": "сегодня", "all": true}, "to_date": "завтра"}
+DAY_WORDS = "слова пользователя о дне дословно («сегодня», «завтра», «в пятницу», «15 октября», «через 2 дня») или YYYY-MM-DD"
+STATUSES = ("open", "done", "overdue", "any")
+
+FILTER = {
+    "type": "object",
+    "description": "Какие задачи: приложение само найдёт задачи, подходящие под все указанные условия.",
+    "properties": {
+        "ids": {"type": "array", "items": {"type": "integer"}, "description": "Номера конкретных задач из блока «План» или прошлых ответов"},
+        "date_from": {"type": "string", "description": f"Первый день периода: {DAY_WORDS}"},
+        "date_to": {"type": "string", "description": "Последний день периода (для одного дня — пусто)"},
+        "query": {"type": "string", "description": "Слова из названия: «созвон», «встреча с Олей»"},
+        "status": {"type": "string", "enum": list(STATUSES), "description": "open — невыполненные, done — выполненные, overdue — просроченные, any — любые"},
+        "timed": {"type": "string", "enum": ["timed", "untimed"], "description": "timed — только задачи со временем, untimed — только без времени"},
+        "time_from": {"type": "string", "description": "Только задачи, которые начинаются не раньше HH:MM («вечерние» — 18:00)"},
+        "time_to": {"type": "string", "description": "Только задачи, которые начинаются раньше HH:MM («утренние» — 12:00)"},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Только задачи с этими тегами, без #"},
+        "all": {"type": "boolean", "description": "true, когда пользователь говорит «все», «всё», «всю неделю»: все задачи под остальными условиями"},
+    },
 }
 
-FUNCTIONS = [
-    {
-        "name": "get_events",
-        "description": "Найти задачи и события пользователя за период и/или по словам из названия. Возвращает id, дату, время и состояние. "
-        "Вызывай, когда нужной задачи нет в блоке «План», когда спрашивают о другом периоде или ищут задачу по названию.",
-        "parameters": {"type": "object", "properties": {**{key: SELECTOR[key] for key in ("date_from", "date_to", "query")}}},
-        "few_shot_examples": [
-            {"request": "Что у меня на следующей неделе?", "params": {"date_from": "{next_monday}", "date_to": "{next_sunday}"}},
-            {"request": "Что у меня в пятницу?", "params": {"date_from": "в пятницу"}},
-            {"request": "Когда встреча с Анной?", "params": {"query": "встреча с Анной"}},
-        ],
+NEW_EVENT = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "Короткое название, с большой буквы: «Купить хлеб»"},
+        "date": {"type": "string", "description": f"День: {DAY_WORDS}; пусто — сегодня"},
+        "start_time": {"type": "string", "description": "Время начала HH:MM; пусто — задача без времени"},
+        "end_time": {"type": "string", "description": "Время окончания HH:MM"},
+        "duration_minutes": {"type": "integer", "description": "Длительность, если названа"},
+        "end_date": {"type": "string", "description": "Последний день для дел на несколько дней («по 12 октября»)"},
+        "repeat": {"type": "string", "description": "Повторение словами: «каждую пятницу», «по будням», «каждый день»"},
+        "deadline": {"type": "string", "description": "Крайний срок словами пользователя («до пятницы 18:00») или YYYY-MM-DDTHH:MM"},
+        "reminder_minutes": {"type": "integer", "description": "За сколько минут до начала напомнить"},
+        "location": {"type": "string"},
+        "description": {"type": "string"},
+        "fixed": {"type": "boolean", "description": "true, если дело нельзя переносить (экзамен, встреча)"},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги задачи: названия из блока «Теги» или новые, без #"},
     },
-    {
-        "name": "create_events",
-        "description": "Добавить в календарь новые задачи, встречи, созвоны, события — всё, что пользователь планирует сделать. "
-        "Пользователь увидит черновик и подтвердит его. Каждое отдельное дело — отдельный элемент. Не указывай время, если пользователь его не назвал.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "events": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string", "description": "Короткое название, с большой буквы: «Купить хлеб»"},
-                            "date": {"type": "string", "description": "Слова пользователя о дне дословно («завтра», «в пятницу», «15 октября», «через 2 дня») или YYYY-MM-DD; пусто — сегодня"},
-                            "start_time": {"type": "string", "description": "Время начала HH:MM; пусто — задача без времени"},
-                            "end_time": {"type": "string", "description": "Время окончания HH:MM"},
-                            "duration_minutes": {"type": "integer", "description": "Длительность, если названа"},
-                            "end_date": {"type": "string", "description": "Последний день для дел на несколько дней («по 12 октября»)"},
-                            "repeat": {"type": "string", "description": "Повторение словами: «каждую пятницу», «по будням», «каждый день»"},
-                            "deadline": {"type": "string", "description": "Крайний срок словами пользователя («до пятницы 18:00») или YYYY-MM-DDTHH:MM"},
-                            "reminder_minutes": {"type": "integer", "description": "За сколько минут до начала напомнить"},
-                            "location": {"type": "string"},
-                            "description": {"type": "string"},
-                            "fixed": {"type": "boolean", "description": "true, если дело нельзя переносить (экзамен, встреча)"},
-                            "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги задачи: названия из блока «Теги» или новые, без #"},
-                        },
-                        "required": ["title"],
-                    },
-                }
-            },
-            "required": ["events"],
-        },
-        "few_shot_examples": [
-            {
-                "request": "Завтра в 15:00 созвон с командой на час и купить хлеб",
-                "params": {"events": [{"title": "Созвон с командой", "date": "завтра", "start_time": "15:00", "duration_minutes": 60}, {"title": "Купить хлеб", "date": "завтра"}]},
-            },
-            {
-                "request": "В пятницу сдать отчёт, дедлайн в 18:00, это нельзя переносить",
-                "params": {"events": [{"title": "Сдать отчёт", "date": "в пятницу", "deadline": "в пятницу 18:00", "fixed": True}]},
-            }
-        ],
+    "required": ["title"],
+}
+
+ACTIONS = {
+    "find": "найти и показать задачи (вопросы «что у меня в пятницу?», «когда встреча с Анной?»)",
+    "create": "добавить новые задачи, встречи, дела — поле events",
+    "change": "изменить или перенести существующие задачи, одну или сразу много: to_date, shift_days, shift_minutes, new_time, new_end_time, new_title, untimed, tags",
+    "delete": "удалить задачи",
+    "complete": "отметить задачи выполненными",
+    "reopen": "вернуть выполненные задачи в невыполненные",
+    "remind": "поставить напоминание в Telegram, только когда просят «напомни»: text и in_minutes или at, repeat, every_minutes",
+    "reminders": "показать активные напоминания",
+    "cancel_reminder": "отменить напоминание: reminder_id из блока «Напоминания»",
+    "analyze": "анализ загрузки, советы, «что перенести», «как всё успеть», «разгрузи»: period",
+    "breakdown": "разбить большую цель на шаги до срока: goal, deadline",
+    "stats": "статистика выполнения",
+}
+
+OPERATION = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": list(ACTIONS), "description": "; ".join(f"{name} — {text}" for name, text in ACTIONS.items())},
+        "filter": FILTER,
+        "events": {"type": "array", "items": NEW_EVENT, "description": "Для create: каждое отдельное дело — отдельный элемент"},
+        "to_date": {"type": "string", "description": f"Для change: новый день, время каждой задачи сохраняется — {DAY_WORDS}"},
+        "shift_days": {"type": "integer", "description": "Для change: сдвиг на N дней: 1 — на день позже, -1 — на день раньше"},
+        "shift_minutes": {"type": "integer", "description": "Для change: сдвиг в минутах: 60 — на час позже, -30 — на полчаса раньше"},
+        "new_time": {"type": "string", "description": "Для change: новое время начала HH:MM"},
+        "new_end_time": {"type": "string", "description": "Для change: новое время окончания HH:MM; только оно — продлить или сократить"},
+        "new_title": {"type": "string", "description": "Для change: новое название"},
+        "untimed": {"type": "boolean", "description": "Для change: true — убрать время, задача на весь день"},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Для change: поставить задачам эти теги, без #"},
+        "text": {"type": "string", "description": "Для remind: о чём напомнить, коротко: «Помыть посуду»"},
+        "in_minutes": {"type": "integer", "description": "Для remind: через сколько минут от текущего момента"},
+        "at": {"type": "string", "description": "Для remind: когда (первый раз): слова пользователя («завтра в 9:00», «в 18:30») или YYYY-MM-DDTHH:MM"},
+        "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekly", "monthly"], "description": "Для remind: повтор — каждый день, по будням, каждую неделю, каждый месяц"},
+        "every_minutes": {"type": "integer", "description": "Для remind: повтор через равные промежутки: «каждые 2 часа» — 120"},
+        "reminder_id": {"type": "integer", "description": "Для cancel_reminder"},
+        "period": {"type": "string", "enum": ["today", "tomorrow", "week", "next_week", "month"], "description": "Для analyze"},
+        "goal": {"type": "string", "description": "Для breakdown: что нужно сделать: «подготовиться к экзамену по истории»"},
+        "deadline": {"type": "string", "description": "Для breakdown: срок словами пользователя («20 октября») или YYYY-MM-DD"},
     },
-    {
-        "name": "update_event",
-        "description": "Изменить ОДНУ существующую задачу по id: перенести на другой день и/или время, сдвинуть, продлить, переименовать, "
-        "убрать время. Пользователь подтвердит изменение.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "event_id": {"type": "integer"},
-                "new_date": {"type": "string", "description": "Новый день: слова пользователя о дне дословно («завтра», «в пятницу», «15 октября», «через 2 дня») или YYYY-MM-DD"},
-                "new_start_time": {"type": "string", "description": "Новое время начала HH:MM"},
-                "new_end_time": {"type": "string", "description": "Новое время окончания HH:MM; только оно — продлить или сократить"},
-                "shift_minutes": {"type": "integer", "description": "Сдвиг в минутах: 60 — на час позже, -30 — на полчаса раньше, 1440 — на день позже"},
-                "new_title": {"type": "string"},
-                "untimed": {"type": "boolean", "description": "true — убрать время, задача на весь день"},
-                "tags": {"type": "array", "items": {"type": "string"}, "description": "Поставить задаче теги: названия из блока «Теги» или новые, без #"},
-            },
-            "required": ["event_id"],
-        },
-    },
-    {
-        "name": "move_events",
-        "description": "Перенести СРАЗУ НЕСКОЛЬКО задач на другой день, время каждой сохраняется: «перенеси всё с пятницы на понедельник», "
-        "«перенеси их на завтра». Для одной задачи — update_event. Пользователь подтвердит перенос.",
-        "parameters": {
-            "type": "object",
-            "properties": {**SELECTOR, "to_date": {"type": "string", "description": "Новый день: слова пользователя о дне дословно («завтра», «в пятницу», «15 октября», «через 2 дня») или YYYY-MM-DD"}},
-            "required": ["to_date"],
-        },
-    },
-    {
-        "name": "delete_events",
-        "description": "Удалить задачи: по списку id, за период, по словам из названия или все (all=true). Пользователь подтвердит удаление.",
-        "parameters": {"type": "object", "properties": {**SELECTOR, "all": {"type": "boolean", "description": "true — удалить все задачи пользователя"}}},
-    },
-    {
-        "name": "complete_events",
-        "description": "Отметить задачи выполненными (сразу): по списку id, за день или по словам из названия.",
-        "parameters": {"type": "object", "properties": SELECTOR},
-    },
-    {
-        "name": "create_reminder",
-        "description": "Поставить напоминание, только когда пользователь прямо просит напомнить («напомни …», «поставь напоминание»): "
-        "в нужный момент бот Dayla пришлёт сообщение в Telegram. Встречи и дела без слова «напомни» — это create_events. Укажи in_minutes или at.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "О чём напомнить, коротко: «Помыть посуду»"},
-                "in_minutes": {"type": "integer", "description": "Через сколько минут от текущего момента"},
-                "at": {"type": "string", "description": "Когда (первый раз): слова пользователя («завтра в 9:00», «в 18:30») или YYYY-MM-DDTHH:MM"},
-                "repeat": {
-                    "type": "string",
-                    "enum": ["daily", "weekdays", "weekly", "monthly"],
-                    "description": "Повтор, если пользователь просит напоминать регулярно: каждый день, по будням, каждую неделю, каждый месяц",
-                },
-                "every_minutes": {"type": "integer", "description": "Повтор через равные промежутки: «каждые 2 часа» — 120"},
-            },
-            "required": ["text"],
-        },
-        "few_shot_examples": [
-            {"request": "напомни помыть посуду через 10 минут", "params": {"text": "Помыть посуду", "in_minutes": 10}},
-            {"request": "напоминай каждый день в 9:00 пить витамины", "params": {"text": "Пить витамины", "at": "в 9:00", "repeat": "daily"}},
-            {"request": "напоминай пить воду каждые 2 часа", "params": {"text": "Пить воду", "every_minutes": 120}},
-            {"request": "через 2 часа напомни выключить духовку", "params": {"text": "Выключить духовку", "in_minutes": 120}},
-            {"request": "напомни завтра в 9:00 позвонить в банк", "params": {"text": "Позвонить в банк", "at": "завтра в 9:00"}},
-        ],
-    },
-    {
-        "name": "list_reminders",
-        "description": "Показать активные напоминания пользователя (те, что ещё не пришли).",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "cancel_reminder",
-        "description": "Отменить напоминание по id из list_reminders или из блока «Напоминания».",
-        "parameters": {"type": "object", "properties": {"reminder_id": {"type": "integer"}}, "required": ["reminder_id"]},
-    },
-    {
-        "name": "analyze_plan",
-        "description": "Проанализировать загрузку и план: сегодня, завтра, неделю или месяц. Возвращает факты (перегруженные и свободные дни, "
-        "свободные окна, дедлайны, просроченное, сколько пользователь обычно успевает) и предлагает переносы, которые пользователь подтвердит. "
-        "Вызывай для анализа дня или недели, для советов, «что перенести», «как всё успеть», «разгрузи день».",
-        "parameters": {
-            "type": "object",
-            "properties": {"period": {"type": "string", "enum": ["today", "tomorrow", "week", "next_week", "month"]}},
-            "required": ["period"],
-        },
-    },
-    {
-        "name": "breakdown_task",
-        "description": "Разбить большую цель (экзамен, проект, переезд) на шаги и разложить их по свободным дням до срока. "
-        "Пользователь увидит шаги черновиком и подтвердит.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "goal": {"type": "string", "description": "Что нужно сделать: «подготовиться к экзамену по истории»"},
-                "deadline": {"type": "string", "description": "Срок словами пользователя («20 октября») или YYYY-MM-DD"},
-            },
-            "required": ["goal"],
-        },
-    },
-    {
-        "name": "get_stats",
-        "description": "Статистика выполнения: сколько задач сделано за неделю, серия дней.",
-        "parameters": {"type": "object", "properties": {}},
-    },
+    "required": ["action"],
+}
+
+EXAMPLES = [
+    ("Завтра в 15:00 созвон с командой на час и купить хлеб", [{"action": "create", "events": [{"title": "Созвон с командой", "date": "завтра", "start_time": "15:00", "duration_minutes": 60}, {"title": "Купить хлеб", "date": "завтра"}]}]),
+    ("Перенеси всё на завтра", [{"action": "change", "filter": {"date_from": "сегодня", "all": True}, "to_date": "завтра"}]),
+    ("Перенеси просроченные на сегодня", [{"action": "change", "filter": {"status": "overdue", "all": True}, "to_date": "сегодня"}]),
+    ("Сдвинь все встречи в пятницу на час позже", [{"action": "change", "filter": {"date_from": "в пятницу", "query": "встреча", "all": True}, "shift_minutes": 60}]),
+    ("Перенеси созвон с Олегом на понедельник в 11", [{"action": "change", "filter": {"query": "созвон с Олегом"}, "to_date": "в понедельник", "new_time": "11:00"}]),
+    ("Удали все выполненные задачи", [{"action": "delete", "filter": {"status": "done", "all": True}}]),
+    ("Я сделала отчёт и купила продукты", [{"action": "complete", "filter": {"query": "отчёт"}}, {"action": "complete", "filter": {"query": "продукты"}}]),
+    ("Что у меня на следующей неделе?", [{"action": "find", "filter": {"date_from": "{next_monday}", "date_to": "{next_sunday}"}}]),
+    ("напомни через 2 часа выключить духовку", [{"action": "remind", "text": "Выключить духовку", "in_minutes": 120}]),
+    ("напоминай каждый день в 9:00 пить витамины", [{"action": "remind", "text": "Пить витамины", "at": "в 9:00", "repeat": "daily"}]),
+    ("Как мне всё успеть на этой неделе?", [{"action": "analyze", "period": "week"}]),
 ]
 
 
@@ -237,38 +165,57 @@ REMINDER_WORDS = re.compile(r"напомн|напомин|будильник", r
 # The model's repeat is taken only when the user said something about it
 REPEAT_HINT = re.compile(r"кажд|ежедн|еженед|ежемес|ежечас|регулярн|повтор|по\s+будн|по\s+утрам|по\s+вечерам", re.I)
 DELETE_WORDS = re.compile(r"удал|сотр|стер|очист|почист|убер|убра|отмен|не\s+нужн|больше\s+не", re.I)
+REOPEN_WORDS = re.compile(r"верни|вернуть|не\s+(?:сделал|выполнил|закончил)|сними\s+отметк|сними\s+галочк|сними\s+выполн|сними\s+«выполн", re.I)
 
 
 def offered(text: str, history: str) -> set[str]:
-    """The functions a message may need. A small model confuses look-alike functions, so a reminder or a deletion
+    """The actions a message may need. A small model confuses look-alike actions, so a reminder or a deletion
     is offered only when the message (or, for a follow-up, the previous one) speaks about it; this also keeps
     a misread request from deleting anything."""
-    names = {spec["name"] for spec in FUNCTIONS}
+    names = set(ACTIONS)
     context = f"{text}\n{history}"
     if not REMINDER_WORDS.search(context):
-        names -= {"create_reminder", "list_reminders", "cancel_reminder"}
+        names -= {"remind", "reminders", "cancel_reminder"}
     if not DELETE_WORDS.search(context):
-        names -= {"delete_events"}
+        names -= {"delete"}
+    if not REOPEN_WORDS.search(context):
+        names -= {"reopen"}
     if not REMINDER_WORDS.search(text) and not DELETE_WORDS.search(text):
         names -= {"cancel_reminder"}
     if DELETE_WORDS.search(text) and not chat.COMPLETE_REQUEST.match(text):
-        names -= {"complete_events"}
+        names -= {"complete"}
     if chat.COMPLETE_REQUEST.match(text) and not DELETE_WORDS.search(text):
-        names -= {"delete_events"}
+        names -= {"delete"}
     if re.search(r"напоминани", text, re.I) and not re.search(r"\bнапомни", text, re.I):
         # "какие у меня напоминания?", "отмени напоминание про посуду": about reminders, not tasks
-        names = {"list_reminders", "cancel_reminder", "create_reminder"}
+        names = {"reminders", "cancel_reminder", "remind"}
     return names
 
 
 def functions(today: date, names: set[str] | None = None) -> list[dict]:
-    """FUNCTIONS with the dates of the examples counted from today, so the model never copies a stale date."""
+    """The one function the model calls, with the actions this message may need and the examples' dates
+    counted from today, so the model never copies a stale date."""
+    allowed = [name for name in ACTIONS if names is None or name in names]
+    operation = {**OPERATION, "properties": {**OPERATION["properties"], "action": {**OPERATION["properties"]["action"], "enum": allowed}}}
+    operation["properties"]["action"]["description"] = "; ".join(f"{name} — {ACTIONS[name]}" for name in allowed)
+    spec = {
+        "name": "act",
+        "description": "Сделать то, что просит пользователь: по операции на каждое действие. Какие задачи — описывай фильтром, "
+        "приложение само найдёт их и выполнит действие; добавление, изменение и удаление пользователь подтвердит.",
+        "parameters": {"type": "object", "properties": {"operations": {"type": "array", "items": operation}}, "required": ["operations"]},
+        "few_shot_examples": [
+            {"request": request, "params": {"operations": operations}}
+            for request, operations in EXAMPLES
+            if all(item["action"] in allowed for item in operations)
+        ],
+    }
     monday = today + timedelta(days=7 - today.weekday())
     values = {"tomorrow": today + timedelta(days=1), "next_monday": monday, "next_sunday": monday + timedelta(days=6)}
-    text = json.dumps([spec for spec in FUNCTIONS if names is None or spec["name"] in names], ensure_ascii=False)
+    text = json.dumps([spec], ensure_ascii=False)
     for key, value in values.items():
         text = text.replace("{" + key + "}", value.isoformat())
     return json.loads(text)
+
 
 
 # ---------- one turn of the conversation ----------
@@ -288,6 +235,11 @@ class Turn:
     completed: list[Event] = field(default_factory=list)
     reminders: list[dict] = field(default_factory=list)
     cancelled: list[dict] = field(default_factory=list)
+    reopened: list[Event] = field(default_factory=list)
+    listed: list[dict] | None = None
+    stats: dict | None = None
+    # The actions this message may need (see offered)
+    allowed: set[str] = field(default_factory=lambda: set(ACTIONS))
     shown: list[Event] | None = None
     # The model's text is shown as is after an analysis or a breakdown; after other changes the app says what it did
     analysed: bool = False
@@ -308,7 +260,7 @@ class Turn:
     @property
     def changed(self) -> bool:
         """Something was really done or proposed in this turn."""
-        return bool(self.items or self.delete or self.completed or self.reminders or self.cancelled)
+        return bool(self.items or self.delete or self.completed or self.reopened or self.reminders or self.cancelled)
 
     @property
     def today(self) -> date:
@@ -414,32 +366,65 @@ async def owned(turn: Turn, ids) -> list[Event]:
     return list(await turn.session.scalars(select(Event).where(Event.user_id == turn.user.id, Event.id.in_(values)).order_by(Event.start_at)))
 
 
-async def pick(turn: Turn, args: dict, default_day: date | None = None) -> tuple[list[Event], str | None]:
-    """The tasks a function is about: explicit ids, or a period and/or words of the title. Returns (events, problem)."""
+async def pick(turn: Turn, args: dict, default_day: date | None = None, status: str = "any") -> tuple[list[Event], str | None]:
+    """The tasks a filter describes: explicit ids, or a period, words of the title, a state, tags, a time of day.
+    Returns (events, problem). `default_day` is the period when nothing else narrows the tasks down ("перенеси всё
+    на завтра" is about today's), `status` the state when the filter names none."""
+    status = args.get("status") if args.get("status") in STATUSES else status
     if args.get("event_ids"):
         found = await owned(turn, args["event_ids"])
         if found:
             return await grounded(turn, found), None
         if not (args.get("query") or args.get("date_from")):
-            return [], "Задачи с такими id не найдены — возьми id из блока «План» или из get_events."
-    first, last = parse_day(args.get("date_from"), turn), parse_day(args.get("date_to"), turn)
-    first = first or (last if last else default_day if not args.get("query") else None)
-    last = last or first
+            return [], "Задачи с такими номерами не найдены — возьми номера из блока «План» или опиши задачи фильтром."
+    tags = tag_names(args.get("tags"))
     query = args.get("query") if isinstance(args.get("query"), str) else ""
-    if not first and not query.strip() and not args.get("all"):
-        return [], "Не указано, какие задачи: передай event_ids, период или слова из названия."
+    first, last = parse_day(args.get("date_from"), turn), parse_day(args.get("date_to"), turn)
+    narrowed = query.strip() or tags or status in ("done", "overdue") or args.get("timed") in ("timed", "untimed")
+    first = first or last or (default_day if not narrowed else None)
+    last = last or first
+    if not first and not narrowed and not args.get("all"):
+        return [], "Не указано, какие задачи: передай filter — номера, период, слова из названия или all."
     conditions = [Event.user_id == turn.user.id]
     if first:
         if last < first:
             first, last = last, first
         conditions += [Event.start_at < datetime.combine(last + timedelta(days=1), time.min, turn.tz), Event.end_at > datetime.combine(first, time.min, turn.tz)]
-    elif query.strip():
+    elif status == "overdue":
+        conditions += [Event.start_at >= datetime.combine(turn.today - timedelta(days=insights.OVERDUE_DAYS), time.min, turn.tz), Event.start_at < turn.now]
+    elif query.strip() or not args.get("all"):
         conditions += [Event.start_at < turn.now + chat.SEARCH_AHEAD, Event.end_at > turn.now - chat.SEARCH_PAST]
     events = list(await turn.session.scalars(events_query(conditions)))
     keywords = chat.search_keywords(query)
     if keywords:
         events = chat.match_keywords(events, keywords)
-    return events, None
+    return await narrowed_down(turn, events, args, status), None
+
+
+async def narrowed_down(turn: Turn, events: list[Event], args: dict, status: str) -> list[Event]:
+    """The filter's conditions the database query does not apply: state, time of day, tags."""
+    if status == "open":
+        events = [event for event in events if event.completed_at is None]
+    elif status == "done":
+        events = [event for event in events if event.completed_at is not None]
+    elif status == "overdue":
+        events = [event for event in events if tasks.is_overdue(event, turn.today, turn.tz)]
+    if args.get("timed") == "timed":
+        events = [event for event in events if not event.all_day]
+    elif args.get("timed") == "untimed":
+        events = [event for event in events if event.all_day]
+    since, until = parse_clock(args.get("time_from")), parse_clock(args.get("time_to"))
+    if since or until:
+        def fits(event: Event) -> bool:
+            start = event.start_at.astimezone(turn.tz).time()
+            return not event.all_day and (not since or start >= since) and (not until or start < until)
+
+        events = [event for event in events if fits(event)]
+    names = {name.lower() for name in tag_names(args.get("tags"))}
+    if names:
+        ids = set(await turn.session.scalars(select(Tag.id).where(Tag.user_id == turn.user.id, func.lower(Tag.name).in_(names))))
+        events = [event for event in events if ids & set(event.tag_ids or [])]
+    return events
 
 
 # Words of a request that do not name the task: what to do with it and by how much
@@ -488,8 +473,8 @@ async def get_events(turn: Turn, args: dict) -> dict:
         if local and local["date_from"]:
             args = {**args, "date_from": local["date_from"].isoformat(), "date_to": (local["date_to"] or local["date_from"]).isoformat()}
     query = args.get("query") if isinstance(args.get("query"), str) else ""
-    if not (args.get("date_from") or args.get("date_to") or query.strip()):
-        args = {"date_from": turn.today.isoformat(), "date_to": (turn.today + timedelta(days=PLAN_DAYS - 1)).isoformat()}
+    if not (args.get("date_from") or args.get("date_to") or query.strip() or args.get("status") in ("done", "overdue") or args.get("tags")):
+        args = {**args, "date_from": turn.today.isoformat(), "date_to": (turn.today + timedelta(days=PLAN_DAYS - 1)).isoformat()}
     events, problem = await pick(turn, args)
     if problem:
         return {"error": problem}
@@ -591,7 +576,7 @@ async def create_events(turn: Turn, args: dict) -> dict:
 async def update_event(turn: Turn, args: dict) -> dict:
     found = await owned(turn, [args.get("event_id")])
     if not found:
-        return {"error": "Задача с таким id не найдена. Найди её через get_events."}
+        return {"error": "Задача с таким номером не найдена — опиши её фильтром (query, период)."}
     event = (await grounded(turn, found))[0]
     if turn.delete:
         return {"error": "В этом ответе уже предложено удаление. Изменение предложи следующим сообщением."}
@@ -623,7 +608,7 @@ async def update_event(turn: Turn, args: dict) -> dict:
     elif new_date or new_start or untimed:
         change = {"date": new_date, "time": new_start, "end_time": new_end, "untimed": untimed}
     else:
-        return {"error": "Не указано, что изменить: new_date, new_start_time, new_end_time, shift_minutes, new_title или untimed."}
+        return {"error": "Не указано, что изменить: to_date, new_time, new_end_time, shift_minutes, new_title или untimed."}
     if new_date and new_date < turn.today:
         return {"error": f"Дата {new_date.isoformat()} уже прошла."}
     return await propose_change(turn, event, change, title, tags)
@@ -651,49 +636,79 @@ async def propose_change(turn: Turn, event: Event, change: dict, title: str | No
     return result
 
 
-async def move_events(turn: Turn, args: dict) -> dict:
-    target = parse_day(args.get("to_date"), turn)
-    split = chat.move_target(turn.text, turn.now) if chat.MOVE_VERB.search(turn.text) else None
-    if split:
-        target = split[1]
-    if not target:
-        return {"error": "Укажи to_date — новый день, YYYY-MM-DD."}
-    if target < turn.today:
-        return {"error": f"День {target.isoformat()} уже прошёл."}
+async def change_events(turn: Turn, op: dict) -> dict:
+    """Change the tasks the filter finds: one task as update_event does, many at once by the same rule
+    ("перенеси всё на завтра", "сдвинь все встречи на час позже", "убери время у всех задач в пятницу")."""
     if turn.delete:
-        return {"error": "В этом ответе уже предложено удаление. Перенос предложи следующим сообщением."}
-    events, problem = await pick(turn, args)
+        return {"error": "В этом ответе уже предложено удаление. Изменение предложи следующим сообщением."}
+    events, problem = await pick(turn, selector(op), default_day=turn.today, status="open")
     if problem:
         return {"error": problem}
-    events = [event for event in events if event.completed_at is None]
+    events = [event for event in events if event.completed_at is None] or events
     if not events:
-        return {"error": "Не нашла невыполненных задач для переноса."}
+        return {"error": "Не нашла таких задач."}
+    shift = (as_int(op.get("shift_minutes")) or 0) + (as_int(op.get("shift_days")) or 0) * 1440
     if len(events) == 1:
-        # One task: "на понедельник в 11" also changes its time
-        return await update_event(turn, {"event_id": turn.ref(events[0].id), "new_date": target.isoformat()})
-    moved, kept = [], []
+        return await update_event(
+            turn,
+            {
+                "event_id": turn.ref(events[0].id),
+                "new_date": op.get("to_date"),
+                "new_start_time": op.get("new_time"),
+                "new_end_time": op.get("new_end_time"),
+                "shift_minutes": shift or None,
+                "new_title": op.get("new_title"),
+                "untimed": op.get("untimed"),
+                "tags": op.get("tags"),
+            },
+        )
+    target = parse_day(op.get("to_date"), turn)
+    split = chat.move_target(turn.text, turn.now) if target and chat.MOVE_VERB.search(turn.text) else None
+    if split:
+        # "перенеси всё с пятницы на понедельник": the new day is read from the text, the model miscounts weekdays
+        target = split[1]
+    if target and target < turn.today:
+        return {"error": f"День {target.isoformat()} уже прошёл."}
+    clock, untimed, tags = parse_clock(op.get("new_time")), op.get("untimed") is True, tag_names(op.get("tags"))
+    if target:
+        change = {"date": target, "time": clock, "untimed": untimed}
+    elif shift:
+        change = {"shift": timedelta(minutes=shift)}
+    elif clock or untimed:
+        change = {"time": clock, "end_time": parse_clock(op.get("new_end_time")), "untimed": untimed}
+    elif tags:
+        change = {}
+    else:
+        return {"error": "Не указано, что изменить: to_date, shift_days, shift_minutes, new_time, untimed или tags."}
+    changed, kept = [], []
     for event in events[: chat.MAX_DRAFT_ITEMS]:
-        item, reason = chat.change_item(event, {"date": target}, turn.tz)
+        item, reason = chat.change_item(event, change, turn.tz) if change else ({**chat.event_item(event, turn.tz)}, None)
+        if item and item["date"] < turn.today.isoformat():
+            item, reason = None, f"дата {item['date']} уже прошла"
         if item:
+            if tags:
+                item["tag_names"] = tags
             turn.items = [existing for existing in turn.items if existing.get("event_id") != event.id] + [item]
-            moved.append(event.title)
+            changed.append(event.title)
         else:
             kept.append(f"{event.title}: {reason}")
+    if not changed:
+        return {"error": "Ничего не изменилось: " + "; ".join(kept[:5])}
     if any(event.is_fixed for event in events):
-        turn.notes.append("Среди задач есть отмеченные как неперемещаемые — проверьте перенос.")
+        turn.notes.append("Среди задач есть отмеченные как неперемещаемые — проверьте изменения.")
     return {
-        "status": "Перенос показан пользователю черновиком: он подтвердит. Ещё ничего не перенесено.",
-        "to": day_label(target, turn.today),
-        "moved": moved[:30],
-        "count": len(moved),
-        **({"not_moved": kept[:10]} if kept else {}),
+        "status": "Изменения показаны пользователю черновиком: он подтвердит. Ещё ничего не изменено.",
+        "changed": changed[:30],
+        "count": len(changed),
+        **({"not_changed": kept[:10]} if kept else {}),
     }
 
 
 async def delete_events(turn: Turn, args: dict) -> dict:
     if turn.items:
         return {"error": "В этом ответе уже есть добавления или изменения. Удаление предложи следующим сообщением."}
-    if args.get("all") is True and not (args.get("event_ids") or args.get("date_from") or args.get("query")):
+    criteria = ("event_ids", "date_from", "date_to", "query", "status", "timed", "time_from", "time_to", "tags")
+    if args.get("all") is True and not any(args.get(key) not in (None, "", [], "any") for key in criteria):
         events = list(await turn.session.scalars(events_query([Event.user_id == turn.user.id])))
         label = "все задачи"
     else:
@@ -715,7 +730,7 @@ async def delete_events(turn: Turn, args: dict) -> dict:
 
 
 async def complete_events(turn: Turn, args: dict) -> dict:
-    events, problem = await pick(turn, args, default_day=turn.today)
+    events, problem = await pick(turn, args, default_day=turn.today, status="open")
     if problem:
         return {"error": problem}
     events = [event for event in events if event.completed_at is None][:200]
@@ -727,6 +742,20 @@ async def complete_events(turn: Turn, args: dict) -> dict:
     await turn.session.flush()
     turn.completed += events
     return {"status": "Готово: отмечены выполненными.", "titles": [event.title for event in events[:20]], "count": len(events)}
+
+
+async def reopen_events(turn: Turn, args: dict) -> dict:
+    events, problem = await pick(turn, args, default_day=turn.today, status="done")
+    if problem:
+        return {"error": problem}
+    events = [event for event in events if event.completed_at is not None][:200]
+    if not events:
+        return {"error": "Не нашла выполненных задач по запросу."}
+    for event in events:
+        event.completed_at = None
+    await turn.session.flush()
+    turn.reopened += events
+    return {"status": "Готово: задачи снова невыполненные.", "titles": [event.title for event in events[:20]], "count": len(events)}
 
 
 EVERY_PERIOD = re.compile(r"кажды[ейх]\s+(\d+)\s*(мин\w*|час\w*)|кажд(?:ый|ые)\s+(полчаса|час)\b|ежечасно", re.I)
@@ -834,7 +863,8 @@ async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
 
 async def list_reminders(turn: Turn, args: dict) -> dict:
     found = await reminders.pending_custom(turn.session, turn.user)
-    return {"reminders": [reminders.custom_view(item, turn.tz) for item in found[:30]], "count": len(found)}
+    turn.listed = [reminders.custom_view(item, turn.tz) for item in found[:30]]
+    return {"reminders": turn.listed, "count": len(found)}
 
 
 async def cancel_reminder(turn: Turn, args: dict) -> dict:
@@ -861,7 +891,7 @@ async def analyze_plan(turn: Turn, args: dict) -> dict:
     elif re.search(r"\b(?:сегодня|день|дня)\b", low):
         period = "today"
     now, today = turn.now, turn.today
-    asked = bool(ADVICE_REQUEST.search(turn.text) or chat.ANALYZE_REQUEST.search(turn.text))
+    asked = bool(args.get("asked") or ADVICE_REQUEST.search(turn.text) or chat.ANALYZE_REQUEST.search(turn.text))
     if period == "today":
         first = last = today
         # After the working day "today" is planned as tomorrow (facts say which in "day")
@@ -957,25 +987,75 @@ async def breakdown_task(turn: Turn, args: dict) -> dict:
 
 
 async def get_stats(turn: Turn, args: dict) -> dict:
-    reply = await chat.stats_reply(turn.session, turn.user)
-    reply.pop("kind", None)
-    return reply
+    turn.stats = await chat.stats_reply(turn.session, turn.user)
+    return {key: value for key, value in turn.stats.items() if key != "kind"}
 
 
-HANDLERS = {
-    "get_events": get_events,
-    "create_events": create_events,
-    "update_event": update_event,
-    "move_events": move_events,
-    "delete_events": delete_events,
-    "complete_events": complete_events,
-    "create_reminder": create_reminder,
-    "list_reminders": list_reminders,
+FILTER_KEYS = tuple(FILTER["properties"])
+
+
+def selector(op: dict) -> dict:
+    """The filter of an operation in the form pick() reads; filter fields the model put next to "action" count too."""
+    raw = op.get("filter") if isinstance(op.get("filter"), dict) else {}
+    found = {**{key: op[key] for key in FILTER_KEYS if key in op and key != "tags"}, **raw}
+    if "ids" in found:
+        found["event_ids"] = found.pop("ids")
+    if op.get("action") != "change" and "tags" in op and "tags" not in raw:
+        found["tags"] = op["tags"]
+    return found
+
+
+OPERATIONS = {
+    "find": lambda turn, op: get_events(turn, selector(op)),
+    "create": lambda turn, op: create_events(turn, op),
+    "change": change_events,
+    "delete": lambda turn, op: delete_events(turn, selector(op)),
+    "complete": lambda turn, op: complete_events(turn, selector(op)),
+    "reopen": lambda turn, op: reopen_events(turn, selector(op)),
+    "remind": create_reminder,
+    "reminders": list_reminders,
     "cancel_reminder": cancel_reminder,
-    "analyze_plan": analyze_plan,
-    "breakdown_task": breakdown_task,
-    "get_stats": get_stats,
+    "analyze": analyze_plan,
+    "breakdown": breakdown_task,
+    "stats": get_stats,
 }
+NOT_ASKED = {
+    "delete": "Пользователь не просил ничего удалять.",
+    "remind": "Пользователь не просил напомнить: дело в календаре — это create.",
+    "reopen": "Пользователь не просил возвращать задачи в невыполненные.",
+}
+
+
+async def act(turn: Turn, args: dict) -> dict:
+    """Run the model's operations in order. Each one runs in its own savepoint: a failed one undoes only its own writes."""
+    operations = args.get("operations")
+    if isinstance(operations, dict):
+        operations = [operations]
+    if not isinstance(operations, list) or not operations:
+        return {"results": [{"error": "Передай operations — список операций."}]}
+    operations = [op for op in operations if isinstance(op, dict)][:MAX_OPERATIONS]
+    alone = len(operations) == 1
+    results = []
+    for op in operations:
+        action = op.get("action")
+        handler = OPERATIONS.get(action)
+        if handler is None:
+            result = {"error": f"Действия {action} нет."}
+        elif action not in turn.allowed:
+            result = {"error": NOT_ASKED.get(action, f"Действие {action} здесь не нужно.")}
+        else:
+            turn.tools.append(action)
+            if action == "analyze" and alone:
+                # Asked for on its own, the analysis is the answer
+                op = {**op, "asked": True}
+            try:
+                async with turn.session.begin_nested():
+                    result = await handler(turn, op)
+            except Exception:
+                logger.exception("Assistant operation %s failed", action)
+                result = {"error": "Внутренняя ошибка, попробуй по-другому или извинись перед пользователем."}
+        results.append({"action": action, **result})
+    return {"results": results}
 
 
 # ---------- what the model knows before it starts ----------
@@ -1045,7 +1125,7 @@ async def plan_text(turn: Turn) -> str:
             marks.append(f"дедлайн {event.deadline_at.astimezone(turn.tz):%Y-%m-%d %H:%M}")
         lines.append(f"  [id {turn.ref(event.id)}] {when} {event.title}" + (f" ({', '.join(marks)})" if marks else ""))
         if len(lines) >= PLAN_LINES:
-            lines.append("  … дальше — через get_events")
+            lines.append("  … дальше — через find")
             break
     return "\n".join(lines) or "(на ближайшие 7 дней ничего не запланировано)"
 
@@ -1076,28 +1156,28 @@ async def system_prompt(turn: Turn) -> str:
         "изменяешь, удаляешь и отмечаешь задачи, ставишь напоминания, анализируешь загрузку и даёшь советы.\n"
         f"Говори {tone} — так пользователь выбрал при знакомстве.\n\n"
         "ПРАВИЛА\n"
-        "1. Любое действие с календарём и напоминаниями — только вызовом функции. Никогда не пиши, что что-то сделала, если функция "
-        "не вернула status об этом. Если функция вернула error — исправь вызов или честно объясни пользователю.\n"
-        "2. id задачи — короткий номер в квадратных скобках из блока «План» или из результата get_events. Не выдумывай id. Если задач с похожим названием несколько "
-        "и непонятно, о какой речь, — спроси, перечислив их с днём и временем.\n"
+        "1. Любое действие с календарём и напоминаниями — только вызовом функции act: в operations перечисли всё, о чём просит "
+        "пользователь, по операции на каждое действие. Никогда не пиши текстом, что что-то сделала: результат сообщит приложение.\n"
+        "2. Какие задачи — описывай полем filter, приложение само найдёт их: период (date_from, date_to), слова из названия (query), "
+        "status (open — невыполненные, done — выполненные, overdue — просроченные), timed, время дня (time_from, time_to), tags, "
+        "all=true, когда пользователь говорит «все», «всё». «Перенеси всё на завтра» — filter {date_from: «сегодня», all: true} и to_date "
+        "«завтра». ids — только короткие номера из квадратных скобок [id N] в блоке «План» или в прошлых ответах, не выдумывай их.\n"
         "3. День передавай словами пользователя дословно («завтра», «в пятницу», «15 октября») — приложение само вычислит дату; "
-        "YYYY-MM-DD — когда день берёшь из плана или результата функции. Время — HH:MM. Не выдумывай время: если пользователь его не назвал, "
+        "YYYY-MM-DD — когда день берёшь из плана. Время — HH:MM. Не выдумывай время: если пользователь его не назвал, "
         "не передавай start_time — это задача без времени.\n"
-        "4. «Напомни через N минут / в 18:00 / завтра в 9 <что-то>» без слов о встрече или деле в календаре — это create_reminder. "
-        "Если пользователь планирует дело и просит напомнить заранее («встреча завтра в 15, напомни за 30 минут») — create_events "
+        "4. «Напомни через N минут / в 18:00 / завтра в 9 <что-то>» без слов о встрече или деле в календаре — это remind. "
+        "Если пользователь планирует дело и просит напомнить заранее («встреча завтра в 15, напомни за 30 минут») — create "
         "с reminder_minutes.\n"
         "5. Добавление, изменение, перенос и удаление пользователь подтверждает кнопкой, которую приложение показывает само: "
-        "не спрашивай «удалить?» или «да/нет» текстом — сразу вызывай функцию, а после неё скажи, что показала черновик, "
-        "и попроси проверить и подтвердить. Отметка «выполнено», напоминания и их отмена срабатывают сразу.\n"
-        "6. Для анализа дня, недели, советов, «что перенести», «как всё успеть», «разгрузи» вызывай analyze_plan и опирайся на его факты. "
-        "Учитывай рабочий график и задачи, которые нельзя переносить. "
+        "не спрашивай «удалить?» или «да/нет» текстом — сразу вызывай act. Отметка «выполнено», напоминания и их отмена срабатывают сразу.\n"
+        "6. Анализ дня или недели, советы, «что перенести», «как всё успеть», «разгрузи» — analyze. "
         + PERSONAL_ADVICE
-        + "\n7. Если пользователь хочет подготовиться к чему-то большому или разбить задачу на шаги — breakdown_task.\n"
-        "8. На вопросы о плане отвечай по блоку «План» или get_events, ничего не придумывай. Не перечисляй задачи, если вызвала get_events — "
-        "пользователь увидит их списком; дай короткий вывод или комментарий.\n"
-        "9. Ответ — по-русски, на «вы», коротко: до 5–6 предложений или список строк «• …». Без markdown-заголовков, таблиц и id задач.\n"
-        "10. На сообщения не о планах ответь коротко и дружелюбно и мягко верни разговор к планированию.\n"
-        "11. Теги ставь полем tags (в create_events или update_event), а не символом # в названии. Бери тег из блока «Теги»; "
+        + "\n7. Подготовиться к чему-то большому или разбить задачу на шаги — breakdown.\n"
+        "8. Вопросы о задачах («что у меня в пятницу?», «когда встреча с Анной?») — find: приложение покажет найденное списком.\n"
+        "9. Без act отвечай текстом, только когда непонятно, о каких задачах речь (спроси, перечислив подходящие с днём и временем), "
+        "или когда сообщение не о планах: коротко и дружелюбно, мягко верни разговор к планированию. Ответ — по-русски, на «вы», "
+        "до 5–6 предложений или строки «• …», без markdown-заголовков, таблиц и номеров задач.\n"
+        "10. Теги ставь полем tags (в events у create или в change), а не символом # в названии. Бери тег из блока «Теги»; "
         "если пользователь называет новый тег — передай его, приложение создаст его само.\n\n"
         f"СЕЙЧАС: {turn.now:%Y-%m-%d %H:%M}, {WEEKDAYS[turn.now.weekday()]}. Часовой пояс: {turn.tz}.\n\n"
         f"ТАБЛИЦА ДНЕЙ:\n{day_table(turn.today)}\n\n"
@@ -1156,7 +1236,8 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
     messages = [{"role": "system", "content": await system_prompt(turn)}, *await history_messages(turn), {"role": "user", "content": text[:8000]}]
     client = GigaChatClient()
     previous = next((message["content"] for message in reversed(messages[1:-1]) if message["role"] == "user"), "")
-    specs = functions(turn.today, offered(text, previous))
+    turn.allowed = offered(text, previous)
+    specs = functions(turn.today, turn.allowed)
     answer = None
     corrected = False
     for _ in range(MAX_STEPS):
@@ -1170,15 +1251,15 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
         call = message.get("function_call")
         if not call:
             answer = (message.get("content") or "").strip()
-            # The model claimed a change without calling a function: once, ask it to do it for real
+            # The model claimed a change without calling the function: once, ask it to do it for real
             if not corrected and not turn.changed and chat.claims_action(answer):
                 corrected = True
                 messages.append({"role": "assistant", "content": answer})
                 messages.append(
                     {
                         "role": "user",
-                        "content": "(Системная проверка: ты написала, что изменила календарь, но не вызвала ни одной функции, поэтому ничего "
-                        "не изменилось. Вызови нужную функцию или честно ответь, что не сделала.)",
+                        "content": "(Системная проверка: ты написала, что изменила календарь, но не вызвала act, поэтому ничего "
+                        "не изменилось. Вызови act или честно ответь, что не сделала.)",
                     }
                 )
                 answer = None
@@ -1186,23 +1267,14 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
             break
         name = call.get("name")
         args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
-        handler = HANDLERS.get(name)
-        if handler is None:
-            result = {"error": f"Функции {name} нет."}
-        else:
-            turn.tools.append(name)
-            try:
-                # A failed function undoes only its own writes, not what earlier calls of this turn did
-                async with session.begin_nested():
-                    result = await handler(turn, args)
-            except Exception:
-                logger.exception("Assistant function %s failed", name)
-                result = {"error": "Внутренняя ошибка, попробуй по-другому или извинись перед пользователем."}
-        logger.info("Agent called %s(%s) -> %s", name, json.dumps(args, ensure_ascii=False)[:300], result.get("error") or "ok")
-        messages.append({"role": "assistant", "content": message.get("content") or "", "function_call": {"name": name, "arguments": args}, **({"functions_state_id": message["functions_state_id"]} if message.get("functions_state_id") else {})})
-        messages.append({"role": "function", "name": name or "unknown", "content": json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))})
-        if name in ACTIONS and turn.changed and not (result.get("error") or result.get("skipped")) and not turn.analysed and not MORE_REQUESTS.search(text):
-            # The reply to a done action is written by the app (see finish): one more request would only pay for unused text
+        if name != "act" and isinstance(args.get("operations"), list | dict):
+            name = "act"
+        result = await act(turn, args) if name == "act" else {"results": [{"error": "Есть только функция act."}]}
+        logger.info("Agent operations %s -> %s", json.dumps(args, ensure_ascii=False)[:400], [item.get("error") or "ok" for item in result["results"]])
+        messages.append({"role": "assistant", "content": message.get("content") or "", "function_call": {"name": "act", "arguments": args}, **({"functions_state_id": message["functions_state_id"]} if message.get("functions_state_id") else {})})
+        messages.append({"role": "function", "name": "act", "content": json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))})
+        if not all(item.get("error") for item in result["results"]):
+            # The app words the reply itself (see finish): another request would only pay for unused text
             break
     if not turn.changed and not turn.analysed:
         reply = await by_rules(turn)
@@ -1242,11 +1314,13 @@ async def finish(turn: Turn, answer: str | None) -> dict:
     """The reply the chat shows: the draft to confirm, done tasks, a reminder, the found tasks or just the answer."""
     session, user, tz = turn.session, turn.user, turn.tz
     await session.commit()
+    # Done at once in the same message ("я сделала отчёт и добавь созвон"): said next to the draft or the main result
+    done = done_lines(turn)
     if turn.delete:
         draft = await chat.create_draft(session, user, [turn.delete])
         count = len(turn.delete["event_ids"])
         said = f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({turn.delete['title']})? Это нельзя отменить."
-        return chat.proposal(draft, tz, answer=said)
+        return chat.proposal(draft, tz, answer=chat.join_text(*done, said))
     if turn.items:
         created = await chat.apply_hashtags(session, user, [item for item in turn.items if not item.get("event_id")], turn.text)
         for item in turn.items:
@@ -1262,27 +1336,24 @@ async def finish(turn: Turn, answer: str | None) -> dict:
         if chat.ADD_REQUEST.match(turn.text) and len(turn.items) == 1 and new and not warning and not turn.notes:
             # "Добавь …" with one task: added at once, "Отменить" is under the answer
             reply = await chat.confirm_draft(session, user, draft.id)
-            return {**reply, "answer": None}
+            return {**reply, "answer": None, **({"text": chat.join_text(reply.get("text"), *done)} if done else {})}
         note = " ".join(dict.fromkeys(turn.notes)) or None
         said = (turn.analysis or answer) if turn.analysed else turn.breakdown or proposal_text(turn)
-        return chat.proposal(draft, tz, answer=chat.join_text(warning, said), note=note)
+        return chat.proposal(draft, tz, answer=chat.join_text(*done, warning, said), note=note)
     if turn.completed:
-        titles = list(dict.fromkeys(event.title for event in turn.completed))
-        done = f"«{titles[0]}»" if len(titles) == 1 else f"{len(turn.completed)} {plural(len(turn.completed), 'задачу', 'задачи', 'задач')}"
         return {
             "kind": "completed",
             "events": [chat.event_view(event, tz) for event in turn.completed[:20]],
             "event_ids": [event.id for event in turn.completed[:200]],
-            "text": f"Отметила выполненным: {done} ✓",
+            "text": "\n".join(done),
         }
     if turn.reminders:
-        # The time is the app's: the model's wording about it may be off
-        text = "\n".join(
-            f"Буду напоминать {item['repeat']}: {item['text']} 🔁 Первое — {item['label']}." if item.get("repeat") else f"Напомню {item['label']}: {item['text']} 🔔"
-            for item in turn.reminders
-        )
-        return {"kind": "reminder", "reminders": turn.reminders, "text": text}
-    if turn.shown and set(turn.tools) <= {"get_events"}:
+        return {"kind": "reminder", "reminders": turn.reminders, "text": "\n".join(done)}
+    if turn.reopened or turn.cancelled:
+        return {"kind": "answer" if turn.reopened else "cancelled", "text": "\n".join(done)}
+    if turn.shown is not None and set(turn.tools) <= {"find"}:
+        if not turn.shown:
+            return {"kind": "answer", "text": answer or f"{turn.shown_title or 'Здесь'} — задач не нашла."}
         return {
             "kind": "agenda",
             "title": turn.shown_title or "Найденные события",
@@ -1291,11 +1362,37 @@ async def finish(turn: Turn, answer: str | None) -> dict:
         }
     if turn.analysis:
         return {"kind": "answer", "text": turn.analysis}
-    if turn.cancelled:
-        return {"kind": "cancelled", "text": "\n".join(f"Напоминание отменено: {item['text']}" for item in turn.cancelled)}
+    if turn.stats:
+        return turn.stats
+    if turn.listed is not None:
+        if not turn.listed:
+            return {"kind": "answer", "text": "Активных напоминаний нет."}
+        lines = [f"• {item['label']}{' (' + item['repeat'] + ')' if item.get('repeat') else ''}: {item['text']}" for item in turn.listed]
+        return {"kind": "answer", "text": "Ваши напоминания:\n" + "\n".join(lines)}
     if answer:
         return {"kind": "answer", "text": answer}
     return {"kind": "nothing"}
+
+
+def done_lines(turn: Turn) -> list[str]:
+    """What this turn did at once, said by the app: marked done, reopened, reminders set and cancelled."""
+    lines = []
+
+    def tasks_said(events: list[Event]) -> str:
+        titles = list(dict.fromkeys(event.title for event in events))
+        return f"«{titles[0]}»" if len(titles) == 1 else f"{len(events)} {plural(len(events), 'задачу', 'задачи', 'задач')}"
+
+    if turn.completed:
+        lines.append(f"Отметила выполненным: {tasks_said(turn.completed)} ✓")
+    if turn.reopened:
+        lines.append(f"Вернула в невыполненные: {tasks_said(turn.reopened)}.")
+    # The time is the app's: the model's wording about it may be off
+    lines += [
+        f"Буду напоминать {item['repeat']}: {item['text']} 🔁 Первое — {item['label']}." if item.get("repeat") else f"Напомню {item['label']}: {item['text']} 🔔"
+        for item in turn.reminders
+    ]
+    lines += [f"Напоминание отменено: {item['text']}" for item in turn.cancelled]
+    return lines
 
 
 def proposal_text(turn: Turn) -> str:
