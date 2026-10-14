@@ -89,7 +89,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `GIGACHAT_AGENT_MODEL` | Model of the assistant agent (default: `GIGACHAT_MODEL`); `GigaChat-2-Pro` picks functions more reliably than the free Lite |
 | `ASSISTANT_AGENT` | `false` turns the agent off: the rule-based assistant answers alone (default `true`) |
 | `STORAGE_PATH` | Directory for uploaded files (default `./storage`) |
-| `MAX_FILE_SIZE_MB` | Upload size limit (default `20`) |
+| `MAX_FILE_SIZE_MB` | Upload size limit (default `25`) |
 
 ## Running
 

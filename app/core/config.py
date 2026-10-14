@@ -39,7 +39,7 @@ class Settings:
     database_url: str = _database_url()
     secret_key: str = os.getenv("SECRET_KEY", "change-me")
     storage_path: Path = Path(os.getenv("STORAGE_PATH", "./storage"))
-    max_file_size_mb: int = int(os.getenv("MAX_FILE_SIZE_MB", "20"))
+    max_file_size_mb: int = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
     google_client_id: str | None = os.getenv("GOOGLE_CLIENT_ID")
     google_client_secret: str | None = os.getenv("GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str = os.getenv(
