@@ -400,7 +400,7 @@ def group_by_day(events: list[Event], tz: ZoneInfo, today: date) -> list[dict]:
 
 def is_question(text: str) -> bool:
     lowered = " ".join(text.lower().split())
-    return lowered.startswith(QUESTION_PREFIXES) or bool(
+    return lowered.startswith(QUESTION_PREFIXES) or is_free_time_question(lowered) or bool(
         re.search(
             r"\bчто у меня\b|\bкогда у меня\b|\bчем я занят|\b(мои|какие у меня)\s+(задач|план|дел|событ|встреч)"
             r"|\b(расскажи|подскажи|скажи|покажи)\b.*\b(план|расписан|задач|дел|событ|встреч)",
@@ -482,7 +482,108 @@ def search_title(filters: dict, today: date) -> str:
     return "Найденные события"
 
 
+# "Какое у меня свободное время в понедельник?", "когда я свободна завтра?", "есть окно в пятницу?":
+# the schedule is shown and the free time is written out, counted by the app, not by the model
+FREE_TIME_REQUEST = re.compile(
+    r"свободн\w*\s+(?:время|времени|окн|час|слот|промежут|минут)|\bокн[оаы]\b|\bокошк|когда\s+(?:я\s+|у\s+меня\s+)?свобод"
+    r"|свобод(?:ен|на|ны)\b|не\s+занят|\bfree\s+(?:time|slot)",
+    re.I,
+)
+# "Поставь пробежку в свободное окно": a task to create, not a question
+FREE_TIME_ACTION = re.compile(r"добав|постав|запланир|запиш|созда|перенес|перенест|сдвин|удал|напомн", re.I)
+FREE_MIN_MINUTES = 30
+FREE_TIME_MAX_DAYS = 7
+
+
+def is_free_time_question(text: str) -> bool:
+    return bool(FREE_TIME_REQUEST.search(text)) and not FREE_TIME_ACTION.search(text)
+
+
+def free_span(profile: dict, day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    """The waking part of a day free time is counted in: the working hours, widened to at least 8:00–21:00,
+    so the evening after work counts as free too."""
+    from app.services import insights
+
+    start = min(insights.day_start(profile, day), insights.DEFAULT_DAY_START)
+    end = max(insights.day_end(profile, day), insights.DEFAULT_DAY_END)
+    return datetime.combine(day, start, tz), datetime.combine(day, end, tz)
+
+
+def hours_text(minutes: int) -> str:
+    hours, rest = divmod(minutes, 60)
+    if not hours:
+        return f"{rest} мин"
+    return f"{hours} ч {rest} мин" if rest else f"{hours} ч"
+
+
+async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first: date, last: date) -> str:
+    """The free windows of each day, written out: "Понедельник, 20 октября — свободно: 08:00–10:00, 11:00–21:00 (12 ч)"."""
+    from app.services import insights
+
+    now = datetime.now(tz)
+    first = max(first, now.date())
+    last = min(max(last, first), first + timedelta(days=FREE_TIME_MAX_DAYS - 1))
+    events = await tasks.events_between(
+        session, user, datetime.combine(first, time.min, tz), datetime.combine(last + timedelta(days=1), time.min, tz), limit=3000
+    )
+    profile = user.profile or {}
+    lines = []
+    for offset in range((last - first).days + 1):
+        day = first + timedelta(days=offset)
+        begin, end = free_span(profile, day, tz)
+        begin = max(begin, now)
+        label = short_day(day)
+        label = label[:1].upper() + label[1:]
+        if begin >= end:
+            lines.append(f"{label} — день уже закончился.")
+            continue
+        timed = [event for event in events if not event.all_day and event.start_at < end and event.end_at > begin]
+        untimed = [event for event in events if event.all_day and event.start_at.astimezone(tz).date() <= day < event.end_at.astimezone(tz).date()]
+        windows = insights.free_windows(timed, begin, end, minimum=FREE_MIN_MINUTES)
+        total = sum(int((finish - start).total_seconds() // 60) for start, finish in windows)
+        # Window edges taken from tasks come from the database in UTC
+        spans = ", ".join(f"{start.astimezone(tz):%H:%M}–{finish.astimezone(tz):%H:%M}" for start, finish in windows)
+        if not timed:
+            text = f"{label} — свободно весь день: {spans} ({hours_text(total)})"
+        elif windows:
+            text = f"{label} — свободно: {spans} ({hours_text(total)})"
+        else:
+            text = f"{label} — свободных окон нет: всё занято до {end:%H:%M}"
+        if untimed:
+            text += f". Ещё {len(untimed)} {plural(len(untimed), 'задача', 'задачи', 'задач')} без времени — их можно поставить в эти окна"
+        lines.append(text + ".")
+    return "\n".join(lines)
+
+
+def free_time_period(text: str, tz: ZoneInfo) -> tuple[date, date]:
+    """The days a free-time question is about; no day named — today."""
+    filters = local_filters(text, tz)
+    today = datetime.now(tz).date()
+    if not filters or not filters["date_from"]:
+        return today, today
+    return filters["date_from"], filters["date_to"] or filters["date_from"]
+
+
+async def free_time_reply(session: AsyncSession, user: User, text: str, tz: ZoneInfo, first: date | None = None, last: date | None = None) -> dict:
+    """The schedule of the asked days with their free time written above it."""
+    if first is None:
+        first, last = free_time_period(text, tz)
+    last = last or first
+    today = datetime.now(tz).date()
+    events = await tasks.events_between(session, user, datetime.combine(first, time.min, tz), datetime.combine(last + timedelta(days=1), time.min, tz), limit=200)
+    filters = {"date_from": first, "date_to": last}
+    return {
+        "kind": "agenda",
+        "title": search_title(filters, today),
+        "date": first.isoformat() if first == last else None,
+        "days": group_by_day(events, tz, today),
+        "answer": await free_time_text(session, user, tz, first, last),
+    }
+
+
 async def search(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
+    if is_free_time_question(text):
+        return await free_time_reply(session, user, text, tz)
     filters = local_filters(text, tz)
     if filters is None and settings.llm_enabled:
         from services.gigachat import GigaChatClient
@@ -1944,7 +2045,7 @@ async def breakdown_items(session: AsyncSession, user: User, text: str, tz: Zone
                 "date": day.isoformat(),
                 "weekday": insights.WEEKDAYS_FULL[day.weekday()],
                 "tasks": len(of_day),
-                "free_time": [f"{first:%H:%M}–{last:%H:%M}" for first, last in windows[:3]],
+                "free_time": [f"{first.astimezone(tz):%H:%M}–{last.astimezone(tz):%H:%M}" for first, last in windows[:3]],
             }
         )
     facts = {

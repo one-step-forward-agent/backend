@@ -336,7 +336,7 @@ async def facts(session: AsyncSession, user: User, now: datetime, ahead: bool = 
         "remaining_titles": [event.title for event in remaining[:10]],
         "untimed": [event.title for event in remaining if event.all_day][:5],
         "load_minutes": load_minutes(remaining, now),
-        "free_windows": [f"{start:%H:%M}–{finish:%H:%M}" for start, finish in windows[:3]],
+        "free_windows": [f"{start.astimezone(tz):%H:%M}–{finish.astimezone(tz):%H:%M}" for start, finish in windows[:3]],
         "overdue": [event.title for event in past if tasks.is_overdue(event, real_today, tz)][:5],
         "week_percent": stats["percent"],
         "week_total": stats["total"],

@@ -37,6 +37,8 @@ HISTORY_HOURS = 6
 HISTORY_USER_CHARS = 600
 HISTORY_ASSISTANT_CHARS = 300
 PLAN_DAYS = 7
+# "а во вторник?" right after a question continues it
+FOLLOW_UP_LIMIT = 40
 PLAN_LINES = 40
 TABLE_DAYS = 14
 MAX_FOUND = 40
@@ -247,6 +249,10 @@ class Turn:
     analysis: str | None = None
     breakdown: str | None = None
     shown_title: str | None = None
+    # The days the found tasks are of: a free-time question writes out the free windows of these days
+    shown_range: tuple[date, date] | None = None
+    # "Какое у меня свободное время в понедельник?" (or a follow-up "а во вторник?"): the free time is written out
+    free_time: bool = False
     # A request the app cannot do at all (a reminder without Telegram): the app's own answer, not the model's
     blocked: str | None = None
     tools: list[str] = field(default_factory=list)
@@ -488,6 +494,9 @@ async def get_events(turn: Turn, args: dict) -> dict:
         local = chat.local_filters(turn.text, turn.tz)
         if local and local["date_from"]:
             args = {**args, "date_from": local["date_from"].isoformat(), "date_to": (local["date_to"] or local["date_from"]).isoformat()}
+    if turn.free_time:
+        # Free time is about whole days: words like «свободное время» are not a task's title
+        args = {key: args[key] for key in ("date_from", "date_to") if args.get(key)}
     query = args.get("query") if isinstance(args.get("query"), str) else ""
     if not (args.get("date_from") or args.get("date_to") or query.strip() or args.get("status") in ("done", "overdue") or args.get("tags")):
         args = {**args, "date_from": turn.today.isoformat(), "date_to": (turn.today + timedelta(days=PLAN_DAYS - 1)).isoformat()}
@@ -499,6 +508,8 @@ async def get_events(turn: Turn, args: dict) -> dict:
         events.sort(key=lambda event: (event.end_at < turn.now, abs((event.start_at - turn.now).total_seconds())))
     turn.shown = events[:MAX_FOUND]
     first, last = parse_day(args.get("date_from"), turn), parse_day(args.get("date_to"), turn)
+    if first or last:
+        turn.shown_range = (first or last, last or first)
     turn.shown_title = chat.search_title({"date_from": first or last, "date_to": last or first}, turn.today) if (first or last) else "Найденные события"
     return {"count": len(events), "events": [event_brief(event, turn) for event in events[:MAX_FOUND]], "truncated": len(events) > MAX_FOUND}
 
@@ -993,7 +1004,7 @@ async def day_loads(turn: Turn, first: date, last: date) -> list[str]:
         if minutes:
             text += f", занято ~{round(minutes / 60, 1)} ч"
         if windows:
-            text += ", свободно " + ", ".join(f"{start:%H:%M}–{finish:%H:%M}" for start, finish in windows[:3])
+            text += ", свободно " + ", ".join(f"{start.astimezone(turn.tz):%H:%M}–{finish.astimezone(turn.tz):%H:%M}" for start, finish in windows[:3])
         lines.append(text)
     return lines
 
@@ -1275,6 +1286,9 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
     client = GigaChatClient()
     previous = next((message["content"] for message in reversed(messages[1:-1]) if message["role"] == "user"), "")
     turn.allowed = offered(text, previous)
+    turn.free_time = chat.is_free_time_question(text) or (
+        len(text) <= FOLLOW_UP_LIMIT and chat.is_free_time_question(previous) and not chat.FREE_TIME_ACTION.search(text)
+    )
     specs = functions(turn.today, turn.allowed)
     answer = None
     corrected = False
@@ -1391,6 +1405,10 @@ async def finish(turn: Turn, answer: str | None) -> dict:
         return {"kind": "reminder", "reminders": turn.reminders, "text": "\n".join(done)}
     if turn.reopened or turn.cancelled:
         return {"kind": "answer" if turn.reopened else "cancelled", "text": "\n".join(done)}
+    if turn.free_time and set(turn.tools) <= {"find"} and (turn.shown is not None or chat.is_free_time_question(turn.text)):
+        # The schedule and the free windows, counted by the app: the model's own count is often off
+        first, last = turn.shown_range or chat.free_time_period(turn.text, tz)
+        return await chat.free_time_reply(session, user, turn.text, tz, first, last)
     if turn.shown is not None and set(turn.tools) <= {"find"}:
         if not turn.shown:
             return {"kind": "answer", "text": answer or f"{turn.shown_title or 'Здесь'} — задач не нашла."}
