@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timedelta, timezone
+from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
@@ -135,8 +136,7 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
             # Changed in Dayla and not accepted by the calendar yet: the local version wins until it is sent
             skipped += 1
             continue
-        else:
-            updated += 1
+        before = (event.title, event.description, event.location, event.start_at, event.end_at, event.all_day, event.series_id)
         event.title = item.title[:300]
         event.description = "\n".join(part for part in (item.description, item.url) if part) or None
         event.location = item.location[:500] if item.location else None
@@ -145,11 +145,46 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
         event.all_day = item.all_day
         event.timezone = tz
         event.sync_status = SyncStatus.SYNCED
+        if item.series_key:
+            # Days of one repeating event there make one series here: deleting one asks about the rest
+            event.series_id = str(uuid5(NAMESPACE_URL, f"{integration.provider}:{integration.id}:{item.series_key}"))
+        if event.id is not None and before != (event.title, event.description, event.location, event.start_at, event.end_at, event.all_day, event.series_id):
+            updated += 1
     integration.status = "connected"
     integration.last_sync_at = now
     integration.last_sync_error = None
     await session.commit()
     return {"fetched": len(items), "created": created, "updated": updated, "skipped": skipped}
+
+
+# Opening "Сегодня" syncs the connected calendars, at most this often per user
+AUTO_SYNC_EVERY = timedelta(minutes=2)
+_auto_synced: dict[int, datetime] = {}
+
+
+async def sync_all(session: AsyncSession, user: User) -> dict:
+    """Bring every connected calendar up to date without the user pressing "Синхронизировать". A calendar that
+    fails keeps its error on its card and does not stop the others; `changed` tells the page to reload."""
+    now = datetime.now(timezone.utc)
+    if (last := _auto_synced.get(user.id)) and now - last < AUTO_SYNC_EVERY:
+        return {"synced": [], "changed": False}
+    _auto_synced[user.id] = now
+    synced, changed = [], False
+    for integration in list(await session.scalars(select(Integration).where(Integration.user_id == user.id).order_by(Integration.id))):
+        if integration.provider not in PROVIDERS:
+            continue
+        try:
+            result = await sync_integration(session, user, integration)
+        except IntegrationError:
+            # Already on the integration card; the next visit retries
+            continue
+        except Exception:
+            logger.exception("Auto sync of %s failed for user %s", integration.provider, user.id)
+            await session.rollback()
+            continue
+        synced.append(integration.provider)
+        changed = changed or bool(result["created"] or result["updated"])
+    return {"synced": synced, "changed": changed}
 
 
 async def push_event(session: AsyncSession, user: User, integration: Integration, event: Event) -> EventLink:

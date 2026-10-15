@@ -840,7 +840,15 @@ def default_calendars(user: User, targets: list[dict]) -> list[str]:
 def proposal(draft: AssistantDraft, tz: ZoneInfo, answer: str | None = None, note: str | None = None) -> dict:
     if draft.items and draft.items[0].get("action") == "delete":
         item = draft.items[0]
-        return {"kind": "delete_proposal", "draft_id": draft.id, "count": len(item["event_ids"]), "title": item["title"], "events": item["preview"], "answer": answer}
+        return {
+            "kind": "delete_proposal",
+            "draft_id": draft.id,
+            "count": len(item["event_ids"]),
+            "title": item["title"],
+            "events": item["preview"],
+            "series": bool(item.get("series")),
+            "answer": answer,
+        }
     return {
         "kind": "proposal",
         "draft_id": draft.id,
@@ -1205,7 +1213,7 @@ async def apply_changes(session: AsyncSession, user: User, items: list[dict], tz
     return changed
 
 
-async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dict:
+async def confirm_draft(session: AsyncSession, user: User, draft_id: int, scope: str = "one") -> dict:
     draft = await get_draft(session, user, draft_id)
     tz = tasks.local_tz(user)
     items = list(draft.items)
@@ -1213,7 +1221,7 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dic
     await session.delete(draft)
     await session.flush()
     if items and items[0].get("action") == "delete":
-        count = await delete_events(session, user, items[0]["event_ids"])
+        count = await delete_events(session, user, items[0]["event_ids"], scope)
         reply = {"kind": "deleted", "count": count, "text": deleted_text(count)}
         await update_draft_messages(session, user, draft_id, reply)
         await session.commit()
@@ -1794,25 +1802,31 @@ async def delete_request(session: AsyncSession, user: User, text: str, tz: ZoneI
     titles = list(dict.fromkeys(event.title for event in events))
     title = label or (f"«{titles[0]}»" if len(titles) == 1 else f"«{titles[0]}» и ещё {len(titles) - 1}")
     preview = [event_view(event, tz) for event in sorted(events, key=lambda event: (event.start_at < now, event.start_at))[:10]]
-    draft = await create_draft(session, user, [{"action": "delete", "event_ids": [event.id for event in events], "title": title, "preview": preview}])
-    count = len(events)
-    return proposal(draft, tz, answer=f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({title})? Это нельзя отменить.")
+    draft = await create_draft(session, user, [delete_item(events, title, preview)])
+    return proposal(draft, tz, answer=delete_question(len(events), title, any(event.series_id for event in events)))
+
+
+def delete_item(events: list[Event], title: str, preview: list[dict]) -> dict:
+    # "series": a repeated task is among them, so the user picks just these days, these and the later ones, or all
+    return {"action": "delete", "event_ids": [event.id for event in events], "title": title, "preview": preview, "series": any(event.series_id for event in events)}
+
+
+def delete_question(count: int, title: str, series: bool) -> str:
+    if series:
+        return f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({title})? Задача повторяется: удалить только {'её' if count == 1 else 'их'}, ещё и следующие или всю серию? Это нельзя отменить."
+    return f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({title})? Это нельзя отменить."
 
 
 def deleted_text(count: int) -> str:
     return f"Удалила {count} {plural(count, 'задачу', 'задачи', 'задач')}." if count else "Эти задачи уже удалены."
 
 
-async def delete_events(session: AsyncSession, user: User, event_ids: list[int]) -> int:
-    """Delete the user's events (also from Google Calendar when they were synced there)."""
+async def delete_events(session: AsyncSession, user: User, event_ids: list[int], scope: str = "one") -> int:
+    """Delete the user's events, also from the connected calendars; `scope` — how much of a repeated task's series."""
     events = list(await session.scalars(select(Event).where(Event.user_id == user.id, Event.id.in_(event_ids[:MAX_DELETE]))))
     if not events:
         return 0
-    await delete_from_calendars(session, user.id, events)
-    for event in events:
-        await session.delete(event)
-    await session.commit()
-    return len(events)
+    return await tasks.delete_tasks(session, user, events, scope)
 
 
 async def complete_request(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:

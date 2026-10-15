@@ -214,13 +214,17 @@ def parse_recurrence(text: str) -> tuple[str | None, list[tuple[int, int]]]:
     if match := re.search(r"\b(по\s+выходным|каждые\s+выходные|каждый\s+выходной)\b", low):
         return "FREQ=WEEKLY;BYDAY=SA,SU", [match.span()]
     weekday_list = rf"(?:{ANY_WEEKDAY})(?:\s*(?:,|и)\s*(?:{ANY_WEEKDAY}))*"
+    # "раз в две недели", "каждые 2 нед." — alone, or with the days anywhere in the message: "раз в две недели по чт"
+    weeks = re.search(rf"\b(?:каждые|раз\s+в)\s+({NUMBER})\s+нед\w*\.?", low)
     if match := re.search(rf"\b(?:по|кажд(?:ый|ую|ое|ые)(?:\s+(втор(?:ой|ую|ое)))?)\s+({weekday_list})\b", low):
         days = sorted({_weekday(token) for token in re.findall(rf"\b(?:{ANY_WEEKDAY})\b", match.group(2))} - {None})
         if days:
-            interval = ";INTERVAL=2" if match.group(1) else ""
-            return f"FREQ=WEEKLY{interval};BYDAY={','.join(RRULE_DAYS[day] for day in days)}", [match.span()]
-    if match := re.search(rf"\b(?:каждые|раз\s+в)\s+({NUMBER})\s+недел\w*", low):
-        return f"FREQ=WEEKLY;INTERVAL={_number(match.group(1))}", [match.span()]
+            every = 2 if match.group(1) else _number(weeks.group(1)) if weeks else 1
+            interval = f";INTERVAL={every}" if every > 1 else ""
+            return f"FREQ=WEEKLY{interval};BYDAY={','.join(RRULE_DAYS[day] for day in days)}", [match.span(), *([weeks.span()] if weeks else [])]
+    if weeks:
+        every = _number(weeks.group(1))
+        return ("FREQ=WEEKLY" if every == 1 else f"FREQ=WEEKLY;INTERVAL={every}"), [weeks.span()]
     if match := re.search(r"\b(еженедельно|каждую\s+неделю|раз\s+в\s+неделю)\b", low):
         return "FREQ=WEEKLY", [match.span()]
     monthly_day = r"\b(?:каждое\s+(\d{1,2})(?:-?е)?\s+число|(\d{1,2})(?:-?го)?\s+числа\s+каждого\s+месяца)\b"
@@ -422,7 +426,9 @@ def parse(text: str, now: datetime) -> Parsed:
 
 
 def first_occurrence(rule: str, start: datetime, now: datetime) -> datetime | None:
-    """The first moment of the series that is not in the past."""
+    """The first moment of the series that is not in the past. The series starts there, so "every two weeks" counts
+    its weeks from it: "раз в две недели по чт" said on a Thursday evening starts next Thursday, not in two weeks."""
+    rule = ";".join(part for part in rule.split(";") if not part.startswith("INTERVAL="))
     try:
         series = rrulestr(rule, dtstart=start)
     except (TypeError, ValueError):
@@ -502,8 +508,9 @@ def _describe_frequency(parts: dict) -> str:
             single = ("каждый второй понедельник", "каждый второй вторник", "каждую вторую среду", "каждый второй четверг",
                       "каждую вторую пятницу", "каждую вторую субботу", "каждое второе воскресенье")
             return single[days[0]]
-        if days and interval == 1:
-            return "по " + (", ".join(names[day] for day in days[:-1]) + " и " + names[days[-1]] if len(days) > 1 else names[days[0]])
+        if days:
+            listed = "по " + (", ".join(names[day] for day in days[:-1]) + " и " + names[days[-1]] if len(days) > 1 else names[days[0]])
+            return listed if interval == 1 else f"раз в {interval} нед. {listed}"
         return "каждую неделю" if interval == 1 else f"каждые {interval} нед."
     if freq == "MONTHLY":
         return f"каждый месяц, {parts['BYMONTHDAY']} числа" if parts.get("BYMONTHDAY") else "каждый месяц"

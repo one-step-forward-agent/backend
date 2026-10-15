@@ -116,10 +116,10 @@ async def test_connect_imports_and_exports(client, user, fake_yandex):
     listed = {item["slug"]: item for item in (await client.get("/api/integrations", headers=headers)).json()}
     assert listed["yandex"]["connection"]["status"] == "connected" and listed["yandex"]["connection"]["account_email"] == "olga@yandex.ru"
 
-    # Sync again: the same event is updated, not duplicated
+    # Sync again: the same event is kept, not duplicated; "updated" counts only real changes
     synced = await client.post("/api/integrations/yandex/sync", headers=headers)
     assert synced.status_code == 200, synced.text
-    assert synced.json()["updated"] == 1 and synced.json()["created"] == 0
+    assert synced.json()["updated"] == 0 and synced.json()["created"] == 0 and synced.json()["fetched"] == 1
     assert (await client.post("/api/integrations/yandex/test", headers=headers)).json() == {"status": "ok", "account": "olga@yandex.ru"}
 
     # A task from the chat goes to Yandex Calendar: the connected calendar is the default target

@@ -518,13 +518,17 @@ def new_item(raw: dict, turn: Turn, whole: dates.Parsed | None = None) -> tuple[
         day = None
     start, end = parse_clock(raw.get("start_time")), parse_clock(raw.get("end_time"))
     if whole is not None:
-        day = whole.date or day
+        # A repetition said in the message starts on the day the message names, or on its first day from now:
+        # the model's own day for "раз в две недели по чт" is often a week off
+        day = whole.date or (None if whole.rrule else day)
         if whole.time:
             start, end = whole.time, whole.end_time or (end if end and end != whole.time else None)
     if day and day < turn.today:
         return None, f"«{title}»: дата {day.isoformat()} уже прошла"
     rule = None
-    if isinstance(raw.get("repeat"), str) and raw["repeat"].strip():
+    if whole is not None and whole.rrule:
+        rule = whole.rrule
+    elif isinstance(raw.get("repeat"), str) and raw["repeat"].strip():
         rule = dates.parse(raw["repeat"], turn.now).rrule or dates.valid_rrule(raw["repeat"].strip().removeprefix("RRULE:"))
     elif isinstance(raw.get("date"), str) and raw["date"].strip():
         # "каждый вторник" in the date field is a repetition, not a day
@@ -578,7 +582,7 @@ async def create_events(turn: Turn, args: dict) -> dict:
     if len(raw) == 1 and not turn.items:
         _, rest = chat.take_deadline(turn.text, turn.now)
         whole = dates.parse(rest, turn.now)
-        whole = None if whole.rrule or whole.end_date else whole
+        whole = None if whole.end_date else whole
     for value in raw[: chat.MAX_DRAFT_ITEMS]:
         item, problem = new_item(value, turn, whole) if isinstance(value, dict) else (None, "неверный формат")
         if item and any(not existing.get("event_id") and all(existing.get(key) == item.get(key) for key in ("title", "date", "time")) for existing in turn.items):
@@ -744,7 +748,7 @@ async def delete_events(turn: Turn, args: dict) -> dict:
     titles = list(dict.fromkeys(event.title for event in events))
     title = label or (f"«{titles[0]}»" if len(titles) == 1 else f"«{titles[0]}» и ещё {len(titles) - 1}")
     preview = [chat.event_view(event, turn.tz) for event in sorted(events, key=lambda event: (event.start_at < turn.now, event.start_at))[:10]]
-    turn.delete = {"action": "delete", "event_ids": [event.id for event in events], "title": title, "preview": preview}
+    turn.delete = chat.delete_item(events, title, preview)
     return {
         "status": "Пользователю показан запрос на подтверждение удаления. Ещё ничего не удалено.",
         "count": len(events),
@@ -1355,8 +1359,7 @@ async def finish(turn: Turn, answer: str | None) -> dict:
     done = done_lines(turn)
     if turn.delete:
         draft = await chat.create_draft(session, user, [turn.delete])
-        count = len(turn.delete["event_ids"])
-        said = f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({turn.delete['title']})? Это нельзя отменить."
+        said = chat.delete_question(len(turn.delete["event_ids"]), turn.delete["title"], turn.delete["series"])
         return chat.proposal(draft, tz, answer=chat.join_text(*done, said))
     if turn.items:
         created = await chat.apply_hashtags(session, user, [item for item in turn.items if not item.get("event_id")], turn.text)

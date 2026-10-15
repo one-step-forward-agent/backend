@@ -49,7 +49,7 @@ from app.services import chat, insights, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
 from app.services.google_calendar import revoke_google_access
-from app.services.events import default_calendar, delete_from_calendars, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
+from app.services.events import default_calendar, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets
 
@@ -269,17 +269,13 @@ async def update_event(event_id: int, payload: EventUpdate, user: User = Depends
 @router.delete("/events/{event_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_event(
     event_id: int,
-    scope: Literal["one", "series"] = "one",
+    scope: Literal["one", "following", "all", "series"] = "one",
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
+    """A repeated task: `scope` is just this day, this and the later ones ("series", as older apps call it) or all."""
     event = await _owned_event(session, user, event_id)
-    if scope == "series":
-        await tasks.delete_series(session, user, event)
-        return
-    await delete_from_calendars(session, user.id, [event])
-    await session.delete(event)
-    await session.commit()
+    await tasks.delete_tasks(session, user, [event], "following" if scope == "series" else scope)
 
 
 @router.post("/events/{event_id}/complete", response_model=EventRead)
@@ -453,9 +449,15 @@ async def draft_calendars(draft_id: int, payload: DraftCalendars, user: User = D
 
 
 @router.post("/assistant/drafts/{draft_id}/confirm")
-async def confirm_draft(draft_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+async def confirm_draft(
+    draft_id: int,
+    scope: Literal["one", "following", "all"] = "one",
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """`scope`: for a deletion of a repeated task — just the chosen days, these and the later ones, or the whole series."""
     try:
-        return await chat.confirm_draft(session, user, draft_id)
+        return await chat.confirm_draft(session, user, draft_id, scope)
     except chat.DraftNotFound:
         raise HTTPException(status_code=404, detail="Черновик не найден") from None
 

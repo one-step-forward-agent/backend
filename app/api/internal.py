@@ -185,10 +185,10 @@ async def draft_calendars(chat_id: int, draft_id: int, payload: DraftCalendars, 
 
 
 @router.post("/chat/{chat_id}/drafts/{draft_id}/confirm")
-async def draft_confirm(chat_id: int, draft_id: int, session: AsyncSession = Depends(get_session)):
+async def draft_confirm(chat_id: int, draft_id: int, scope: Literal["one", "following", "all"] = "one", session: AsyncSession = Depends(get_session)):
     user = await _user_by_chat(session, chat_id)
     try:
-        return await chat.confirm_draft(session, user, draft_id)
+        return await chat.confirm_draft(session, user, draft_id, scope)
     except chat.DraftNotFound:
         raise HTTPException(status_code=410, detail="Draft is gone") from None
 

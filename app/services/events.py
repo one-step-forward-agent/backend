@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -71,24 +72,33 @@ async def delete_in_google(provider: GoogleCalendarProvider, external_id: str) -
             raise
 
 
-async def delete_from_google(session: AsyncSession, user_id: int, events: list[Event]) -> None:
+# A day of a series made in the calendar itself: Google's "<series id>_20261015T140000Z", CalDAV's "<uid>@20261015T140000Z"
+OCCURRENCE_SUFFIX = re.compile(r"[_@]\d{8}(?:T\d{6}Z?)?$")
+
+
+def series_copy(event: Event, external_id: str, whole_series: bool) -> str:
+    """The id to delete in the calendar: the day itself, or its whole series when the user deletes all of it."""
+    return OCCURRENCE_SUFFIX.sub("", external_id) if whole_series and event.series_id else external_id
+
+
+async def delete_from_google(session: AsyncSession, user_id: int, events: list[Event], whole_series: bool = False) -> None:
     """Remove the Google copies of events deleted in Dayla; otherwise they stay in Google (and the next import brings them back)."""
-    synced = [event for event in events if event.external_id and event.source == "google"]
+    synced = list(dict.fromkeys(series_copy(event, event.external_id, whole_series) for event in events if event.external_id and event.source == "google"))
     if not synced:
         return
     integration, provider = await google_provider(session, user_id)
     if not integration:
         return
-    for event in synced:
+    for external_id in synced:
         if not provider:
-            remember_deletion(session, user_id, "google", event.external_id)
+            remember_deletion(session, user_id, "google", external_id)
             continue
         try:
-            await delete_in_google(provider, event.external_id)
+            await delete_in_google(provider, external_id)
         except httpx.HTTPError as error:
             status = error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
-            logger.warning("Could not delete Google event %s now, will retry: %s", event.external_id, status or error)
-            remember_deletion(session, user_id, "google", event.external_id)
+            logger.warning("Could not delete Google event %s now, will retry: %s", external_id, status or error)
+            remember_deletion(session, user_id, "google", external_id)
             if access_lost(error):
                 # The integration card asks to reconnect; the deletion goes through after that
                 mark_access_lost(integration)
@@ -103,11 +113,12 @@ def remote_id(integration: Integration, external_id: str) -> str:
     return external_id[len(prefix):] if external_id.startswith(prefix) else external_id
 
 
-async def delete_from_calendars(session: AsyncSession, user_id: int, events: list[Event]) -> None:
+async def delete_from_calendars(session: AsyncSession, user_id: int, events: list[Event], whole_series: bool = False) -> None:
     """Remove the copies of events deleted in Dayla from every connected calendar: Google, and the Yandex and Apple
     copies Dayla sent there (event links) or imported from there. A calendar that fails never stops the deletion:
-    its copy is deleted later by retry_remote_deletions."""
-    await delete_from_google(session, user_id, events)
+    its copy is deleted later by retry_remote_deletions. `whole_series`: the days of a series imported from a calendar
+    go there as the series itself, so its days beyond the imported weeks go too."""
+    await delete_from_google(session, user_id, events, whole_series)
     from app.services.integrations.registry import PROVIDERS
     from app.services.integrations.service import build_provider, user_timezone
 
@@ -124,11 +135,13 @@ async def delete_from_calendars(session: AsyncSession, user_id: int, events: lis
         if link.integration_id in integrations
     ]
     # Imported from Yandex or Apple: the event itself is their copy
-    copies += [
-        (by_provider[event.source], remote_id(by_provider[event.source], event.external_id), None)
-        for event in events
-        if event.external_id and event.source in by_provider and event.source != "google"
-    ]
+    copies += list(
+        dict.fromkeys(
+            (by_provider[event.source], series_copy(event, remote_id(by_provider[event.source], event.external_id), whole_series), None)
+            for event in events
+            if event.external_id and event.source in by_provider and event.source != "google"
+        )
+    )
     user = await session.get(User, user_id)
     for integration, external_id, url in copies:
         if integration.provider == "google" or integration.provider not in PROVIDERS:

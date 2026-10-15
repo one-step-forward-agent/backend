@@ -314,20 +314,27 @@ async def change_series(session: AsyncSession, user: User, event: Event, rule: s
     return add_occurrences(session, event, datetime.now(timezone.utc))
 
 
-async def delete_series(session: AsyncSession, user: User, event: Event) -> int:
-    """Delete this and later occurrences; earlier ones stay as history but stop the series from refilling."""
-    if not event.series_id:
-        await delete_from_calendars(session, user.id, [event])
+# How much of a repeated task a deletion takes: just it, it and the later ones, or the whole series
+DELETE_SCOPES = ("one", "following", "all")
+
+
+async def delete_tasks(session: AsyncSession, user: User, events: list[Event], scope: str = "one") -> int:
+    """Delete the tasks; for a repeated one `scope` says how much of its series goes too. After "following" the
+    earlier days stay as history but stop the series from refilling."""
+    doomed = {event.id: event for event in events}
+    if scope in ("following", "all"):
+        for series_id in {event.series_id for event in events if event.series_id}:
+            conditions = [Event.user_id == user.id, Event.series_id == series_id]
+            if scope == "following":
+                conditions.append(Event.start_at >= min(event.start_at for event in events if event.series_id == series_id))
+            doomed |= {event.id: event for event in await session.scalars(select(Event).where(*conditions))}
+            if scope == "following":
+                await session.execute(update(Event).where(Event.user_id == user.id, Event.series_id == series_id).values(recurrence_rule=None))
+    await delete_from_calendars(session, user.id, list(doomed.values()), whole_series=scope == "all")
+    for event in doomed.values():
         await session.delete(event)
-        await session.commit()
-        return 1
-    later = list(await session.scalars(select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at >= event.start_at)))
-    await delete_from_calendars(session, user.id, later)
-    for item in later:
-        await session.delete(item)
-    await session.execute(update(Event).where(Event.user_id == user.id, Event.series_id == event.series_id).values(recurrence_rule=None))
     await session.commit()
-    return len(later)
+    return len(doomed)
 
 
 async def set_completed(session: AsyncSession, user: User, event_id: int, completed: bool) -> Event | None:

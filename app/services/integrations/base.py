@@ -91,6 +91,8 @@ class RemoteItem:
     description: str | None = None
     location: str | None = None
     url: str | None = None
+    # The calendar's own series this event is a day of (a repeating event there), so Dayla treats it as a series
+    series_key: str | None = None
 
 
 @dataclass

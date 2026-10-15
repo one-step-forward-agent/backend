@@ -149,7 +149,7 @@ class AppleCalendarIntegration(IntegrationProvider):
             start_at = start if start.tzinfo else start.replace(tzinfo=tz)
             end_at = end if isinstance(end, datetime) else start_at + timedelta(hours=1)
             end_at = end_at if end_at.tzinfo else end_at.replace(tzinfo=tz)
-        uid = str(component.get("UID", uuid4().hex))
+        uid = series = str(component.get("UID", uuid4().hex))
         recurrence = component.get("RECURRENCE-ID")
         if recurrence is not None:
             uid = f"{uid}@{recurrence.to_ical().decode()}"
@@ -163,6 +163,7 @@ class AppleCalendarIntegration(IntegrationProvider):
             description=description,
             location=str(component.get("LOCATION")) if component.get("LOCATION") else None,
             url=None,
+            series_key=series if recurrence is not None else None,
         )
 
     async def push_event(self, event: EventPayload) -> PushResult:

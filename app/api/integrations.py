@@ -92,6 +92,12 @@ async def test_integration(slug: str, user: User = Depends(get_current_user), se
     return {"status": "ok", "account": account}
 
 
+@router.post("/integrations/sync")
+async def sync_all_integrations(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Every connected calendar at once: "Сегодня" calls it when it opens."""
+    return await service.sync_all(session, user)
+
+
 @router.post("/integrations/{slug}/sync")
 async def sync_integration(slug: str, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     integration = await _require_integration(session, user, slug)

@@ -78,6 +78,7 @@ class GoogleIntegration(IntegrationProvider):
                     description=raw.get("description"),
                     location=raw.get("location"),
                     url=raw.get("htmlLink"),
+                    series_key=raw.get("recurringEventId"),
                 )
             )
         return items
