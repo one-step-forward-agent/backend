@@ -275,8 +275,8 @@ async def test_moving_a_google_event_changes_it_in_google(client, user, services
     later = TOMORROW + timedelta(days=1)
     moved = await client.post(f"/api/assistant/events/{event['id']}/move", json={"date": later.isoformat()}, headers=headers)
     assert moved.status_code == 200, moved.text
-    # Only the title and the time are sent: guests and links in Google stay
-    assert len(services.google_patches) == 1 and set(services.google_patches[0]) == {"summary", "start", "end"}
+    # Only the event's own fields are sent: guests and links in Google stay
+    assert len(services.google_patches) == 1 and set(services.google_patches[0]) == {"summary", "start", "end", "location", "description"}
     assert services.google_start.date() == later
     await client.post("/api/integrations/google/sync", headers=headers)
     event = await google_standup(client, headers)

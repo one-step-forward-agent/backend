@@ -49,7 +49,7 @@ from app.services import chat, insights, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
 from app.services.google_calendar import revoke_google_access
-from app.services.events import default_calendar, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
+from app.services.events import default_calendar, google_provider, push_changes, push_new_events_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets
 
@@ -254,12 +254,13 @@ async def update_event(event_id: int, payload: EventUpdate, user: User = Depends
         setattr(event, key, value)
     if event.end_at <= event.start_at:
         raise HTTPException(status_code=422, detail="end_at must be later than start_at")
-    event.sync_status = "pending"
+    if event.external_id:
+        event.sync_status = "pending"
     created = []
     if changes_repeat and rule != event.recurrence_rule:
         created = await tasks.change_series(session, user, event, rule)
     await session.commit()
-    await push_pending_to_google(session, user.id)
+    await push_changes(session, user.id, [event])
     if created:
         await push_new_events_to_google(session, user.id, created)
     await session.refresh(event)

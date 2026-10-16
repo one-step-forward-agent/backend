@@ -55,6 +55,25 @@ def _caldav_time(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _fill(component: IEvent, event: EventPayload) -> None:
+    """Write the event's title, time, description and place into a VEVENT, replacing what it had."""
+    for name in ("SUMMARY", "DTSTAMP", "DTSTART", "DTEND", "DURATION", "DESCRIPTION", "LOCATION"):
+        component.pop(name, None)
+    component.add("summary", event.title)
+    component.add("dtstamp", datetime.now(timezone.utc))
+    if event.all_day:
+        first, after = event.days()
+        component.add("dtstart", first)
+        component.add("dtend", after)
+    else:
+        component.add("dtstart", event.start_at.astimezone(timezone.utc))
+        component.add("dtend", event.end_at.astimezone(timezone.utc))
+    if event.description:
+        component.add("description", event.description)
+    if event.location:
+        component.add("location", event.location)
+
+
 class AppleCalendarIntegration(IntegrationProvider):
     slug = "apple"
     title = "Apple Calendar"
@@ -170,19 +189,7 @@ class AppleCalendarIntegration(IntegrationProvider):
         uid = f"{uuid4()}@focus-day"
         component = IEvent()
         component.add("uid", uid)
-        component.add("summary", event.title)
-        component.add("dtstamp", datetime.now(timezone.utc))
-        if event.all_day:
-            first, after = event.days()
-            component.add("dtstart", first)
-            component.add("dtend", after)
-        else:
-            component.add("dtstart", event.start_at.astimezone(timezone.utc))
-            component.add("dtend", event.end_at.astimezone(timezone.utc))
-        if event.description:
-            component.add("description", event.description)
-        if event.location:
-            component.add("location", event.location)
+        _fill(component, event)
         calendar = ICalendar()
         calendar.add("prodid", "-//Focus Day//RU")
         calendar.add("version", "2.0")
@@ -207,6 +214,41 @@ class AppleCalendarIntegration(IntegrationProvider):
             raise IntegrationError(f"CalDAV сервер отклонил событие ({response.status_code})")
         # The address of the .ics is what a later deletion needs
         return PushResult(external_id=uid, url=url)
+
+    async def update_event(self, external_id: str, event: EventPayload, url: str | None = None) -> None:
+        if RECURRENCE_SUFFIX.search(external_id):
+            # One occurrence of a series made in the calendar itself: changing its file would change the whole series
+            return
+        async with self._client() as client:
+            for address in [url] if url else await self._find(client, external_id):
+                try:
+                    response = await client.get(address)
+                except (httpx.HTTPError, httpx.InvalidURL) as error:
+                    raise IntegrationError("CalDAV сервер недоступен") from error
+                if response.status_code in (404, 410):
+                    # Deleted there: nothing to change
+                    continue
+                if response.status_code != 200:
+                    raise IntegrationError(f"CalDAV сервер не отдал событие ({response.status_code})")
+                calendar = ICalendar.from_ical(response.content)
+                found = [item for item in calendar.walk("VEVENT") if str(item.get("UID")) == external_id and item.get("RECURRENCE-ID") is None]
+                if not found or found[0].get("RRULE") is not None:
+                    # A repeating event there: Dayla changes one day, which is not the whole series
+                    continue
+                component = found[0]
+                sequence = int(component.pop("SEQUENCE", 0) or 0)
+                _fill(component, event)
+                component.add("sequence", sequence + 1)
+                headers = {"Content-Type": "text/calendar; charset=utf-8"}
+                if response.headers.get("ETag"):
+                    # Not over a change made there meanwhile: that one is imported, the next change here goes over it
+                    headers["If-Match"] = response.headers["ETag"]
+                try:
+                    saved = await client.put(address, content=calendar.to_ical(), headers=headers)
+                except (httpx.HTTPError, httpx.InvalidURL) as error:
+                    raise IntegrationError("CalDAV сервер недоступен") from error
+                if saved.status_code not in (200, 201, 204):
+                    raise IntegrationError(f"CalDAV сервер не принял изменение ({saved.status_code})")
 
     async def delete_event(self, external_id: str, url: str | None = None) -> None:
         if RECURRENCE_SUFFIX.search(external_id):

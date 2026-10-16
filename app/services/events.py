@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Calendar, Event, EventLink, Integration, RemoteDeletion, User
 from app.services.google_calendar import GoogleCalendarProvider
-from app.services.integrations.google import google_event_body
+from app.services.integrations.google import google_event_body, google_patch_times
 from app.services.integrations.service import event_payload, integration_secrets, store_secrets
 
 logger = logging.getLogger(__name__)
@@ -289,32 +289,89 @@ async def google_catch_up_loop() -> None:
             logger.exception("Sending unsent tasks to Google failed")
 
 
-async def push_pending_to_google(session: AsyncSession, user_id: int) -> None:
-    """Send the Google events changed in Dayla (moved, renamed, new time) back to Google Calendar.
+# Google adds the event's own page to the description it gives; Dayla keeps it as the description's last line
+GOOGLE_LINK = re.compile(r"\n?https://(?:www\.google\.com/calendar/event|calendar\.google\.com/)\S*$")
 
-    Without it the next import brings Google's old version back and the change is lost. An event Google
-    refused stays "pending": the import leaves it alone and the next change or sync tries again."""
-    events = list(
-        await session.scalars(
-            select(Event).where(Event.user_id == user_id, Event.source == "google", Event.external_id.is_not(None), Event.sync_status == "pending")
-        )
-    )
+
+def google_change(event: Event) -> dict:
+    """What a change made in Dayla sets in Google: guests, video links and Google's own reminders stay as they are."""
+    body = google_patch_times(google_event_body(event_payload(event)))
+    description = GOOGLE_LINK.sub("", event.description or "")
+    return {**{key: body[key] for key in ("summary", "start", "end", "location")}, "description": description or None}
+
+
+async def _push_changes_to_google(session: AsyncSession, user_id: int, events: list[Event], failed: set[int]) -> None:
     if not events:
         return
     integration, provider = await google_provider(session, user_id)
     if not provider:
+        failed.update(event.id for event in events)
         return
     for event in events:
-        body = google_event_body(event_payload(event))
         try:
-            await provider.patch_event("primary", event.external_id, {key: body[key] for key in ("summary", "start", "end")})
-            event.sync_status = "synced"
+            await provider.patch_event("primary", event.external_id, google_change(event))
         except httpx.HTTPStatusError as error:
             if error.response.status_code in (404, 410):
                 # Deleted in Google: the import no longer brings it back, the Dayla copy keeps the change
                 event.sync_status = "error"
+            else:
+                failed.add(event.id)
             logger.warning("Google refused the change of event %s: %s", event.id, error.response.status_code)
         except httpx.HTTPError:
+            failed.add(event.id)
             logger.warning("Could not send the change of event %s to Google", event.id)
     remember_google_token(integration, provider)
+
+
+async def _push_changes_to_calendars(session: AsyncSession, user_id: int, events: list[Event], failed: set[int]) -> None:
+    """Yandex, Apple and the copies Dayla sent to a calendar (event links)."""
+    from app.services.integrations.registry import PROVIDERS
+    from app.services.integrations.service import build_provider, user_timezone
+
+    integrations = {item.id: item for item in await session.scalars(select(Integration).where(Integration.user_id == user_id))}
+    if not integrations:
+        return
+    by_provider = {item.provider: item for item in integrations.values()}
+    copies: dict[int, list[tuple[Integration, str, str | None]]] = {}
+    for link in await session.scalars(select(EventLink).where(EventLink.event_id.in_([event.id for event in events]))):
+        if link.integration_id in integrations:
+            copies.setdefault(link.event_id, []).append((integrations[link.integration_id], link.external_id, link.url))
+    for event in events:
+        if event.external_id and event.source in by_provider and event.source != "google":
+            # Imported from Yandex or Apple: the event itself is their copy
+            integration = by_provider[event.source]
+            copies.setdefault(event.id, []).append((integration, remote_id(integration, event.external_id), None))
+    if not copies:
+        return
+    user = await session.get(User, user_id)
+    for event in events:
+        for integration, external_id, url in copies.get(event.id, []):
+            if integration.provider not in PROVIDERS:
+                continue
+            try:
+                provider = build_provider(integration, user_timezone(user))
+                await provider.update_event(external_id, event_payload(event), url)
+                if provider.context.updated_secrets:
+                    store_secrets(integration, provider.context.updated_secrets)
+            except Exception:
+                failed.add(event.id)
+                logger.warning("Could not send the change of event %s to %s now, will retry", event.id, integration.provider)
+
+
+async def push_changes(session: AsyncSession, user_id: int, events: list[Event] | None = None) -> None:
+    """Send the events changed in Dayla (moved, renamed, new time) to every calendar that has a copy of them.
+
+    Without it the next import brings the calendar's old version back and the change is lost. An imported event
+    a calendar refused stays "pending": the import leaves it alone and the next change or sync tries again.
+    `events`: the ones just changed, also those kept in Dayla only, whose copies Dayla sent to a calendar."""
+    pending = list(await session.scalars(select(Event).where(Event.user_id == user_id, Event.sync_status == "pending")))
+    pending += [event for event in events or [] if event not in pending]
+    if not pending:
+        return
+    failed: set[int] = set()
+    await _push_changes_to_google(session, user_id, [event for event in pending if event.source == "google" and event.external_id], failed)
+    await _push_changes_to_calendars(session, user_id, pending, failed)
+    for event in pending:
+        if event.sync_status == "pending" and event.id not in failed:
+            event.sync_status = "synced" if event.external_id else "not_synced"
     await session.commit()

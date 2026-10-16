@@ -26,6 +26,14 @@ class FakeYandex:
         self.profile = {"default_email": "olga@yandex.ru"}
         self.puts: list[tuple[str, str]] = []
         self.event_day = (datetime.now(TZ) + timedelta(days=1)).strftime("%Y%m%d")
+        # The meeting's file as Yandex keeps it once Dayla changed it
+        self.meeting: str | None = None
+
+    def ical(self) -> str:
+        return (
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:meet-1@yandex\r\nSUMMARY:Планёрка в Яндексе\r\n"
+            f"DTSTART:{self.event_day}T070000Z\r\nDTEND:{self.event_day}T080000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -53,11 +61,13 @@ class FakeYandex:
                 "<d:displayname>Мои события</d:displayname></d:prop></d:propstat></d:response>"
             )
         elif request.method == "REPORT" and path == "/calendars/olga/events-1/":
-            ical = (
-                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:meet-1@yandex\r\nSUMMARY:Планёрка в Яндексе\r\n"
-                f"DTSTART:{self.event_day}T070000Z\r\nDTEND:{self.event_day}T080000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-            )
+            ical = self.meeting or self.ical()
             body = f"<d:response><d:href>/calendars/olga/events-1/meet-1.ics</d:href><d:propstat><d:prop><c:calendar-data>{ical}</c:calendar-data></d:prop></d:propstat></d:response>"
+        elif request.method == "GET" and path == "/calendars/olga/events-1/meet-1.ics":
+            return httpx.Response(200, text=self.meeting or self.ical(), headers={"ETag": '"v1"'})
+        elif request.method == "PUT" and path == "/calendars/olga/events-1/meet-1.ics":
+            self.meeting = request.content.decode()
+            return httpx.Response(204)
         elif request.method == "PUT" and path.startswith("/calendars/olga/events-1/"):
             self.puts.append((path, request.content.decode()))
             return httpx.Response(201)
@@ -184,3 +194,23 @@ async def test_sign_up_with_yandex(fake_yandex):
         start = datetime.combine(datetime.now(TZ).date(), time.min, TZ)
         events = (await browser.get("/api/events", params={"start": start.isoformat(), "limit": 100}, headers=headers)).json()
         assert [event["title"] for event in events] == ["Планёрка в Яндексе"]
+
+
+async def test_a_change_made_in_dayla_goes_to_yandex(client, user, fake_yandex):
+    headers, _ = user
+    await connect(client, headers, fake_yandex)
+    start = datetime.combine(datetime.now(TZ).date(), time.min, TZ)
+    event = (await client.get("/api/events", params={"start": start.isoformat(), "limit": 100}, headers=headers)).json()[0]
+    moved = datetime.fromisoformat(event["start_at"]) + timedelta(hours=2)
+    changed = await client.put(
+        f"/api/events/{event['id']}",
+        json={"title": "Планёрка перенесена", "start_at": moved.isoformat(), "end_at": (moved + timedelta(hours=1)).isoformat()},
+        headers=headers,
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["sync_status"] == "synced"
+    assert "SUMMARY:Планёрка перенесена" in fake_yandex.meeting and "UID:meet-1@yandex" in fake_yandex.meeting
+    # The next import brings the changed version back, not the old one
+    await client.post("/api/integrations/yandex/sync", headers=headers)
+    event = (await client.get(f"/api/events/{event['id']}", headers=headers)).json()
+    assert event["title"] == "Планёрка перенесена" and datetime.fromisoformat(event["start_at"]) == moved

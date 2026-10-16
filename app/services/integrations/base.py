@@ -152,6 +152,10 @@ class IntegrationProvider(ABC):
     async def push_event(self, event: EventPayload) -> PushResult:
         raise PushNotSupported(f"{self.title} does not support export")
 
+    async def update_event(self, external_id: str, event: EventPayload, url: str | None = None) -> None:
+        """Send a change made in Dayla to the service's copy of the event. Not every service can."""
+        return None
+
     async def delete_event(self, external_id: str, url: str | None = None) -> None:
         """Remove an event from the service (one Dayla pushed there, or one imported from it). Not every service can."""
         return None

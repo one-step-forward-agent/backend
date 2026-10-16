@@ -18,6 +18,14 @@ def google_event_body(event: EventPayload) -> dict[str, Any]:
     return {"summary": event.title, "description": event.description, "location": event.location, "start": start, "end": end}
 
 
+def google_patch_times(body: dict[str, Any]) -> dict[str, Any]:
+    """PATCH merges `start`/`end` with what Google has: a timed event turned all-day (or back) would keep both
+    `date` and `dateTime`, and Google refuses that. The other kind is cleared explicitly."""
+    for key in ("start", "end"):
+        body[key] = {"date": None, **body[key]} if "dateTime" in body[key] else {"dateTime": None, "timeZone": None, **body[key]}
+    return body
+
+
 class GoogleIntegration(IntegrationProvider):
     slug = "google"
     title = "Google Calendar"
@@ -91,3 +99,16 @@ class GoogleIntegration(IntegrationProvider):
             raise IntegrationError("Google Calendar отклонил событие") from error
         self._remember_token(client)
         return PushResult(external_id=result["id"], url=result.get("htmlLink"))
+
+    async def update_event(self, external_id: str, event: EventPayload, url: str | None = None) -> None:
+        client = self._client()
+        body = google_patch_times(google_event_body(event))
+        try:
+            await client.patch_event("primary", external_id, body)
+        except httpx.HTTPStatusError as error:
+            # 404 and 410: deleted in Google, nothing to change
+            if error.response.status_code not in (404, 410):
+                raise IntegrationError("Google Calendar не принял изменение") from error
+        except httpx.HTTPError as error:
+            raise IntegrationError("Google Calendar недоступен") from error
+        self._remember_token(client)

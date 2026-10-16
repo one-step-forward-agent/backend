@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Event, Tag, User
 from app.services.dates import describe_rrule, valid_rrule
-from app.services.events import default_calendar, delete_from_calendars, push_new_events_to_google, push_pending_to_google
+from app.services.events import default_calendar, delete_from_calendars, push_changes, push_new_events_to_google
 from app.services.integrations.service import user_timezone
 
 logger = logging.getLogger(__name__)
@@ -461,7 +461,7 @@ async def move_events(session: AsyncSession, user: User, event_ids: list[int], t
         event.end_at = event.start_at + duration
         event.sync_status = "pending" if event.external_id else event.sync_status
     await session.commit()
-    await push_pending_to_google(session, user.id)
+    await push_changes(session, user.id, events)
     return len(events)
 
 
