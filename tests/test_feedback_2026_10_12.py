@@ -46,14 +46,13 @@ async def log_in(browser, provider: str) -> httpx.Response:
 
 
 
-async def test_jira_and_notion_can_no_longer_be_used(browser, client, user):
+async def test_jira_and_notion_connect_but_do_not_sign_in(browser, client, user):
     headers, _ = user
     for provider in ("notion", "jira"):
         started = await browser.post(f"/auth/oauth/{provider}/start", json={"mode": "signup", "consent": True})
         assert started.status_code == 404
-        assert (await client.post(f"/api/integrations/{provider}/connect", json={"values": {}}, headers=headers)).status_code == 404
     listed = {item["slug"] for item in (await client.get("/api/integrations", headers=headers)).json()}
-    assert not listed & {"notion", "jira"}
+    assert {"notion", "jira"} <= listed
 
 
 async def test_reminder_every_day_repeats_and_says_so(client, user, agent):

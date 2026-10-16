@@ -1119,6 +1119,9 @@ def day_table(today: date) -> str:
     return "\n".join(lines)
 
 
+CHAT_NOTE_KINDS = {"goals": "цели и планы", "personal": "личные обстоятельства", "constraints": "ограничения и запреты"}
+
+
 def profile_text(user: User) -> str:
     profile = user.profile if isinstance(user.profile, dict) else {}
     lines = []
@@ -1138,6 +1141,19 @@ def profile_text(user: User) -> str:
     special = [f"{day} {value.get('from')}–{value.get('to')}" for day, value in per_day.items() if isinstance(value, dict) and value.get("from")]
     if special:
         lines.append("Часы по дням: " + ", ".join(special))
+    # Chats with other assistants the user shared: the links are not read, only what the user wrote about them
+    for source in (profile.get("aiChatSources") or [])[:20]:
+        if not isinstance(source, dict) or not source.get("url"):
+            continue
+        parts = [str(source["url"])[:300]]
+        topics = [str(item)[:60] for item in source.get("spheres") or [] if item] + [
+            CHAT_NOTE_KINDS.get(str(item), str(item).removeprefix("custom:"))[:60] for item in source.get("notes") or [] if item
+        ]
+        if topics:
+            parts.append("темы: " + ", ".join(topics))
+        if source.get("comment"):
+            parts.append("комментарий: " + str(source["comment"])[:500])
+        lines.append("Перенёс контекст из чата с ассистентом: " + "; ".join(parts))
     return "\n".join(lines) or "(онбординг не пройден — о пользователе пока ничего не известно)"
 
 

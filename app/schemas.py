@@ -358,6 +358,8 @@ class OnboardingProfile(BaseModel):
     perDayWorkHours: dict = Field(default_factory=dict)
     timezone: str | None = None
     integrations: list[str] = Field(default_factory=list, max_length=20)
+    # Chats with other assistants the user shares from the Integrations page: {url, spheres, notes, comment}
+    aiChatSources: list[dict] = Field(default_factory=list, max_length=20)
 
     @field_validator("timezone")
     @classmethod
