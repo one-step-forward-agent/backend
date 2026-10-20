@@ -9,7 +9,7 @@ from typing import Literal
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from sqlalchemy import any_, delete, func, select, update
@@ -750,23 +750,29 @@ async def transcribe_audio(audio: UploadFile = File(...), user: User = Depends(g
         Path(f"{target}.wav").unlink(missing_ok=True)
 
 
-@router.post("/assistant/file")
-async def send_chat_file(file: UploadFile = File(...), user: User = Depends(get_current_user)):
-    limit_uploads(user)
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in {".pdf", ".docx"}:
-        raise HTTPException(status_code=422, detail="Поддерживаются только PDF и DOCX")
-    content = await file.read()
-    if len(content) > settings.max_file_size_mb * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Файл слишком большой")
-    target = settings.storage_path / f"chat-{uuid4().hex}{suffix}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(content)
-    try:
-        from services.text_extractors import extract_document
+@router.post("/assistant/chat/file")
+async def assistant_chat_file(
+    file: UploadFile = File(...),
+    text: str = Form(default="", max_length=50000),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """A message with a file — a PDF, Word, Excel, CSV, text or photo: read here and answered like any message."""
+    return await chat_with_file(session, user, file, text)
 
-        return {"filename": file.filename, "text": await run_in_threadpool(extract_document, str(target))}
-    except ValueError as error:
+
+async def chat_with_file(session: AsyncSession, user: User, file: UploadFile, text: str) -> dict:
+    """The same for the site and the Telegram bot."""
+    from app.services import attachments
+
+    limit_uploads(user)
+    await limit_assistant(session, user, None)
+    data = await file.read(settings.max_file_size_mb * 1024 * 1024 + 1)
+    try:
+        attachment = await attachments.read(file.filename or "file", data)
+    except attachments.UnreadableFile as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    finally:
-        target.unlink(missing_ok=True)
+    try:
+        return await chat.handle_message(session, user, text, attachment)
+    except chat.AssistantUnavailable:
+        raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from None

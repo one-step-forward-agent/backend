@@ -8,6 +8,9 @@ from app.services.google_calendar import GoogleCalendarProvider
 from app.services.integrations.base import EventPayload, IntegrationError, IntegrationProvider, PushResult, RemoteItem
 
 
+MAX_PAGES = 20
+
+
 def google_event_body(event: EventPayload) -> dict[str, Any]:
     if event.all_day:
         first, after = event.days()
@@ -33,6 +36,7 @@ class GoogleIntegration(IntegrationProvider):
     auth_type = "oauth"
     fields = []
     scoped_external_ids = False
+    complete_fetch = True
 
     def _client(self) -> GoogleCalendarProvider:
         if not self.secrets.get("access_token"):
@@ -55,18 +59,24 @@ class GoogleIntegration(IntegrationProvider):
 
     async def fetch_items(self, start: datetime, end: datetime) -> list[RemoteItem]:
         client = self._client()
+        raws: list[dict] = []
+        params = {"timeMin": start.isoformat(), "timeMax": end.isoformat(), "singleEvents": "true", "orderBy": "startTime", "maxResults": "2500"}
         try:
-            data = await client._request(
-                "GET",
-                f"{client.base_url}/calendars/primary/events",
-                params={"timeMin": start.isoformat(), "timeMax": end.isoformat(), "singleEvents": "true", "orderBy": "startTime", "maxResults": "250"},
-            )
+            # Every page: the sync deletes in Dayla what is missing here, so a cut-off list would delete real events
+            for _ in range(MAX_PAGES):
+                data = await client._request("GET", f"{client.base_url}/calendars/primary/events", params=params) or {}
+                raws += data.get("items", [])
+                if not data.get("nextPageToken"):
+                    break
+                params = {**params, "pageToken": data["nextPageToken"]}
+            else:
+                raise IntegrationError("В Google Calendar слишком много событий")
         except httpx.HTTPError as error:
             raise IntegrationError("Не удалось получить события Google Calendar") from error
         self._remember_token(client)
         tz = ZoneInfo(self.context.timezone)
         items = []
-        for raw in (data or {}).get("items", []):
+        for raw in raws:
             if raw.get("status") == "cancelled":
                 continue
             all_day = "date" in raw.get("start", {})

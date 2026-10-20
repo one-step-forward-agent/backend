@@ -1,14 +1,14 @@
-import base64
 import logging
 from datetime import date
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_bot
-from app.api.routes import limit_assistant
+from app.api.routes import chat_with_file, limit_assistant
+from app.core import lang
 from app.core.config import settings
 from app.core.database import get_session
 from app.models.models import Notification, User
@@ -19,7 +19,6 @@ from app.schemas import (
     BotClaimRequest,
     BotCompleteRequest,
     BotEditRequest,
-    BotImageRequest,
     BotRatingRequest,
     BotTopicRequest,
     BotRemoveRequest,
@@ -43,6 +42,8 @@ async def _user_by_chat(session: AsyncSession, chat_id: int) -> User:
     if not user:
         raise HTTPException(status_code=404, detail="Telegram chat is not linked")
     usage.current_user_id.set(user.id)
+    # The bot speaks the language chosen on the site
+    lang.current.set(user.language or "ru")
     return user
 
 
@@ -60,6 +61,7 @@ def profile(user: User) -> dict:
         "name": user.name,
         "timezone": user_timezone(user),
         "app_url": settings.public_app_url or None,
+        "language": user.language or "ru",
     }
 
 
@@ -79,25 +81,10 @@ async def chat_message(chat_id: int, payload: BotChatRequest, session: AsyncSess
         raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
 
 
-@router.post("/chat/{chat_id}/image-text")
-async def chat_image_text(chat_id: int, payload: BotImageRequest, session: AsyncSession = Depends(get_session)):
-    """The text of a photo sent to the bot; the bot then sends it on as a message, like the text of a document."""
-    from services.gigachat import GigaChatClient, ImagesNotSupported
-
-    user = await _user_by_chat(session, chat_id)
-    await limit_assistant(session, user, None)
-    usage.current_user_id.set(user.id)
-    try:
-        data = base64.b64decode(payload.image, validate=True)
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Не получилось открыть картинку") from None
-    try:
-        return {"text": await GigaChatClient().image_text(data, payload.mime)}
-    except ImagesNotSupported:
-        raise HTTPException(status_code=422, detail="Картинки пока не читаю — перешлите текст или PDF") from None
-    except Exception:
-        logger.exception("Image of chat %s could not be read", chat_id)
-        raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
+@router.post("/chat/{chat_id}/file")
+async def chat_file(chat_id: int, file: UploadFile = File(...), text: str = Form(default="", max_length=50000), session: AsyncSession = Depends(get_session)):
+    """A document or photo sent to the bot: read and answered exactly as on the site."""
+    return await chat_with_file(session, await _user_by_chat(session, chat_id), file, text)
 
 
 @router.post("/chat/{chat_id}/messages/{message_id}/rating")

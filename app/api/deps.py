@@ -6,6 +6,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import decode_access_token
+from app.core import lang
 from app.core.config import settings
 from app.core.database import get_session
 from app.models.models import User
@@ -24,6 +25,7 @@ def _unauthorized(detail: str) -> HTTPException:
 async def get_current_user(
     bearer_token: str | None = Depends(oauth2_scheme),
     cookie_token: str | None = Cookie(default=None, alias=ACCESS_COOKIE),
+    accept_language: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> User:
     token = bearer_token or cookie_token
@@ -38,6 +40,12 @@ async def get_current_user(
         raise _unauthorized("Пользователь не найден или отключён")
     # Language model tokens spent in this request are counted for this user
     usage.current_user_id.set(user.id)
+    # The assistant answers in the site's language; the bot and the notifications follow the site's choice
+    language = lang.from_header(accept_language) if accept_language else user.language
+    lang.current.set(language)
+    if accept_language and user.language != language:
+        user.language = language
+        await session.commit()
     return user
 
 

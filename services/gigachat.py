@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
+from app.core import lang
 from app.core.config import settings
 from app.services import usage
 
@@ -40,6 +41,26 @@ PERSONAL_ADVICE = (
     "Не используй слова flexible, fixed, гибкие, movable и другие названия полей: говори «задачи без времени — их можно "
     "поставить на любой день», «задачи, которые нельзя переносить». "
 )
+# Requests whose text the user reads; the rest only extract fields the app parses in Russian
+USER_FACING = {"agent", "chat_reply", "process_message", "analysis", "breakdown", "recommendations", "plan_recommendations"}
+ENGLISH = (
+    "LANGUAGE: the user's site is in English. Everything the user reads — answers, questions, advice, "
+    "recommendation titles and texts, step titles — must be in natural English; this overrides any instruction "
+    "above to answer in Russian. Keep task titles taken from the user's calendar as they are, in quotes. "
+    "Function call arguments and JSON field names follow the rules above unchanged."
+)
+
+
+def in_site_language(messages: list[dict]) -> list[dict]:
+    """The messages with the English instruction added to the system message, or as one, when the site is in English."""
+    if not lang.is_en() or not messages:
+        return messages
+    first = messages[0]
+    if first.get("role") == "system" and isinstance(first.get("content"), str):
+        return [{**first, "content": first["content"] + "\n\n" + ENGLISH}, *messages[1:]]
+    return [{"role": "system", "content": ENGLISH}, *messages]
+
+
 # The OAuth token lives 30 minutes; fetching it for every request doubled the latency
 TOKEN_MARGIN = 60
 _token_cache: dict = {"value": None, "expires": 0.0}
@@ -259,6 +280,8 @@ class GigaChatClient:
     async def _complete(self, payload: dict, purpose: str, timeout: float | None = None) -> dict:
         """One chat completion from the service LLM_PROVIDER selects; its token usage is stored in llm_usage under `purpose`."""
         client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else aiohttp.ClientTimeout(total=300)
+        if purpose in USER_FACING:
+            payload = {**payload, "messages": in_site_language(payload["messages"])}
         async with aiohttp.ClientSession(timeout=client_timeout) as session:
             if settings.uses_openai:
                 payload = with_thinking(payload)
@@ -517,7 +540,7 @@ class GigaChatClient:
             raise ImagesNotSupported
         prompt = (
             "Перепиши с картинки всё, что относится к делам и событиям: что, дата, время, место, адрес, номер рейса или "
-            "брони, кто прислал и о чём просит. Обычным текстом по-русски, без markdown и без своих выводов. "
+            "брони, кто прислал и о чём просит, расписания и таблицы — строка за строкой. Обычным текстом на языке картинки, без markdown и без своих выводов. "
             "Если на картинке нет ничего о планах — ответь одним словом: НЕТ."
         )
         payload = {

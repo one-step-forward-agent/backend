@@ -57,6 +57,8 @@ class User(Base):
     # Opens dayla.tech/dashboard; granted with `python -m app.core.make_admin <email>`
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     timezone: Mapped[str | None] = mapped_column(Text)
+    # The site's language ("ru" or "en"): the Telegram bot and the notifications speak it too
+    language: Mapped[str] = mapped_column(String(2), default="ru", server_default="ru")
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     telegram_username: Mapped[str | None] = mapped_column(EncryptedText("users.telegram_username"))
     telegram_linked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -423,12 +423,6 @@ class BotCompleteRequest(BaseModel):
     completed: bool = True
 
 
-class BotImageRequest(BaseModel):
-    # A Telegram photo is at most a few MB; base64 makes it a third larger
-    image: str = Field(min_length=1, max_length=14_000_000)
-    mime: Literal["image/jpeg", "image/png", "image/webp"] = "image/jpeg"
-
-
 class BotEditRequest(BaseModel):
     index: int = Field(ge=0, lt=40)
     field: Literal["title", "date", "time", "repeat", "period", "reminder"]

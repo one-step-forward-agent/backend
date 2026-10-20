@@ -22,7 +22,20 @@ CONNECT_CANCELLED = "Подключение отменено."
 TOO_MANY = "Слишком много запросов — подождите минуту."
 CHECK_INPUT = "Проверьте введённые данные."
 # Names users know from the interface; any other Latin word marks a technical message
-KNOWN_WORDS = {"google", "calendar", "notion", "jira", "apple", "id", "icloud", "telegram", "dayla", "atlassian", "email", "pdf", "docx", "connections"}
+KNOWN_WORDS = {
+    "google", "calendar", "notion", "jira", "apple", "id", "icloud", "telegram", "dayla", "atlassian", "email", "pdf", "docx", "connections",
+    "word", "excel", "csv", "yandex", "samsung",
+}
+# The same on the English site (see app.core.lang): the site sends its language with every request
+ENGLISH = {
+    SERVER_ERROR: "Server error. Please try again later.",
+    CONNECT_ERROR: "Couldn't connect the service. Please try again.",
+    CONNECT_CANCELLED: "Connection cancelled.",
+    TOO_MANY: "Too many requests — please wait a minute.",
+    CHECK_INPUT: "Please check what you entered.",
+    "Пароль должен быть не короче 8 символов.": "The password must be at least 8 characters.",
+    "Проверьте email.": "Please check the email.",
+}
 CALLBACK_PATH = re.compile(r"^/auth/[a-z]+/callback$")
 
 
@@ -37,6 +50,24 @@ def plain(detail: object) -> str | None:
     if latin - KNOWN_WORDS or re.search(r"\b[1-5]\d\d\b|\b\d{1,3}(?:\.\d{1,3}){3}\b|[{}<>\[\]]|https?:", outside_quotes):
         return None
     return detail
+
+
+def plain_english(detail: object) -> str | None:
+    """On the English site: a plain English sentence the app wrote for the user, None for anything technical."""
+    if not isinstance(detail, str) or re.search(r"[а-яё]", detail, re.I) or " " not in detail.strip():
+        return None
+    if re.search(r"\b[1-5]\d\d\b|\b\d{1,3}(?:\.\d{1,3}){3}\b|[{}<>\[\]_]|https?:|Error\b|Exception\b|Traceback", detail):
+        return None
+    return detail if detail[:1].isupper() else None
+
+
+def english(request: Request) -> bool:
+    return (request.headers.get("accept-language") or "").strip().lower().startswith("en")
+
+
+def said(request: Request, detail: str) -> str:
+    """A generic message in the site's language."""
+    return ENGLISH.get(detail, detail) if english(request) else detail
 
 
 def _bot(request: Request) -> bool:
@@ -66,12 +97,13 @@ async def http_error(request: Request, error: StarletteHTTPException):
     if CALLBACK_PATH.match(request.url.path):
         logger.warning("OAuth callback %s failed: %s %s", request.url.path, error.status_code, error.detail)
         return _connect_failed(request, cancelled=bool(request.query_params.get("error")))
+    own = plain_english(error.detail) if english(request) else None
     if error.status_code == 429:
-        detail = plain(error.detail) or TOO_MANY
+        detail = own or plain(error.detail) or said(request, TOO_MANY)
     elif error.status_code >= 500:
-        detail = SERVER_ERROR
+        detail = said(request, SERVER_ERROR)
     else:
-        detail = plain(error.detail) or SERVER_ERROR
+        detail = own or plain(error.detail) or said(request, SERVER_ERROR)
     if detail != error.detail:
         logger.info("%s %s -> %s: %s", request.method, request.url.path, error.status_code, error.detail)
     return JSONResponse({"detail": detail}, status_code=error.status_code, headers=headers)
@@ -86,14 +118,14 @@ async def validation_error(request: Request, error: RequestValidationError):
         detail = "Пароль должен быть не короче 8 символов."
     elif "email" in fields:
         detail = "Проверьте email."
-    return JSONResponse({"detail": detail}, status_code=422)
+    return JSONResponse({"detail": said(request, detail)}, status_code=422)
 
 
 async def unexpected_error(request: Request, error: Exception):
     logger.exception("Unhandled error on %s %s", request.method, request.url.path)
     if CALLBACK_PATH.match(request.url.path):
         return _connect_failed(request)
-    return JSONResponse({"detail": SERVER_ERROR}, status_code=500)
+    return JSONResponse({"detail": said(request, SERVER_ERROR)}, status_code=500)
 
 
 def install(app: FastAPI) -> None:

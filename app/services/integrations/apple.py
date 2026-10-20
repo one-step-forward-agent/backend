@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urljoin
@@ -12,7 +14,21 @@ import httpx
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 
-from app.services.integrations.base import ConfigField, EventPayload, IntegrationError, IntegrationProvider, PushResult, RemoteItem, guarded_client
+from app.services.integrations.base import (
+    ConfigField,
+    EventPayload,
+    IntegrationError,
+    IntegrationProvider,
+    IntegrationUnavailable,
+    PushResult,
+    RemoteItem,
+    guarded_client,
+)
+
+logger = logging.getLogger(__name__)
+# Busy or failing for a moment (Yandex answers 429 and 5xx now and then): asked again once after a pause
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_PAUSE = 1.5
 
 NS = {"d": "DAV:", "c": "urn:ietf:params:xml:ns:caldav"}
 
@@ -97,15 +113,32 @@ class AppleCalendarIntegration(IntegrationProvider):
             headers={"Content-Type": "application/xml; charset=utf-8"},
         )
 
+    def unavailable(self) -> IntegrationUnavailable:
+        # Plain words for the card: the status code and the protocol stay in the log
+        return IntegrationUnavailable(f"{self.title} сейчас не отвечает — попробуем ещё раз чуть позже")
+
     async def _multistatus(self, client: httpx.AsyncClient, method: str, url: str, body: str, depth: str) -> tuple[str, ElementTree.Element]:
-        try:
-            response = await client.request(method, url, content=body, headers={"Depth": depth})
-        except (httpx.HTTPError, httpx.InvalidURL) as error:
-            raise IntegrationError("CalDAV сервер недоступен") from error
+        for attempt in range(2):
+            try:
+                response = await client.request(method, url, content=body, headers={"Depth": depth})
+            except httpx.InvalidURL as error:
+                raise IntegrationError("Неверный адрес календаря") from error
+            except httpx.HTTPError as error:
+                logger.warning("%s %s failed: %r", self.slug, method, error)
+                if attempt:
+                    raise self.unavailable() from error
+            else:
+                if response.status_code not in RETRY_STATUSES:
+                    break
+                logger.warning("%s %s answered %s", self.slug, method, response.status_code)
+                if attempt:
+                    raise self.unavailable()
+            await asyncio.sleep(RETRY_PAUSE)
         if response.status_code == 401:
             raise CalDAVUnauthorized(self.auth_error)
         if response.status_code != 207:
-            raise IntegrationError(f"CalDAV сервер ответил {response.status_code}")
+            logger.warning("%s %s %s answered %s", self.slug, method, url, response.status_code)
+            raise IntegrationError(f"{self.title} не отдал календарь — попробуйте подключить заново")
         # The CalDAV server is user-supplied: parse its XML without entity expansion or external entities
         return str(response.url), SafeElementTree.fromstring(response.content)
 
@@ -143,8 +176,20 @@ class AppleCalendarIntegration(IntegrationProvider):
         body = EVENTS_QUERY.format(start=_caldav_time(start), end=_caldav_time(end))
         items = []
         async with self._client() as client:
-            for calendar_url, calendar_name in await self._calendars(client):
-                _, tree = await self._multistatus(client, "REPORT", calendar_url, body, "1")
+            calendars = await self._calendars(client)
+            failed = 0
+            for calendar_url, calendar_name in calendars:
+                try:
+                    _, tree = await self._multistatus(client, "REPORT", calendar_url, body, "1")
+                except CalDAVUnauthorized:
+                    raise
+                except IntegrationError:
+                    # One calendar that cannot be read (holidays, a subscription) does not stop the others
+                    logger.warning("%s calendar %r could not be read", self.slug, calendar_name)
+                    failed += 1
+                    if failed == len(calendars):
+                        raise
+                    continue
                 for data in tree.iterfind(".//c:calendar-data", NS):
                     if not data.text:
                         continue

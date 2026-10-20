@@ -15,6 +15,7 @@ python-dateutil==2.9.0.post0
 snowballstemmer==3.1.1
 pypdf==6.19.0
 python-docx==1.2.0
+openpyxl==3.1.5
 SpeechRecognition==3.17.0
 pydub==0.25.1
 imageio-ffmpeg==0.6.0

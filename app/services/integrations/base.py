@@ -21,6 +21,11 @@ class PushNotSupported(IntegrationError):
     pass
 
 
+class IntegrationUnavailable(IntegrationError):
+    """The service did not answer now (timeout, overload, its own error): the connection itself is fine, so the card
+    stays "connected" and the next sync tries again."""
+
+
 async def guard_request(request: httpx.Request) -> None:
     if request.url.scheme not in ("http", "https"):
         raise IntegrationError("Поддерживаются только адреса http(s)")
@@ -135,6 +140,8 @@ class IntegrationProvider(ABC):
     fields: ClassVar[list[ConfigField]] = []
     supports_push: ClassVar[bool] = True
     scoped_external_ids: ClassVar[bool] = True
+    # fetch_items returns every event of the period: an imported event missing from it was deleted in the service
+    complete_fetch: ClassVar[bool] = False
 
     def __init__(self, context: ProviderContext):
         self.context = context

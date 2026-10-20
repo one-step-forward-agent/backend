@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import ratelimit
+from app.core import lang, ratelimit
 from app.core.config import settings
 from app.models.models import Event, RecommendationCache, Tag, User
 from app.services import dates, tasks, usage
@@ -40,6 +40,16 @@ GREETINGS = {
     "supportive": "Как вы? Середина дня — хороший момент свериться с планом 🌿",
     "motivating": "Полдня позади — отличный момент ускориться 💪",
     "strict": "Контрольная точка дня.",
+}
+GREETINGS_EN = {
+    "supportive": "How are you? Midday is a good moment to check the plan 🌿",
+    "motivating": "Half the day is behind you — a great moment to speed up 💪",
+    "strict": "The day's checkpoint.",
+}
+EVENING_GREETINGS_EN = {
+    "supportive": "How was your day? Here's the summary 🌙",
+    "motivating": "The day is done — let's look at the result 💪",
+    "strict": "The day's summary.",
 }
 EVENING_GREETINGS = {
     "supportive": "Как прошёл день? Вот итоги 🌙",
@@ -109,6 +119,10 @@ async def target_day(session: AsyncSession, user: User, tz: ZoneInfo, today: dat
 
 
 def day_text(day: date, today: date) -> str:
+    if lang.is_en():
+        from app.services.ru import WEEKDAYS_SHORT_EN, day_month
+
+        return "tomorrow" if day == today + timedelta(days=1) else f"{WEEKDAYS_SHORT_EN[day.weekday()]}, {day_month(day)}"
     if day == today + timedelta(days=1):
         return "завтра"
     return f"{WEEKDAYS_SHORT[day.weekday()]}, {day.day} {MONTHS[day.month - 1]}"
@@ -132,6 +146,8 @@ async def checkin(session: AsyncSession, user: User, now: datetime) -> tuple[str
     done = sum(tasks.is_done(event, now) for event in events)
 
     tone = profile.get("toneOfVoice") if isinstance(profile, dict) else None
+    if lang.is_en():
+        return checkin_en(events, remaining, done, load, available, overloaded, suggestions, target, today, end, tz, tone)
     lines = [f"🕐 <b>{GREETINGS.get(tone, 'Как успеваете?')}</b>", ""]
     if done:
         lines.append(f"Уже сделано: {done} из {len(events)} ✅")
@@ -153,6 +169,33 @@ async def checkin(session: AsyncSession, user: User, now: datetime) -> tuple[str
         names = ", ".join(f"«{html.escape(event.title)}»" for event in suggestions)
         lines.append(f"Если не успеваете, могу перенести {names} на {day_text(target, today)} — там свободнее.")
     lines.append("Успеваете?")
+    payload = {"event_ids": [event.id for event in suggestions], "target": target.isoformat(), "target_label": day_text(target, today)}
+    return "\n".join(lines), payload
+
+
+def checkin_en(events, remaining, done, load, available, overloaded, suggestions, target, today, end, tz, tone) -> tuple[str, dict]:
+    """The midday check-in on the English site."""
+    lines = [f"🕐 <b>{GREETINGS_EN.get(tone, 'Are you keeping up?')}</b>", ""]
+    if done:
+        lines.append(f"Done so far: {done} of {len(events)} ✅")
+    count = len(remaining)
+    lines.append(f"Left for today — {count} {'task' if count == 1 else 'tasks'}:")
+    for event in remaining[:8]:
+        when = "no time" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
+        lines.append(f"• <code>{when}</code> {html.escape(event.title)}")
+    if count > 8:
+        lines.append(f"• …and {count - 8} more")
+    lines.append("")
+    hours, minutes = divmod(load, 60)
+    load_text = f"{hours} h {minutes} min" if hours else f"{minutes} min"
+    if overloaded:
+        lines.append(f"⚠️ That's roughly {load_text}, and there's less left until the end of the day ({end:%H:%M}). It looks like it won't all fit.")
+    else:
+        lines.append(f"That's roughly {load_text} — there should be enough time until {end:%H:%M}.")
+    if suggestions:
+        names = ", ".join(f"“{html.escape(event.title)}”" for event in suggestions)
+        lines.append(f"If you can't make it, I can move {names} to {day_text(target, today)} — it's freer.")
+    lines.append("Are you keeping up?")
     payload = {"event_ids": [event.id for event in suggestions], "target": target.isoformat(), "target_label": day_text(target, today)}
     return "\n".join(lines), payload
 
@@ -370,6 +413,8 @@ def deadline_label(moment: datetime, today: date) -> str:
 
 
 def rule_recommendations(data: dict) -> list[dict]:
+    if lang.is_en():
+        return rule_recommendations_en(data)
     found = []
     if data.get("deadlines"):
         found.append({"kind": "warning", "title": "Скоро дедлайн", "text": f"{data['deadlines'][0]}. Выделите на неё время заранее."})
@@ -442,6 +487,9 @@ async def recommendations(session: AsyncSession, user: User, scope: str = "today
 
 
 async def _cached(session: AsyncSession, user: User, scope: str, key: str, data: dict, rules, method: str) -> list[dict]:
+    if lang.is_en():
+        # Advice written in Russian is not shown on the English site, and back
+        key = hashlib.sha256(f"{key}:en".encode()).hexdigest()
     cached = await session.scalar(select(RecommendationCache).where(RecommendationCache.user_id == user.id, RecommendationCache.scope == scope))
     if cached and cached.key == key and cached.items:
         return cached.items
@@ -535,6 +583,8 @@ async def period_facts(session: AsyncSession, user: User, now: datetime, first: 
 
 
 def plan_rules(data: dict) -> list[dict]:
+    if lang.is_en():
+        return plan_rules_en(data)
     found = []
     if data["past"]:
         total, done = data["past_total"], data["past_done"]
@@ -560,6 +610,56 @@ def plan_rules(data: dict) -> list[dict]:
         found.append({"kind": "info", "title": "Это не сдвинуть", "text": f"«{data['fixed'][0]}»{more} нельзя переносить — остальное ставьте вокруг."})
     if not found:
         found.append({"kind": "success", "title": "План сбалансирован", "text": "Нагрузка распределена ровно. Добавляйте задачи в свободные дни."})
+    return found[:3]
+
+
+# The rules on the English site: the facts' own sentences are Russian, so only titles, times and numbers are used
+
+
+def rule_recommendations_en(data: dict) -> list[dict]:
+    found = []
+    day = "tomorrow" if data.get("day") == "завтра" else "today"
+    if data.get("deadlines"):
+        found.append({"kind": "warning", "title": "Deadline soon", "text": "A deadline is coming up — set time aside for it in advance."})
+    if data["overdue"]:
+        found.append({"kind": "warning", "title": "Unfinished tasks", "text": f"Left from the past days: {', '.join(data['overdue'][:3])}. Move them to today or mark them done."})
+    if data["untimed"] and data["free_windows"]:
+        found.append({"kind": "info", "title": "A free window", "text": f"{data['free_windows'][0]} is a good time for “{data['untimed'][0]}”."})
+    available = max(0, (int(data["day_end"][:2]) * 60 + int(data["day_end"][3:])) - (int(data["now"][:2]) * 60 + int(data["now"][3:])))
+    if data["load_minutes"] > available and data["remaining_titles"]:
+        found.append({"kind": "warning", "title": "A busy day", "text": f"There are more tasks for {day} than working time. Some can move to another day."})
+    habit = data.get("habits") or {}
+    remaining = len(data["remaining_titles"])
+    if habit.get("done_per_day") and remaining >= habit["done_per_day"] + 3:
+        found.append({"kind": "warning", "title": "More than usual", "text": f"You usually close about {habit['done_per_day']:g} tasks a day, and {remaining} are left. Pick the main ones and move the rest."})
+    if data["streak"] >= 2:
+        found.append({"kind": "success", "title": f"{data['streak']}-day streak", "text": "Everything done several days in a row — keep it up!"})
+    if not found:
+        if data["today_total"] == 0:
+            found.append({"kind": "info", "title": "The day is free so far", "text": f"Tell the chat your plans for {day} — I'll lay them out in time."})
+        else:
+            found.append({"kind": "success", "title": "Plan under control", "text": f"The load for {day} is fine. Remember to mark the tasks you finish."})
+    return found[:2]
+
+
+def plan_rules_en(data: dict) -> list[dict]:
+    if data["past"]:
+        total, done = data["past_total"], data["past_done"]
+        text = f"{done} of {total} tasks done." if total else "There were no tasks in this period."
+        return [{"kind": "success" if total and done == total else "info", "title": "Period over", "text": text}]
+    found = []
+    if data["deadlines"]:
+        found.append({"kind": "warning", "title": "Deadline soon", "text": "A deadline falls in this period — plan time for it on a free day."})
+    if data["busy_days"]:
+        found.append({"kind": "warning", "title": "An overloaded day", "text": "Some days are packed. Tasks without a time can move to a freer day."})
+    if data["movable"] and data["free_days"]:
+        found.append({"kind": "info", "title": "Free days ahead", "text": f"Some days are almost free — a good time for “{data['movable'][0].split(' (')[0]}”."})
+    if data["fixed"]:
+        rest = len(data["fixed"]) - 1
+        more = f" and {rest} more" if rest else ""
+        found.append({"kind": "info", "title": "Can't be moved", "text": f"“{data['fixed'][0].split(' (')[0]}”{more} can't be moved — plan the rest around them."})
+    if not found:
+        found.append({"kind": "success", "title": "A balanced plan", "text": "The load is spread evenly. Add tasks on the free days."})
     return found[:3]
 
 
@@ -592,6 +692,8 @@ async def evening(session: AsyncSession, user: User, now: datetime) -> tuple[str
     tone = profile.get("toneOfVoice") if isinstance(profile, dict) else None
     done = sum(tasks.is_done(event, now) for event in todays)
     streak, _ = await tasks.streaks(session, user, now)
+    if lang.is_en():
+        return evening_en(todays, upcoming, unfinished, done, streak, tomorrow, tz, tone)
     lines = [f"🌙 <b>{EVENING_GREETINGS.get(tone, 'Итоги дня')}</b>", ""]
     if todays:
         progress = f"✅ Выполнено {done} из {len(todays)}"
@@ -619,6 +721,40 @@ async def evening(session: AsyncSession, user: User, now: datetime) -> tuple[str
     else:
         lines.append("Пока свободно — напишите мне, что запланировать 🌿")
     payload = {"event_ids": [event.id for event in unfinished], "target": tomorrow.isoformat(), "target_label": "завтра"}
+    return "\n".join(lines), payload
+
+
+def evening_en(todays, upcoming, unfinished, done, streak, tomorrow, tz, tone) -> tuple[str, dict]:
+    """The evening summary on the English site."""
+    from app.services.ru import WEEKDAYS_SHORT_EN, day_month
+
+    lines = [f"🌙 <b>{EVENING_GREETINGS_EN.get(tone, 'The day in review')}</b>", ""]
+    if todays:
+        progress = f"✅ Done {done} of {len(todays)}"
+        if streak >= 2:
+            progress += f" · 🔥 {streak}-day streak"
+        lines.append(progress)
+        if done == len(todays):
+            lines.append("Every task of the day is done — great work! 🎉")
+    else:
+        lines.append("There were no tasks today.")
+    if unfinished:
+        lines += ["", f"⏳ <b>Not done</b> — {len(unfinished)}:"]
+        for event in unfinished[:MAX_EVENING_ITEMS]:
+            lines.append(f"• {html.escape(event.title)}")
+        if len(unfinished) > MAX_EVENING_ITEMS:
+            lines.append(f"• …and {len(unfinished) - MAX_EVENING_ITEMS} more")
+        lines.append("Move them to tomorrow?")
+    lines += ["", f"📅 <b>Tomorrow's plan</b> · {WEEKDAYS_SHORT_EN[tomorrow.weekday()]}, {day_month(tomorrow)}"]
+    if upcoming:
+        for event in upcoming[:MAX_EVENING_ITEMS]:
+            when = "no time" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
+            lines.append(f"<code>{when}</code>  {html.escape(event.title)}")
+        if len(upcoming) > MAX_EVENING_ITEMS:
+            lines.append(f"…and {len(upcoming) - MAX_EVENING_ITEMS} more")
+    else:
+        lines.append("Nothing yet — tell me what to plan 🌿")
+    payload = {"event_ids": [event.id for event in unfinished], "target": tomorrow.isoformat(), "target_label": "tomorrow"}
     return "\n".join(lines), payload
 
 

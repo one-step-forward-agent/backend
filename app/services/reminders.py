@@ -1,5 +1,6 @@
 import calendar
 import html
+import re
 import secrets
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -14,7 +15,9 @@ from app.models.models import Event, Notification, NotificationStatus, ReminderS
 from app.services import insights, tasks
 from app.services.events import default_calendar
 from app.services.integrations.service import user_timezone
-from app.services.ru import MONTHS, WEEKDAYS_ACCUSATIVE, plural, relative_day, time_range
+from app.core import lang
+from app.core.lang import is_en, tr
+from app.services.ru import MONTHS, WEEKDAYS_ACCUSATIVE, WEEKDAYS_EN, day_month, plural, relative_day, time_range
 
 MAX_LEAD_MINUTES = 7 * 24 * 60
 DIGEST_WINDOW = timedelta(hours=6)
@@ -67,10 +70,11 @@ def apply_settings(reminder_settings: ReminderSettings, values: dict) -> None:
 
 def format_lead(minutes: int) -> str:
     if minutes == 0:
-        return "в момент начала"
+        return tr("в момент начала", "at the start")
     days, rest = divmod(minutes, 1440)
     hours, mins = divmod(rest, 60)
-    parts = [f"{days} дн" if days else "", f"{hours} ч" if hours else "", f"{mins} мин" if mins else ""]
+    day_unit, hour_unit, minute_unit = (("d", "h", "min") if is_en() else ("дн", "ч", "мин"))
+    parts = [f"{days} {day_unit}" if days else "", f"{hours} {hour_unit}" if hours else "", f"{mins} {minute_unit}" if mins else ""]
     return " ".join(part for part in parts if part)
 
 
@@ -81,19 +85,42 @@ def in_quiet_hours(reminder_settings: ReminderSettings, moment: time) -> bool:
     return start <= moment < end if start < end else moment >= start or moment < end
 
 
+# A link to a call (Zoom, Meet, Telemost…) or anything else the user sent with the plan
+LINK = re.compile(r"https?://[^\s<>«»\"']+[^\s<>«»\"'.,;:!?)\]]")
+
+
+def links_in(*texts: str | None) -> list[str]:
+    """The links in the texts, each once, in order."""
+    return list(dict.fromkeys(link for text in texts if text for link in LINK.findall(text)))
+
+
+def with_links(text: str, source: str) -> str:
+    """The reminder text with the links of the user's message it lacks: "напомни о созвоне в 15:00 https://…"
+    — the model writes "Созвон", the link goes along so the bot sends it."""
+    missing = [link for link in links_in(source) if link not in text]
+    return " ".join([text, *missing]).strip() if missing else text
+
+
 def reminder_text(event: Event, minutes: int, tz: ZoneInfo) -> str:
     starts = event.start_at.astimezone(tz)
     ends = event.end_at.astimezone(tz)
     today = datetime.now(tz).date()
-    lead = "Уже идёт" if minutes < 0 else "Начинается сейчас" if minutes == 0 else f"Через {format_lead(minutes)}"
-    when = "весь день" if event.all_day else time_range(starts, ends)
+    if is_en():
+        lead = "Already started" if minutes < 0 else "Starting now" if minutes == 0 else f"In {format_lead(minutes)}"
+    else:
+        lead = "Уже идёт" if minutes < 0 else "Начинается сейчас" if minutes == 0 else f"Через {format_lead(minutes)}"
+    when = tr("весь день", "all day") if event.all_day else time_range(starts, ends)
     lines = [f"🔔 <b>{lead}</b>", "", f"<b>{html.escape(event.title)}</b>", f"🕒 {when} · {relative_day(starts.date(), today)}"]
-    if event.location:
+    if event.location and not LINK.fullmatch(event.location.strip()):
         lines.append(f"📍 {html.escape(event.location)}")
+    # The call link goes with the reminder: one tap to join
+    lines += [f"🔗 {html.escape(link)}" for link in links_in(event.location, event.description)[:3]]
     return "\n".join(lines)
 
 
 def digest_text(events: list[Event], day: datetime, tz: ZoneInfo) -> str:
+    if is_en():
+        return digest_text_en(events, day, tz)
     date_text = f"{WEEKDAYS_ACCUSATIVE[day.weekday()]}, {day.day} {MONTHS[day.month - 1]}"
     if not events:
         return f"☀️ <b>Доброе утро!</b>\n\nНа {date_text} ничего не запланировано — день свободен 🌿"
@@ -109,10 +136,39 @@ def digest_text(events: list[Event], day: datetime, tz: ZoneInfo) -> str:
     return "\n".join(lines)
 
 
+def digest_text_en(events: list[Event], day: datetime, tz: ZoneInfo) -> str:
+    date_text = f"{WEEKDAYS_EN[day.weekday()]}, {day_month(day)}"
+    if not events:
+        return f"☀️ <b>Good morning!</b>\n\nNothing planned for {date_text} — the day is free 🌿"
+    count = len(events)
+    lines = ["☀️ <b>Good morning!</b>", f"Plan for {date_text} — {count} {'event' if count == 1 else 'events'}", ""]
+    for event in events:
+        when = "no time" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
+        line = f"<b>{when}</b>  {html.escape(event.title)}"
+        if event.location:
+            line += f"  · 📍 {html.escape(event.location)}"
+        lines.append(line)
+    lines += ["", "Have a good day ✨"]
+    return "\n".join(lines)
+
+
 def deadline_text(event: Event, now: datetime, tz: ZoneInfo) -> str:
     deadline = event.deadline_at.astimezone(tz)
     local_now = now.astimezone(tz)
     left = deadline - local_now
+    if is_en():
+        if left < timedelta(hours=1):
+            lead = f"in {max(1, int(left.total_seconds() // 60))} min"
+        elif left < timedelta(days=1):
+            hours = int(left.total_seconds() // 3600)
+            lead = f"in {hours} {'hour' if hours == 1 else 'hours'}"
+        else:
+            days = (deadline.date() - local_now.date()).days
+            lead = f"in {days} {'day' if days == 1 else 'days'}"
+        when = relative_day(deadline.date(), local_now.date())
+        if deadline.time() < time(23, 59):
+            when += f" at {deadline:%H:%M}"
+        return f"⏳ <b>Deadline {lead}</b>\n\n<b>{html.escape(event.title)}</b>\nDue: {when}"
     if left < timedelta(hours=1):
         lead = f"через {max(1, int(left.total_seconds() // 60))} мин"
     elif left < timedelta(days=1):
@@ -135,126 +191,133 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
     )
     values = []
     for user, reminder_settings in rows.all():
-        tz = ZoneInfo(user_timezone(user))
-        leads = sorted({minutes for minutes in reminder_settings.lead_times or [] if 0 <= minutes <= MAX_LEAD_MINUTES})
-        conditions = [Event.user_id == user.id, Event.start_at > now, Event.all_day.is_(False), Event.completed_at.is_(None)]
-        conditions.append(
-            or_(
-                Event.start_at <= now + timedelta(minutes=max(leads, default=0)),
-                and_(Event.reminder_minutes.is_not(None), Event.start_at <= now + timedelta(minutes=MAX_LEAD_MINUTES)),
-            )
-        )
-        if reminder_settings.sources:
-            conditions.append(Event.source.in_(reminder_settings.sources))
-        for event in await session.scalars(select(Event).where(*conditions)):
-            event_leads = [event.reminder_minutes] if event.reminder_minutes is not None else leads
-            due = [minutes for minutes in event_leads if event.start_at - timedelta(minutes=minutes) <= now]
-            if not due:
-                continue
-            minutes = min(due)
-            values.append(
-                {
-                    "user_id": user.id,
-                    "event_id": event.id,
-                    "kind": "reminder",
-                    "dedupe_key": f"reminder:{event.id}:{int(event.start_at.timestamp())}:{minutes}",
-                    "text": reminder_text(event, max(0, round((event.start_at - now).total_seconds() / 60)), tz),
-                    "scheduled_for": now,
-                    "expires_at": event.start_at,
-                }
-            )
-
-        if reminder_settings.daily_digest_enabled:
-            local_now = now.astimezone(tz)
-            digest_at = datetime.combine(local_now.date(), reminder_settings.daily_digest_time, tz)
-            if digest_at <= local_now < digest_at + DIGEST_WINDOW:
-                day_start = datetime.combine(local_now.date(), time.min, tz)
-                day_end = day_start + timedelta(days=1)
-                digest_conditions = [Event.user_id == user.id, Event.start_at < day_end, Event.end_at > day_start]
-                if reminder_settings.sources:
-                    digest_conditions.append(Event.source.in_(reminder_settings.sources))
-                events = list(await session.scalars(select(Event).where(*digest_conditions).order_by(Event.all_day.desc(), Event.start_at)))
-                values.append(
-                    {
-                        "user_id": user.id,
-                        "event_id": None,
-                        "kind": "digest",
-                        "dedupe_key": f"digest:{user.id}:{local_now.date().isoformat()}",
-                        "text": digest_text(events, local_now, tz),
-                        "scheduled_for": now,
-                        "expires_at": day_end,
-                    }
-                )
-
-        if reminder_settings.deadline_enabled:
-            deadline_conditions = [
-                Event.user_id == user.id,
-                Event.completed_at.is_(None),
-                Event.deadline_at.is_not(None),
-                Event.deadline_at > now,
-                Event.deadline_at <= now + timedelta(minutes=max(DEADLINE_STAGES)),
-            ]
-            for event in await session.scalars(select(Event).where(*deadline_conditions)):
-                stage = min(minutes for minutes in DEADLINE_STAGES if event.deadline_at - timedelta(minutes=minutes) <= now)
-                values.append(
-                    {
-                        "user_id": user.id,
-                        "event_id": event.id,
-                        "kind": "deadline",
-                        "dedupe_key": f"deadline:{event.id}:{int(event.deadline_at.timestamp())}:{stage}",
-                        "text": deadline_text(event, now, tz),
-                        "scheduled_for": now,
-                        "expires_at": event.deadline_at,
-                    }
-                )
-
-        if reminder_settings.evening_enabled:
-            local_now = now.astimezone(tz)
-            evening_at = datetime.combine(local_now.date(), reminder_settings.evening_time, tz)
-            dedupe_key = f"evening:{user.id}:{local_now.date().isoformat()}"
-            if evening_at <= local_now < evening_at + EVENING_WINDOW and not await session.scalar(select(Notification.id).where(Notification.dedupe_key == dedupe_key)):
-                found = await insights.evening(session, user, local_now)
-                if found:
-                    text_body, payload = found
-                    values.append(
-                        {
-                            "user_id": user.id,
-                            "event_id": None,
-                            "kind": "evening",
-                            "dedupe_key": dedupe_key,
-                            "text": text_body,
-                            "payload": payload,
-                            "scheduled_for": now,
-                            "expires_at": datetime.combine(local_now.date() + timedelta(days=1), time(6, 0), tz),
-                        }
-                    )
-
-        if reminder_settings.checkin_enabled:
-            local_now = now.astimezone(tz)
-            checkin_at = datetime.combine(local_now.date(), reminder_settings.checkin_time, tz)
-            dedupe_key = f"checkin:{user.id}:{local_now.date().isoformat()}"
-            if checkin_at <= local_now < checkin_at + CHECKIN_WINDOW and not await session.scalar(select(Notification.id).where(Notification.dedupe_key == dedupe_key)):
-                found = await insights.checkin(session, user, local_now)
-                if found:
-                    text_body, payload = found
-                    values.append(
-                        {
-                            "user_id": user.id,
-                            "event_id": None,
-                            "kind": "checkin",
-                            "dedupe_key": dedupe_key,
-                            "text": text_body,
-                            "payload": payload,
-                            "scheduled_for": now,
-                            "expires_at": datetime.combine(local_now.date() + timedelta(days=1), time.min, tz),
-                        }
-                    )
+        # Each user's notifications are written in the language chosen on the site
+        with lang.using(user.language):
+            await queue_for_user(session, user, reminder_settings, now, values)
     if not values:
         return 0
     for value in values:
         value.setdefault("payload", None)
     result = await session.execute(insert(Notification).values(values).on_conflict_do_nothing(index_elements=["dedupe_key"]))
     return result.rowcount or 0
+
+
+async def queue_for_user(session: AsyncSession, user: User, reminder_settings: ReminderSettings, now: datetime, values: list[dict]) -> None:
+    """The notifications due for one user now, added to `values`."""
+    tz = ZoneInfo(user_timezone(user))
+    leads = sorted({minutes for minutes in reminder_settings.lead_times or [] if 0 <= minutes <= MAX_LEAD_MINUTES})
+    conditions = [Event.user_id == user.id, Event.start_at > now, Event.all_day.is_(False), Event.completed_at.is_(None)]
+    conditions.append(
+        or_(
+            Event.start_at <= now + timedelta(minutes=max(leads, default=0)),
+            and_(Event.reminder_minutes.is_not(None), Event.start_at <= now + timedelta(minutes=MAX_LEAD_MINUTES)),
+        )
+    )
+    if reminder_settings.sources:
+        conditions.append(Event.source.in_(reminder_settings.sources))
+    for event in await session.scalars(select(Event).where(*conditions)):
+        event_leads = [event.reminder_minutes] if event.reminder_minutes is not None else leads
+        due = [minutes for minutes in event_leads if event.start_at - timedelta(minutes=minutes) <= now]
+        if not due:
+            continue
+        minutes = min(due)
+        values.append(
+            {
+                "user_id": user.id,
+                "event_id": event.id,
+                "kind": "reminder",
+                "dedupe_key": f"reminder:{event.id}:{int(event.start_at.timestamp())}:{minutes}",
+                "text": reminder_text(event, max(0, round((event.start_at - now).total_seconds() / 60)), tz),
+                "scheduled_for": now,
+                "expires_at": event.start_at,
+            }
+        )
+
+    if reminder_settings.daily_digest_enabled:
+        local_now = now.astimezone(tz)
+        digest_at = datetime.combine(local_now.date(), reminder_settings.daily_digest_time, tz)
+        if digest_at <= local_now < digest_at + DIGEST_WINDOW:
+            day_start = datetime.combine(local_now.date(), time.min, tz)
+            day_end = day_start + timedelta(days=1)
+            digest_conditions = [Event.user_id == user.id, Event.start_at < day_end, Event.end_at > day_start]
+            if reminder_settings.sources:
+                digest_conditions.append(Event.source.in_(reminder_settings.sources))
+            events = list(await session.scalars(select(Event).where(*digest_conditions).order_by(Event.all_day.desc(), Event.start_at)))
+            values.append(
+                {
+                    "user_id": user.id,
+                    "event_id": None,
+                    "kind": "digest",
+                    "dedupe_key": f"digest:{user.id}:{local_now.date().isoformat()}",
+                    "text": digest_text(events, local_now, tz),
+                    "scheduled_for": now,
+                    "expires_at": day_end,
+                }
+            )
+
+    if reminder_settings.deadline_enabled:
+        deadline_conditions = [
+            Event.user_id == user.id,
+            Event.completed_at.is_(None),
+            Event.deadline_at.is_not(None),
+            Event.deadline_at > now,
+            Event.deadline_at <= now + timedelta(minutes=max(DEADLINE_STAGES)),
+        ]
+        for event in await session.scalars(select(Event).where(*deadline_conditions)):
+            stage = min(minutes for minutes in DEADLINE_STAGES if event.deadline_at - timedelta(minutes=minutes) <= now)
+            values.append(
+                {
+                    "user_id": user.id,
+                    "event_id": event.id,
+                    "kind": "deadline",
+                    "dedupe_key": f"deadline:{event.id}:{int(event.deadline_at.timestamp())}:{stage}",
+                    "text": deadline_text(event, now, tz),
+                    "scheduled_for": now,
+                    "expires_at": event.deadline_at,
+                }
+            )
+
+    if reminder_settings.evening_enabled:
+        local_now = now.astimezone(tz)
+        evening_at = datetime.combine(local_now.date(), reminder_settings.evening_time, tz)
+        dedupe_key = f"evening:{user.id}:{local_now.date().isoformat()}"
+        if evening_at <= local_now < evening_at + EVENING_WINDOW and not await session.scalar(select(Notification.id).where(Notification.dedupe_key == dedupe_key)):
+            found = await insights.evening(session, user, local_now)
+            if found:
+                text_body, payload = found
+                values.append(
+                    {
+                        "user_id": user.id,
+                        "event_id": None,
+                        "kind": "evening",
+                        "dedupe_key": dedupe_key,
+                        "text": text_body,
+                        "payload": payload,
+                        "scheduled_for": now,
+                        "expires_at": datetime.combine(local_now.date() + timedelta(days=1), time(6, 0), tz),
+                    }
+                )
+
+    if reminder_settings.checkin_enabled:
+        local_now = now.astimezone(tz)
+        checkin_at = datetime.combine(local_now.date(), reminder_settings.checkin_time, tz)
+        dedupe_key = f"checkin:{user.id}:{local_now.date().isoformat()}"
+        if checkin_at <= local_now < checkin_at + CHECKIN_WINDOW and not await session.scalar(select(Notification.id).where(Notification.dedupe_key == dedupe_key)):
+            found = await insights.checkin(session, user, local_now)
+            if found:
+                text_body, payload = found
+                values.append(
+                    {
+                        "user_id": user.id,
+                        "event_id": None,
+                        "kind": "checkin",
+                        "dedupe_key": dedupe_key,
+                        "text": text_body,
+                        "payload": payload,
+                        "scheduled_for": now,
+                        "expires_at": datetime.combine(local_now.date() + timedelta(days=1), time.min, tz),
+                    }
+                )
 
 
 async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
@@ -307,6 +370,8 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
                 "event_id": notification.event_id,
                 "payload": notification.payload,
                 "url": f"{settings.public_app_url}/app/events/{notification.event_id}" if settings.public_app_url and notification.event_id else None,
+                # The bot's buttons under it in the same language
+                "language": user.language or "ru",
             }
         )
     await session.commit()
@@ -336,14 +401,14 @@ async def acknowledge(session: AsyncSession, notification: Notification, ok: boo
 
 async def queue_test(session: AsyncSession, user: User) -> Notification:
     reminder_settings = await get_settings(session, user)
-    leads = ", ".join(format_lead(minutes) for minutes in sorted(reminder_settings.lead_times or [])) or "не выбраны"
-    state = "включены" if reminder_settings.enabled else "выключены"
+    leads = ", ".join(format_lead(minutes) for minutes in sorted(reminder_settings.lead_times or [])) or tr("не выбраны", "none chosen")
+    state = tr("включены", "on") if reminder_settings.enabled else tr("выключены", "off")
     now = datetime.now(timezone.utc)
     notification = Notification(
         user_id=user.id,
         kind="test",
         dedupe_key=f"test:{user.id}:{secrets.token_hex(8)}",
-        text=f"✅ Тестовое уведомление Dayla.\nНапоминания {state}, за: {leads}.",
+        text=tr(f"✅ Тестовое уведомление Dayla.\nНапоминания {state}, за: {leads}.", f"✅ A test notification from Dayla.\nReminders are {state}, before: {leads}."),
         scheduled_for=now,
         expires_at=now + timedelta(hours=1),
         status=NotificationStatus.PENDING,
@@ -396,7 +461,8 @@ async def snooze(session: AsyncSession, notification: Notification, minutes: int
     if event and event.start_at:
         user = await session.get(User, notification.user_id)
         lead = int((event.start_at - scheduled).total_seconds() // 60)
-        body = reminder_text(event, lead, ZoneInfo(user_timezone(user)))
+        with lang.using(user.language):
+            body = reminder_text(event, lead, ZoneInfo(user_timezone(user)))
     copy = Notification(
         user_id=notification.user_id,
         event_id=notification.event_id,
@@ -418,13 +484,15 @@ class ReminderError(ValueError):
 
 
 def custom_text(text: str, repeat: str | None = None) -> str:
-    return f"🔔 <b>Напоминание</b>\n\n{html.escape(text)}" + (f"\n\n🔁 {html.escape(repeat)}" if repeat else "")
+    return f"🔔 <b>{tr('Напоминание', 'Reminder')}</b>\n\n{html.escape(text)}" + (f"\n\n🔁 {html.escape(repeat)}" if repeat else "")
 
 
 def repeat_label(payload: dict | None, moment: datetime) -> str | None:
     """"каждый день в 09:00", "по будням в 09:00", "каждую пятницу в 18:00", "каждые 2 часа"; None for a one-off reminder."""
     payload = payload or {}
     every = payload.get("every")
+    if is_en():
+        return repeat_label_en(payload, moment)
     if every:
         if every % 60 == 0:
             hours = every // 60
@@ -436,6 +504,24 @@ def repeat_label(payload: dict | None, moment: datetime) -> str | None:
         "weekdays": f"по будням {at}",
         "weekly": f"{WEEKDAYS_EVERY[moment.weekday()]} {at}",
         "monthly": f"каждый месяц {payload.get('day') or moment.day}-го {at}",
+    }.get(payload.get("repeat"))
+
+
+def repeat_label_en(payload: dict, moment: datetime) -> str | None:
+    """repeat_label on the English site: "every day at 09:00", "every 2 hours"."""
+    every = payload.get("every")
+    if every:
+        if every % 60 == 0:
+            hours = every // 60
+            return "every hour" if hours == 1 else f"every {hours} hours"
+        return f"every {every} minutes"
+    at = f"at {moment:%H:%M}"
+    day = payload.get("day") or moment.day
+    return {
+        "daily": f"every day {at}",
+        "weekdays": f"on weekdays {at}",
+        "weekly": f"every {WEEKDAYS_EN[moment.weekday()]} {at}",
+        "monthly": f"every month on day {day} {at}",
     }.get(payload.get("repeat"))
 
 
@@ -497,7 +583,7 @@ def custom_view(notification: Notification, tz: ZoneInfo) -> dict:
         "id": notification.id,
         "text": payload.get("text") or notification.text,
         "at": moment.isoformat(),
-        "label": f"{relative_day(moment.date(), today)} в {moment:%H:%M}",
+        "label": f"{relative_day(moment.date(), today)} {tr('в', 'at')} {moment:%H:%M}",
         "repeat": repeat_label(payload, moment) if is_repeating(payload) else None,
         # For the edit form of the reminders screen
         "repeat_kind": payload.get("repeat") if payload.get("repeat") in REPEATS else None,
@@ -510,7 +596,7 @@ async def create_custom(
 ) -> Notification:
     """A reminder at `moment` sent to Telegram, once or again and again: `repeat` is one of REPEATS, `every` is
     a period in minutes. Raises ReminderError when it cannot be delivered."""
-    text = " ".join(str(text or "").split()).strip(" .")[:500]
+    text = " ".join(str(text or "").split()).strip(" .")[:1000]
     if not text:
         raise ReminderError("Не понятно, о чём напомнить")
     now = datetime.now(timezone.utc)

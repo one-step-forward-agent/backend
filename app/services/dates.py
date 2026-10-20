@@ -14,6 +14,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 from dateutil.rrule import rrulestr
 
+from app.core.lang import is_en
 from app.services.ru import MONTHS as MONTHS_GENITIVE
 
 RRULE_DAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
@@ -479,10 +480,12 @@ def strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
 
 
 def describe_rrule(rule: str | None) -> str | None:
-    """Short Russian description: "каждую пятницу", "по будням", "каждый день, 10 раз", "по будням, до 31 декабря"."""
+    """Short description in the site's language: "каждую пятницу", "по будням", "каждый день, 10 раз", "по будням, до 31 декабря"."""
     if not rule:
         return None
     parts = dict(part.split("=", 1) for part in rule.split(";") if "=" in part)
+    if is_en():
+        return _describe_en(parts)
     base = _describe_frequency(parts)
     if parts.get("COUNT", "").isdigit():
         count = int(parts["COUNT"])
@@ -517,3 +520,36 @@ def _describe_frequency(parts: dict) -> str:
     if freq == "YEARLY":
         return "каждый год"
     return "повторяется"
+
+
+def _describe_en(parts: dict) -> str:
+    """The same in English: "every Friday", "on weekdays", "every day, 10 times", "on weekdays, until 31 December"."""
+    from app.services.ru import MONTHS_EN, WEEKDAYS_EN
+
+    interval = int(parts.get("INTERVAL", "1") or 1)
+    freq = parts.get("FREQ")
+    base = "repeats"
+    if freq == "DAILY":
+        base = "every day" if interval == 1 else f"every {interval} days"
+    elif freq == "WEEKLY":
+        days = [RRULE_DAYS.index(day) for day in parts.get("BYDAY", "").split(",") if day in RRULE_DAYS]
+        if days == [0, 1, 2, 3, 4]:
+            base = "on weekdays"
+        elif days == [5, 6]:
+            base = "on weekends"
+        elif days:
+            names = [WEEKDAYS_EN[day] for day in days]
+            listed = ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0]
+            base = f"every {listed}" if interval == 1 else f"every {interval} weeks on {listed}"
+        else:
+            base = "every week" if interval == 1 else f"every {interval} weeks"
+    elif freq == "MONTHLY":
+        base = f"every month on day {parts['BYMONTHDAY']}" if parts.get("BYMONTHDAY") else "every month"
+    elif freq == "YEARLY":
+        base = "every year"
+    if parts.get("COUNT", "").isdigit():
+        count = int(parts["COUNT"])
+        return f"{base}, {count} {'time' if count == 1 else 'times'}"
+    if match := re.match(r"(\d{4})(\d{2})(\d{2})", parts.get("UNTIL", "")):
+        return f"{base}, until {int(match.group(3))} {MONTHS_EN[int(match.group(2)) - 1]}"
+    return base

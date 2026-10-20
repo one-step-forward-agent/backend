@@ -3,20 +3,22 @@ from datetime import datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.errors import SERVER_ERROR, plain
 from app.core.crypto import decrypt_json, encrypt_json
 from app.models.models import Calendar, Event, EventLink, Integration, RemoteDeletion, SyncStatus, User
-from app.services.integrations.base import EventPayload, IntegrationError, IntegrationProvider, ProviderContext
+from app.services.integrations.base import EventPayload, IntegrationError, IntegrationProvider, IntegrationUnavailable, ProviderContext
 from app.services.integrations.registry import PROVIDERS
 
 logger = logging.getLogger(__name__)
 
 SYNC_PAST = timedelta(days=7)
 SYNC_FUTURE = timedelta(days=60)
+# The calendar may count an all-day event on the period's first or last day by its own time zone: those are left alone
+EDGE = timedelta(days=1)
 
 
 def user_timezone(user: User) -> str:
@@ -105,8 +107,19 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
     tz = user_timezone(user)
     provider = build_provider(integration, tz)
     now = datetime.now(timezone.utc)
+    # The events that may go if the calendar no longer has them: taken before the fetch, so a task sent to the
+    # calendar meanwhile (not in the fetched list yet) is never among them
+    known = set(await session.scalars(select(Event.id).where(*imported_here(user, integration, provider, now)))) if provider.complete_fetch else set()
     try:
         items = await provider.fetch_items(now - SYNC_PAST, now + SYNC_FUTURE)
+    except IntegrationUnavailable as error:
+        # The service is down for a moment: the card keeps "connected" instead of blinking to an error
+        logger.warning("%s is unavailable for user %s: %s", integration.provider, user.id, error)
+        if integration.status != "connected":
+            integration.status = "error"
+            integration.last_sync_error = str(error)
+        await session.commit()
+        raise
     except IntegrationError as error:
         integration.status = "error"
         # Shown on the integration card: plain words only, details stay in the log
@@ -149,11 +162,45 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
             event.series_id = str(uuid5(NAMESPACE_URL, f"{integration.provider}:{integration.id}:{item.series_key}"))
         if event.id is not None and before != (event.title, event.description, event.location, event.start_at, event.end_at, event.all_day, event.series_id):
             updated += 1
+    deleted = await delete_missing(session, user, integration, provider, items, now, known) if known else 0
     integration.status = "connected"
     integration.last_sync_at = now
     integration.last_sync_error = None
     await session.commit()
-    return {"fetched": len(items), "created": created, "updated": updated, "skipped": skipped}
+    return {"fetched": len(items), "created": created, "updated": updated, "deleted": deleted, "skipped": skipped}
+
+
+def imported_here(user: User, integration: Integration, provider: IntegrationProvider, now: datetime) -> list:
+    """The events of this calendar inside the fetched period, except the ones changed in Dayla that the calendar
+    has not taken yet ("pending") or has refused ("error"): the local version of those wins."""
+    prefix = f"{integration.provider}:{integration.id}:"
+    return [
+        Event.user_id == user.id,
+        Event.source == integration.provider,
+        Event.external_id.startswith(prefix) if provider.scoped_external_ids else Event.external_id.is_not(None),
+        Event.start_at >= now - SYNC_PAST + EDGE,
+        Event.start_at < now + SYNC_FUTURE - EDGE,
+        or_(Event.sync_status.is_(None), Event.sync_status.not_in(("pending", "error"))),
+    ]
+
+
+async def delete_missing(
+    session: AsyncSession, user: User, integration: Integration, provider: IntegrationProvider, items: list, now: datetime, known: set[int]
+) -> int:
+    """Delete the events of this calendar that are no longer in it: deleted there, or moved out of the synced weeks.
+    `known`: the ones there were before the fetch (see sync_integration)."""
+    prefix = f"{integration.provider}:{integration.id}:"
+    seen = {(prefix + item.external_id if provider.scoped_external_ids else item.external_id)[:255] for item in items}
+    gone = [
+        event
+        for event in await session.scalars(select(Event).where(Event.id.in_(known), *imported_here(user, integration, provider, now)))
+        if event.external_id not in seen
+    ]
+    for event in gone:
+        await session.delete(event)
+    if gone:
+        logger.info("%d events of user %s deleted in %s are deleted in Dayla too", len(gone), user.id, integration.provider)
+    return len(gone)
 
 
 # Opening "Сегодня" syncs the connected calendars, at most this often per user
@@ -182,7 +229,7 @@ async def sync_all(session: AsyncSession, user: User) -> dict:
             await session.rollback()
             continue
         synced.append(integration.provider)
-        changed = changed or bool(result["created"] or result["updated"])
+        changed = changed or bool(result["created"] or result["updated"] or result["deleted"])
     return {"synced": synced, "changed": changed}
 
 

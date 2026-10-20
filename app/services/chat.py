@@ -16,7 +16,8 @@ from app.services.integrations import service as integrations
 from app.services.integrations.base import IntegrationError
 from app.services.integrations.registry import PROVIDERS
 from app.services.events import GOOGLE_ACCESS_LOST, delete_from_calendars, push_changes
-from app.services.ru import MONTHS, RELATIVE_DAYS, WEEKDAYS, day_label, plural
+from app.core.lang import is_en, tr
+from app.services.ru import MONTHS, RELATIVE_DAYS, RELATIVE_DAYS_EN, WEEKDAYS, count_text, day_label, day_month, plural, weekday_name
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,18 @@ NOT_FOUND_TEXT = (
     "Задача не найдена. Попробуйте уточнить запрос: укажите слово из названия, дату или период — "
     "например, «когда встреча с Анной?» или «что у меня в пятницу?»"
 )
+NOT_FOUND_TEXT_EN = (
+    "Couldn't find the task. Try to be more specific: a word from the title, a date or a period — "
+    "for example, “when is the meeting with Anna?” or “what do I have on Friday?”"
+)
+EDIT_PROMPTS_EN = {
+    "title": "Type the new title",
+    "date": "Type the new date: “tomorrow”, “on Friday”, “in 2 days”, “15 October”",
+    "time": "Type the new time: “18:00”, “10 to 12” — or “no time”",
+    "repeat": "How to repeat: “every day”, “on weekdays”, “every week 5 times”, “every month until 1 May” — or “don't repeat”",
+    "period": "Which day it lasts until: “until 20 October”, “3 days” — or “one day”",
+    "reminder": "When to remind: “30 minutes before”, “2 hours before”, “a day before” — or “no reminder”",
+}
 EDIT_PROMPTS = {
     "title": "Напишите новое название",
     "date": "Напишите новую дату: «завтра», «в пятницу», «через 2 дня», «15 октября»",
@@ -110,11 +123,17 @@ NOISE_WORDS = {"больше", "нужны", "нужен", "нужна", "нуж
 # A reply that claims a change the app did not make ("удалила все события") is never shown
 ACTION_CLAIM = re.compile(
     r"\b(?:удалила|удалил|перенесла|перенёс|изменила|изменил|отметила|отметил|отменила|отменил|очистила|добавила|создала|запланировала"
-    r"|удален[ыо]?|удалён[ыо]?|перенесен[ыо]?|перенесён[ыо]?|отменен[ыо]?|отменён[ыо]?)\b",
+    r"|удален[ыо]?|удалён[ыо]?|перенесен[ыо]?|перенесён[ыо]?|отменен[ыо]?|отменён[ыо]?"
+    # The English site's answers: "I've deleted the meeting", "the task has been moved to Friday"
+    r"|(?:i\s+have|i've|i)\s+(?:deleted|removed|moved|rescheduled|changed|updated|marked|cancelled|canceled|added|created|scheduled)"
+    r"|(?:has|have)\s+been\s+(?:deleted|removed|moved|rescheduled|cancelled|canceled|added|created))\b",
     re.I,
 )
 # An answer about something else ("кто изменил ход истории?") uses these words too: a claim is about the calendar
-CALENDAR_WORDS = re.compile(r"задач|встреч|событи|календар|напомина|дел[оа]\b|план|созвон|черновик", re.I)
+CALENDAR_WORDS = re.compile(
+    r"задач|встреч|событи|календар|напомина|дел[оа]\b|план|созвон|черновик|\btasks?\b|meeting|event|calendar|remind|\bplan|\bcall\b|draft",
+    re.I,
+)
 CLAIM_ONLY_LIMIT = 80
 OFF_TOPIC_ANSWER = (
     "Я лучше всего помогаю с планами: добавить задачу, перенести встречу, напомнить о деле или разобрать загрузку недели. "
@@ -128,6 +147,18 @@ HONEST_ANSWER = (
     "Я ничего не меняла в календаре. Напишите, что сделать, — например, «удали встречу с Олей», "
     "«перенеси отчёт на пятницу» или «отметь отчёт выполненным», и я покажу изменение на подтверждение."
 )
+OFF_TOPIC_ANSWER_EN = (
+    "I'm best at plans: adding a task, moving a meeting, reminding you of something or reviewing your week. "
+    "Try, for example, “call with Olya tomorrow at 15:00” or “what do I have tomorrow?”."
+)
+MODEL_FAILED_ANSWER_EN = (
+    "I couldn't answer that message — try rephrasing it or ask a bit later. "
+    "I can still help with plans: for example, “call with Olya tomorrow at 15:00” or “what do I have tomorrow?”."
+)
+HONEST_ANSWER_EN = (
+    "I haven't changed anything in the calendar. Tell me what to do — for example, “delete the meeting with Olya”, "
+    "“move the report to Friday” or “mark the report done” — and I'll show the change for you to confirm."
+)
 MAX_DELETE = 5000
 # "Добавь …" already says what to do: a single clear task is added at once, with an undo button
 ADD_REQUEST = re.compile(
@@ -135,6 +166,7 @@ ADD_REQUEST = re.compile(
     re.I,
 )
 SUPERSEDED_TEXT = "Черновик закрыт: вы отправили новый запрос."
+SUPERSEDED_TEXT_EN = "Draft closed: you sent a new request."
 # Quick commands work the same in the web chat and in Telegram: typed, from a menu button or as /command
 COMMANDS = {
     "today": ("/today", "сегодня", "план на сегодня", "что сегодня", "на сегодня", "today", "plan for today"),
@@ -154,6 +186,14 @@ HELP_SECTIONS = [
     {"title": "Разбить на шаги", "examples": ["Помоги подготовиться к экзамену 20 октября", "Разбей переезд на шаги до конца месяца"]},
     {"title": "Быстрые команды", "examples": ["Сегодня", "Завтра", "Неделя", "Выполнено", "Статистика", "Напоминания"]},
 ]
+HELP_SECTIONS_EN = [
+    {"title": "Plan", "examples": ["Team call tomorrow at 11:00 for an hour", "Gym every Friday at 18:00", "Report, deadline Friday 18:00", "Conference from 10 to 12 October"]},
+    {"title": "Change and delete", "examples": ["Move the call to Friday at 15:00", "Extend the meeting until 18:00", "Delete the meeting with Olya", "Mark the report done"]},
+    {"title": "Ask and analyse", "examples": ["What do I have tomorrow?", "Analyse my week", "What can I move?", "Advice"]},
+    {"title": "Remind", "examples": ["Remind me to do the dishes in 10 minutes", "Remind me tomorrow at 9:00 to call the bank", "What reminders do I have?"]},
+    {"title": "Break into steps", "examples": ["Help me prepare for the exam on 20 October", "Break the move into steps by the end of the month"]},
+    {"title": "Quick commands", "examples": ["Today", "Tomorrow", "Week", "Done", "Stats", "Reminders"]},
+]
 SIMPLE_TEXT_LIMIT = 100
 # A message that holds more than one request or task: "добавь X, Y и перенеси Z", "две задачи: …"
 MULTI_PART = re.compile(
@@ -168,6 +208,7 @@ def is_multi_part(text: str) -> bool:
     return bool(MULTI_PART.search(f" {text} "))
 EDIT_WORDS = {"время", "времени", "дату", "дата", "даты", "окончание", "окончания", "начало", "начала", "конец", "срок", "её", "его", "ее"}
 NOTHING_CHANGES = "Так и стоит — менять нечего."
+NOTHING_CHANGES_EN = "It's already like that — nothing to change."
 
 QUESTION_PREFIXES = (
     "что ", "что?", "какие ", "какая ", "какой ", "покажи", "есть ли ", "когда ", "во сколько ", "где у меня",
@@ -354,12 +395,12 @@ def match_keywords(events: list[Event], keywords: list[str]) -> list[Event]:
 
 
 def short_day(day: date) -> str:
-    return f"{WEEKDAYS[day.weekday()]}, {day.day} {MONTHS[day.month - 1]}"
+    return f"{weekday_name(day)}, {day_month(day)}"
 
 
 def date_day(day: date) -> str:
     """A day after "на" or "с": "14 октября (среда)", not "на среда, 14 октября"."""
-    return f"{day.day} {MONTHS[day.month - 1]} ({WEEKDAYS[day.weekday()]})"
+    return f"{day_month(day)} ({weekday_name(day)})"
 
 
 def night_note(text: str, now: datetime) -> str | None:
@@ -371,6 +412,13 @@ def night_note(text: str, now: datetime) -> str | None:
     after = bool(re.search(r"послезавтра", text, re.I))
     said = today + timedelta(days=2 if after else 1)
     meant = said - timedelta(days=1)
+    if is_en():
+        word = "the day after tomorrow" if after else "tomorrow"
+        fix = "today" if meant == today else "tomorrow"
+        return (
+            f"⚠️ It's {now:%H:%M} — already {short_day(today)}. “{word.capitalize()}” is {short_day(said)}. "
+            f"If you meant {short_day(meant)}, type “move them to {fix}”."
+        )
     fix = "на сегодня" if meant == today else "на завтра"
     word = "Послезавтра" if after else "Завтра"
     return (
@@ -476,10 +524,11 @@ def search_title(filters: dict, today: date) -> str:
     date_from, date_to = filters["date_from"], filters["date_to"]
     if date_from and date_from == date_to:
         label = day_label(date_from, today)
-        return label.split(", ")[0] if label.startswith(tuple(RELATIVE_DAYS.values())) else label
+        relative = (*RELATIVE_DAYS.values(), *RELATIVE_DAYS_EN.values())
+        return label.split(", ")[0] if label.startswith(relative) else label
     if date_from and date_to:
-        return f"{date_from.day} {MONTHS[date_from.month - 1]} — {date_to.day} {MONTHS[date_to.month - 1]}"
-    return "Найденные события"
+        return f"{day_month(date_from)} — {day_month(date_to)}"
+    return tr("Найденные события", "Found events")
 
 
 # "Какое у меня свободное время в понедельник?", "когда я свободна завтра?", "есть окно в пятницу?":
@@ -511,9 +560,10 @@ def free_span(profile: dict, day: date, tz: ZoneInfo) -> tuple[datetime, datetim
 
 def hours_text(minutes: int) -> str:
     hours, rest = divmod(minutes, 60)
+    minute, hour = tr("мин", "min"), tr("ч", "h")
     if not hours:
-        return f"{rest} мин"
-    return f"{hours} ч {rest} мин" if rest else f"{hours} ч"
+        return f"{rest} {minute}"
+    return f"{hours} {hour} {rest} {minute}" if rest else f"{hours} {hour}"
 
 
 async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first: date, last: date) -> str:
@@ -535,7 +585,7 @@ async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first:
         label = short_day(day)
         label = label[:1].upper() + label[1:]
         if begin >= end:
-            lines.append(f"{label} — день уже закончился.")
+            lines.append(tr(f"{label} — день уже закончился.", f"{label} — the day is already over."))
             continue
         timed = [event for event in events if not event.all_day and event.start_at < end and event.end_at > begin]
         untimed = [event for event in events if event.all_day and event.start_at.astimezone(tz).date() <= day < event.end_at.astimezone(tz).date()]
@@ -544,13 +594,17 @@ async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first:
         # Window edges taken from tasks come from the database in UTC
         spans = ", ".join(f"{start.astimezone(tz):%H:%M}–{finish.astimezone(tz):%H:%M}" for start, finish in windows)
         if not timed:
-            text = f"{label} — свободно весь день: {spans} ({hours_text(total)})"
+            text = tr(f"{label} — свободно весь день: {spans} ({hours_text(total)})", f"{label} — free all day: {spans} ({hours_text(total)})")
         elif windows:
-            text = f"{label} — свободно: {spans} ({hours_text(total)})"
+            text = tr(f"{label} — свободно: {spans} ({hours_text(total)})", f"{label} — free: {spans} ({hours_text(total)})")
         else:
-            text = f"{label} — свободных окон нет: всё занято до {end:%H:%M}"
+            text = tr(f"{label} — свободных окон нет: всё занято до {end:%H:%M}", f"{label} — no free windows: busy until {end:%H:%M}")
         if untimed:
-            text += f". Ещё {len(untimed)} {plural(len(untimed), 'задача', 'задачи', 'задач')} без времени — их можно поставить в эти окна"
+            count = len(untimed)
+            text += tr(
+                f". Ещё {count} {plural(count, 'задача', 'задачи', 'задач')} без времени — их можно поставить в эти окна",
+                f". Also {count} {'task' if count == 1 else 'tasks'} without a time — they can go into these windows",
+            )
         lines.append(text + ".")
     return "\n".join(lines)
 
@@ -594,7 +648,7 @@ async def search(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> 
             logger.exception("GigaChat search filters failed")
     if not filters or not (filters["date_from"] or filters["time_from"] or filters["keywords"]):
         # Nothing to search by: ask to refine instead of dumping every task
-        return {"kind": "not_found", "text": NOT_FOUND_TEXT}
+        return {"kind": "not_found", "text": tr(NOT_FOUND_TEXT, NOT_FOUND_TEXT_EN)}
     now = datetime.now(tz)
     if filters["date_from"]:
         since = datetime.combine(filters["date_from"], time.min, tz)
@@ -617,11 +671,11 @@ async def search(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> 
             and (not filters["time_to"] or event.start_at.astimezone(tz).time() < filters["time_to"])
         ]
     if not events and filters["keywords"]:
-        return {"kind": "not_found", "text": NOT_FOUND_TEXT}
+        return {"kind": "not_found", "text": tr(NOT_FOUND_TEXT, NOT_FOUND_TEXT_EN)}
     single_day = filters["date_from"] if filters["date_from"] and filters["date_from"] == filters["date_to"] else None
     return {
         "kind": "agenda",
-        "title": search_title(filters, now.date()) if filters["date_from"] else "Найденные события",
+        "title": search_title(filters, now.date()) if filters["date_from"] else tr("Найденные события", "Found events"),
         "date": single_day.isoformat() if single_day else None,
         "days": group_by_day(events, tz, now.date()),
     }
@@ -641,8 +695,10 @@ async def agenda(session: AsyncSession, user: User, scope: str, mark: bool = Fal
 
         past = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=OVERDUE_DAYS), time.min, tz), start, limit=200)
         events = [event for event in past if tasks.is_overdue(event, today, tz)] + events
-    titles = {"today": "Сегодня", "tomorrow": "Завтра", "week": "Ближайшие 7 дней"}
-    reply = {"kind": "agenda", "scope": scope, "title": titles.get(scope, "План"), "date": first.isoformat(), "days": group_by_day(events, tz, today)}
+    titles = (
+        {"today": "Today", "tomorrow": "Tomorrow", "week": "Next 7 days"} if is_en() else {"today": "Сегодня", "tomorrow": "Завтра", "week": "Ближайшие 7 дней"}
+    )
+    reply = {"kind": "agenda", "scope": scope, "title": titles.get(scope, tr("План", "Plan")), "date": first.isoformat(), "days": group_by_day(events, tz, today)}
     return {**reply, "mark": True} if mark else reply
 
 
@@ -673,7 +729,7 @@ async def run_command(session: AsyncSession, user: User, name: str) -> dict:
         values = ReminderSettingsRead.model_validate(await reminders.get_settings(session, user)).model_dump(mode="json")
         await session.commit()
         return {"kind": "reminders", "settings": values}
-    return {"kind": "help", "sections": HELP_SECTIONS}
+    return {"kind": "help", "sections": HELP_SECTIONS_EN if is_en() else HELP_SECTIONS}
 
 
 async def stats_reply(session: AsyncSession, user: User) -> dict:
@@ -923,7 +979,17 @@ DEFAULT_CALENDARS = ("google", "yandex", "apple")
 async def calendar_targets(session: AsyncSession, user: User) -> list[dict]:
     """The connected calendars that accept events: new tasks are always in Dayla and can also go to any of them."""
     connected = set(await session.scalars(select(Integration.provider).where(Integration.user_id == user.id)))
-    return [{"slug": slug, "title": provider.title} for slug, provider in PROVIDERS.items() if provider.supports_push and slug in connected]
+    return [{"slug": slug, "title": calendar_title(slug)} for slug, provider in PROVIDERS.items() if provider.supports_push and slug in connected]
+
+
+# Calendar names on the English site; the rest are the same in both languages
+CALENDAR_TITLES_EN = {"yandex": "Yandex Calendar"}
+
+
+def calendar_title(slug: str) -> str:
+    if is_en() and slug in CALENDAR_TITLES_EN:
+        return CALENDAR_TITLES_EN[slug]
+    return PROVIDERS[slug].title if slug in PROVIDERS else slug
 
 
 def default_calendars(user: User, targets: list[dict]) -> list[str]:
@@ -968,7 +1034,7 @@ async def create_draft(session: AsyncSession, user: User, items: list[dict]) -> 
     )
     # A new request closes drafts left unconfirmed, so they are not offered again and again
     for old in list(await session.scalars(select(AssistantDraft).where(AssistantDraft.user_id == user.id))):
-        await update_draft_messages(session, user, old.id, {"kind": "cancelled", "text": SUPERSEDED_TEXT})
+        await update_draft_messages(session, user, old.id, {"kind": "cancelled", "text": tr(SUPERSEDED_TEXT, SUPERSEDED_TEXT_EN)})
         await session.delete(old)
     targets = await calendar_targets(session, user)
     draft = AssistantDraft(user_id=user.id, items=items[:MAX_DRAFT_ITEMS], awaiting=None, targets=targets, calendars=default_calendars(user, targets))
@@ -1005,7 +1071,7 @@ async def begin_edit(session: AsyncSession, user: User, draft_id: int, index: in
     )
     draft.awaiting = {"index": index, "field": field}
     await session.commit()
-    return {"prompt": EDIT_PROMPTS[field], "title": draft.items[index]["title"], "field": field, "index": index}
+    return {"prompt": (EDIT_PROMPTS_EN if is_en() else EDIT_PROMPTS)[field], "title": draft.items[index]["title"], "field": field, "index": index}
 
 
 def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict | None, str | None]:
@@ -1014,12 +1080,12 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
     if field == "title":
         title = " ".join(value.split())[:300]
         if not title:
-            return None, "Название не может быть пустым"
+            return None, tr("Название не может быть пустым", "The title can't be empty")
         item["title"] = title
     elif field == "date":
         parsed = dates.parse(value, now)
         if parsed.date is None and parsed.rrule is None:
-            return None, "Не поняла дату. Напишите, например: «завтра», «в пятницу», «через 2 дня», «15 октября»"
+            return None, tr("Не поняла дату. Напишите, например: «завтра», «в пятницу», «через 2 дня», «15 октября»", "I didn't get the date. Type, for example: “tomorrow”, “on Friday”, “in 2 days”, “15 October”")
         current_time = time.fromisoformat(item["time"]) if item.get("time") else None
         if parsed.time is not None:
             item["time"], item["end_time"] = parsed.time.strftime("%H:%M"), parsed.end_time.strftime("%H:%M") if parsed.end_time else None
@@ -1047,7 +1113,7 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
             candidate = ("с " if re.search(r"\d\s*(?:-|–|—|до)\s*\d", candidate) else "в ") + candidate
         start, end, _ = dates.parse_time(candidate)
         if start is None:
-            return None, "Не поняла время. Напишите, например: «18:00», «в 9 утра», «с 10 до 12» или «без времени»"
+            return None, tr("Не поняла время. Напишите, например: «18:00», «в 9 утра», «с 10 до 12» или «без времени»", "I didn't get the time. Type, for example: “18:00”, “9 am”, “10 to 12” or “no time”")
         item["time"] = start.strftime("%H:%M")
         item["end_time"] = end.strftime("%H:%M") if end else None
     elif field == "repeat":
@@ -1063,9 +1129,9 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
             parsed = dates.parse(value, now)
             last = parsed.end_date or parsed.date
         if last is None:
-            return None, "Не поняла. Напишите, например: «по 20 октября», «3 дня» — или «один день»"
+            return None, tr("Не поняла. Напишите, например: «по 20 октября», «3 дня» — или «один день»", "I didn't get it. Type, for example: “until 20 October”, “3 days” — or “one day”")
         if last < first:
-            return None, "Последний день раньше первого — напишите другой"
+            return None, tr("Последний день раньше первого — напишите другой", "The last day is before the first one — type another")
         item["end_date"] = last.isoformat() if last > first else None
         item["rrule"] = None if last > first else item.get("rrule")
     elif field == "reminder":
@@ -1077,12 +1143,12 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
             item["reminder_minutes"] = 0
             return item, None
         if not found:
-            return None, "Не поняла. Напишите, например: «за 30 минут», «за 2 часа», «за день» — или «не напоминать»"
+            return None, tr("Не поняла. Напишите, например: «за 30 минут», «за 2 часа», «за день» — или «не напоминать»", "I didn't get it. Type, for example: “30 minutes before”, “2 hours before”, “a day before” — or “no reminder”")
         number = float((found.group(1) or "1").replace(",", "."))
         unit = next(minutes for stem, minutes in LEAD_UNITS.items() if found.group(2).startswith(stem))
         minutes = round(number * unit)
         if not 0 <= minutes <= tasks.MAX_REMINDER_MINUTES:
-            return None, "Напомнить можно не раньше чем за неделю"
+            return None, tr("Напомнить можно не раньше чем за неделю", "A reminder can be at most a week before")
         item["reminder_minutes"] = minutes
     return item, None
 
@@ -1099,12 +1165,12 @@ def edit_repeat(item: dict, value: str, now: datetime) -> tuple[dict | None, str
         ending = dates.parse(f"каждый день {value}", now).rrule or ""
         rule = re.sub(r";(?:COUNT|UNTIL)=[^;]+", "", current) + "".join(f";{part}" for part in re.findall(r"(?:UNTIL)=[^;]+", ending))
     if not rule:
-        return None, "Не поняла повтор. Напишите, например: «каждый день», «по будням», «каждую неделю 5 раз» — или «не повторять»"
+        return None, tr("Не поняла повтор. Напишите, например: «каждый день», «по будням», «каждую неделю 5 раз» — или «не повторять»", "I didn't get the repeat. Type, for example: “every day”, “on weekdays”, “every week 5 times” — or “don't repeat”")
     if count := re.search(r"(\d+)\s*раз", value, re.I):
         rule = re.sub(r";(?:COUNT|UNTIL)=[^;]+", "", rule) + f";COUNT={min(int(count.group(1)), dates.MAX_COUNT)}"
     rule = dates.valid_rrule(rule)
     if not rule:
-        return None, "Такой повтор не получится — напишите по-другому"
+        return None, tr("Такой повтор не получится — напишите по-другому", "That repeat won't work — try putting it differently")
     clock = time.fromisoformat(item["time"]) if item.get("time") else time.min
     first = dates.first_occurrence(rule, datetime.combine(date.fromisoformat(item["date"]), clock, now.tzinfo), now)
     item["rrule"] = rule
@@ -1138,7 +1204,7 @@ async def apply_edit_text(session: AsyncSession, user: User, draft: AssistantDra
     if text.strip().lower() in CANCEL_WORDS:
         draft.awaiting = None
         await session.commit()
-        return proposal(draft, tz, note="Изменение отменено")
+        return proposal(draft, tz, note=tr("Изменение отменено", "Change cancelled"))
     index, field = awaiting.get("index"), awaiting.get("field")
     if not isinstance(index, int) or not 0 <= index < len(draft.items):
         draft.awaiting = None
@@ -1151,7 +1217,7 @@ async def apply_edit_text(session: AsyncSession, user: User, draft: AssistantDra
     items[index] = item
     draft.items = items
     draft.awaiting = None
-    reply = proposal(draft, tz, note="Изменено ✓")
+    reply = proposal(draft, tz, note=tr("Изменено ✓", "Changed ✓"))
     await update_draft_messages(session, user, draft.id, reply)
     await session.commit()
     return reply
@@ -1189,7 +1255,7 @@ async def replace_items(session: AsyncSession, user: User, draft_id: int, items:
     originals = {item["event_id"]: item for item in draft.items if isinstance(item.get("event_id"), int)}
     cleaned = [item for item in (validate_item(raw, now, originals) for raw in items[:MAX_DRAFT_ITEMS]) if item]
     if not cleaned:
-        raise ValueError("Нужна хотя бы одна задача с названием и датой")
+        raise ValueError(tr("Нужна хотя бы одна задача с названием и датой", "At least one task with a title and a date is needed"))
     draft.items = cleaned
     draft.awaiting = None
     reply = proposal(draft, tz)
@@ -1203,7 +1269,7 @@ async def set_calendars(session: AsyncSession, user: User, draft_id: int, calend
     draft = await get_draft(session, user, draft_id)
     offered = [item["slug"] for item in draft.targets or []]
     if any(slug not in offered for slug in calendars):
-        raise ValueError("Этот календарь не подключён")
+        raise ValueError(tr("Этот календарь не подключён", "This calendar is not connected"))
     chosen = [slug for slug in offered if slug in calendars]
     draft.calendars = chosen
     user.calendar_targets = chosen
@@ -1215,7 +1281,7 @@ async def set_calendars(session: AsyncSession, user: User, draft_id: int, calend
 
 async def export_to(session: AsyncSession, user: User, slug: str, events: list[Event]) -> str | None:
     """Send confirmed new tasks to one calendar; None when all went, otherwise what happened."""
-    title = PROVIDERS[slug].title if slug in PROVIDERS else slug
+    title = calendar_title(slug)
     if slug == "google":
         # create_tasks has copied them already
         # Said only when Google really took every task: one not sent at all is not "added"
@@ -1224,10 +1290,10 @@ async def export_to(session: AsyncSession, user: User, slug: str, events: list[E
         integration = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == "google"))
         if integration and integration.last_sync_error == GOOGLE_ACCESS_LOST:
             return GOOGLE_ACCESS_LOST
-        return f"Не удалось добавить в {title}"
+        return tr(f"Не удалось добавить в {title}", f"Couldn't add to {title}")
     integration = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == slug))
     if not integration:
-        return f"{title} не подключён"
+        return tr(f"{title} не подключён", f"{title} is not connected")
     sent = 0
     for event in events[:MAX_EXPORT]:
         try:
@@ -1236,14 +1302,14 @@ async def export_to(session: AsyncSession, user: User, slug: str, events: list[E
             logger.warning("Export to %s failed for user %s: %s", slug, user.id, error)
             await session.rollback()
             reason = plain(str(error))
-            return f"Не удалось добавить в {title}{': ' + reason if reason else ''}"
+            return tr(f"Не удалось добавить в {title}{': ' + reason if reason else ''}", f"Couldn't add to {title}")
         except Exception:
             logger.exception("Export to %s failed for user %s", slug, user.id)
             await session.rollback()
-            return f"Не удалось добавить в {title}"
+            return tr(f"Не удалось добавить в {title}", f"Couldn't add to {title}")
         sent += 1
     if sent < len(events):
-        return f"В {title} добавлены первые {sent} из {len(events)}"
+        return tr(f"В {title} добавлены первые {sent} из {len(events)}", f"The first {sent} of {len(events)} were added to {title}")
     return None
 
 
@@ -1258,10 +1324,10 @@ async def export_new(session: AsyncSession, user: User, calendars: list[str] | N
         if problem:
             problems.append(problem)
         else:
-            done.append(PROVIDERS[slug].title if slug in PROVIDERS else slug)
-    lines = [f"Добавлено в {' и '.join(done)}"] if done else []
+            done.append(calendar_title(slug))
+    lines = [tr(f"Добавлено в {' и '.join(done)}", f"Added to {' and '.join(done)}")] if done else []
     if problems:
-        lines += problems + ["Задачи сохранены в Dayla"]
+        lines += problems + [tr("Задачи сохранены в Dayla", "The tasks are saved in Dayla")]
     return ". ".join(lines)
 
 
@@ -1273,9 +1339,9 @@ async def remove_item(session: AsyncSession, user: User, draft_id: int, index: i
     draft.awaiting = None
     if not draft.items:
         await session.delete(draft)
-        reply = {"kind": "cancelled", "text": "Черновик пуст — ничего не добавлено"}
+        reply = {"kind": "cancelled", "text": tr("Черновик пуст — ничего не добавлено", "The draft is empty — nothing added")}
     else:
-        reply = proposal(draft, tz, note="Удалено из черновика")
+        reply = proposal(draft, tz, note=tr("Удалено из черновика", "Removed from the draft"))
     await update_draft_messages(session, user, draft_id, reply)
     await session.commit()
     return reply
@@ -1354,7 +1420,7 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int, scope:
 async def cancel_draft(session: AsyncSession, user: User, draft_id: int) -> dict:
     draft = await get_draft(session, user, draft_id)
     await session.delete(draft)
-    reply = {"kind": "cancelled", "text": "Хорошо, ничего не добавляю"}
+    reply = {"kind": "cancelled", "text": tr("Хорошо, ничего не добавляю", "OK, I won't add anything")}
     await update_draft_messages(session, user, draft_id, reply)
     await session.commit()
     return reply
@@ -1493,7 +1559,7 @@ def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, 
     if change.get("shift"):
         shift: timedelta = change["shift"]
         if event.all_day and shift % timedelta(days=1):
-            return None, "У этой задачи нет времени — напишите, на какой день или время её перенести."
+            return None, tr("У этой задачи нет времени — напишите, на какой день или время её перенести.", "This task has no time — tell me which day or time to move it to.")
         start, end = start + shift, end + shift
         day, last = start.date(), (last + timedelta(days=shift.days) if event.all_day else end.date())
         begins, finishes = (None, None) if event.all_day else (start.time(), end.time())
@@ -1502,13 +1568,13 @@ def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, 
             last = change["date"]
         if change.get("time"):
             if event.all_day:
-                return None, "У этой задачи нет времени — сначала укажите, во сколько она начинается."
+                return None, tr("У этой задачи нет времени — сначала укажите, во сколько она начинается.", "This task has no time — first say when it starts.")
             finishes = change["time"]
             if not change.get("date") and last == day and finishes <= begins:
                 # "продли смену до 6 утра": the next morning
                 last = day + timedelta(days=1)
         if datetime.combine(last, finishes or time.max) <= datetime.combine(day, begins or time.min):
-            return None, "Окончание должно быть позже начала."
+            return None, tr("Окончание должно быть позже начала.", "The end must be after the start.")
     elif not change.get("title"):
         new_day = change.get("date") or day
         last = change.get("end_date") or last + (new_day - day)
@@ -1531,7 +1597,7 @@ def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, 
         "end_date": last.isoformat() if last > day else None,
     }
     if all(item[key] == before[key] for key in before):
-        return None, NOTHING_CHANGES
+        return None, tr(NOTHING_CHANGES, NOTHING_CHANGES_EN)
     return item, None
 
 
@@ -1556,18 +1622,18 @@ async def change_request(session: AsyncSession, user: User, text: str, tz: ZoneI
     asks = not verb or not re.search(r"(?:ть|ти)$", verb.group("verb").lower()) or re.match(r"^\s*\S*\s*(?:можешь|можно|могла)", text, re.I)
     if not change:
         if asks and not settings.llm_enabled:
-            return {"kind": "answer", "text": "Напишите, что и на когда изменить, — например, «перенеси встречу с Олей на пятницу в 15:00»."}
+            return {"kind": "answer", "text": tr("Напишите, что и на когда изменить, — например, «перенеси встречу с Олей на пятницу в 15:00».", "Tell me what to change and to when — for example, “move the meeting with Olya to Friday at 15:00”.")}
         return None
     if not event:
         if not asks:
             return None
-        return {"kind": "not_found", "text": f"Не нашла задачу «{change['target'].strip() or text}». Уточните название или дату — например, «перенеси встречу с Олей на пятницу»."}
+        return {"kind": "not_found", "text": tr(f"Не нашла задачу «{change['target'].strip() or text}». Уточните название или дату — например, «перенеси встречу с Олей на пятницу».", f"Couldn't find the task “{change['target'].strip() or text}”. Give the title or the date — for example, “move the meeting with Olya to Friday”.")}
     item, problem = change_item(event, change, tz)
     if problem:
         return {"kind": "answer", "text": problem}
-    note = "Эта задача отмечена как неперемещаемая — точно изменить?" if event.is_fixed and not change.get("title") else None
+    note = tr("Эта задача отмечена как неперемещаемая — точно изменить?", "This task is marked as fixed — change it anyway?") if event.is_fixed and not change.get("title") else None
     draft = await create_draft(session, user, [item])
-    return proposal(draft, tz, answer=join_text(night_note(text, now), f"Изменю «{event.title}» — проверьте и подтвердите:"), note=note)
+    return proposal(draft, tz, answer=join_text(night_note(text, now), tr(f"Изменю «{event.title}» — проверьте и подтвердите:", f"I'll change “{event.title}” — check and confirm:")), note=note)
 
 
 def model_change(raw: dict, now: datetime) -> dict | None:
@@ -1622,6 +1688,8 @@ async def apply_hashtags(session: AsyncSession, user: User, items: list[dict], t
 def tags_note(created: list[str]) -> str | None:
     if not created:
         return None
+    if is_en():
+        return ("Created tags " if len(created) > 1 else "Created the tag ") + ", ".join(f"“{name}”" for name in created) + " — you'll find them in the settings."
     return ("Создала теги " if len(created) > 1 else "Создала тег ") + ", ".join(f"«{name}»" for name in created) + " — они есть в настройках."
 
 
@@ -1705,7 +1773,7 @@ def honest(answer: str | None) -> str | None:
     """The model may not report changes it cannot make; such a reply is replaced with the truth."""
     if claims_action(answer):
         logger.warning("Dropped an assistant reply that claimed an action")
-        return HONEST_ANSWER
+        return tr(HONEST_ANSWER, HONEST_ANSWER_EN)
     return answer
 
 
@@ -1716,10 +1784,19 @@ def simple_task(text: str, now: datetime) -> list[dict]:
     return local_items(text, now)
 
 
-async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
+async def handle_message(session: AsyncSession, user: User, text: str, attachment=None) -> dict:
+    """One message of the chat (the site's and Telegram's are the same). `attachment`: a file read by
+    app.services.attachments; the chat shows its name with the caption, the assistant reads its text."""
     usage.current_user_id.set(user.id)
     tz = tasks.local_tz(user)
-    text = text.strip()[:50000]
+    caption = text.strip()[:50000]
+    shown = {"kind": "file", "caption": caption, "file": attachment.meta()} if attachment else None
+    if attachment:
+        from app.services.attachments import message_text
+
+        text = message_text(caption, attachment)
+    else:
+        text = caption
     await prune_history(session, user.id)
     try:
         reply = await route(session, user, text, tz)
@@ -1728,8 +1805,8 @@ async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
             raise
         # A model request of the rules failed: an answer in the chat, not a server error
         await session.rollback()
-        reply = {"kind": "answer", "text": MODEL_FAILED_ANSWER}
-    await remember(session, user.id, "user", text)
+        reply = {"kind": "answer", "text": tr(MODEL_FAILED_ANSWER, MODEL_FAILED_ANSWER_EN)}
+    await remember(session, user.id, "user", text, shown)
     message = await remember(session, user.id, "assistant", summarize(reply), reply)
     await session.commit()
     # The id lets the user rate this answer
@@ -1834,7 +1911,7 @@ async def small_talk(session: AsyncSession, user: User, text: str, tz: ZoneInfo,
         except Exception:
             logger.exception("GigaChat chat reply failed")
             failed = True
-    return {"kind": "answer", "text": honest(answer) or (MODEL_FAILED_ANSWER if failed else OFF_TOPIC_ANSWER)}
+    return {"kind": "answer", "text": honest(answer) or (tr(MODEL_FAILED_ANSWER, MODEL_FAILED_ANSWER_EN) if failed else tr(OFF_TOPIC_ANSWER, OFF_TOPIC_ANSWER_EN))}
 
 
 # ---------- deleting, completing and analysing ----------
@@ -1886,7 +1963,7 @@ async def select_events(session: AsyncSession, user: User, text: str, tz: ZoneIn
             events.sort(key=lambda event: (event.completed_at is not None, event.end_at < now, abs((event.start_at - now).total_seconds())))
             events = events[:1]
     if not label:
-        label = "все задачи" if everything and not keywords else None
+        label = tr("все задачи", "all tasks") if everything and not keywords else None
     return events, label
 
 
@@ -1898,10 +1975,13 @@ async def delete_request(session: AsyncSession, user: User, text: str, tz: ZoneI
     if not events:
         if not strong:
             return None
-        return {"kind": "not_found", "text": "Не нашла задач для удаления. Уточните, что удалить: «удали встречу с Олей», «удали задачи на завтра» или «удали все события»."}
+        return {"kind": "not_found", "text": tr("Не нашла задач для удаления. Уточните, что удалить: «удали встречу с Олей», «удали задачи на завтра» или «удали все события».", "Couldn't find tasks to delete. Say what to delete: “delete the meeting with Olya”, “delete tomorrow's tasks” or “delete all events”.")}
     now = datetime.now(tz)
     titles = list(dict.fromkeys(event.title for event in events))
-    title = label or (f"«{titles[0]}»" if len(titles) == 1 else f"«{titles[0]}» и ещё {len(titles) - 1}")
+    if is_en():
+        title = label or (f"“{titles[0]}”" if len(titles) == 1 else f"“{titles[0]}” and {len(titles) - 1} more")
+    else:
+        title = label or (f"«{titles[0]}»" if len(titles) == 1 else f"«{titles[0]}» и ещё {len(titles) - 1}")
     preview = [event_view(event, tz) for event in sorted(events, key=lambda event: (event.start_at < now, event.start_at))[:10]]
     draft = await create_draft(session, user, [delete_item(events, title, preview)])
     return proposal(draft, tz, answer=delete_question(len(events), title, any(event.series_id for event in events)))
@@ -1913,12 +1993,19 @@ def delete_item(events: list[Event], title: str, preview: list[dict]) -> dict:
 
 
 def delete_question(count: int, title: str, series: bool) -> str:
+    if is_en():
+        tasks_said = f"{count} {'task' if count == 1 else 'tasks'}"
+        if series:
+            return f"Delete {tasks_said} ({title})? It repeats: delete only {'this one' if count == 1 else 'these'}, the following ones too, or the whole series? This can't be undone."
+        return f"Delete {tasks_said} ({title})? This can't be undone."
     if series:
         return f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({title})? Задача повторяется: удалить только {'её' if count == 1 else 'их'}, ещё и следующие или всю серию? Это нельзя отменить."
     return f"Удалить {count} {plural(count, 'задачу', 'задачи', 'задач')} ({title})? Это нельзя отменить."
 
 
 def deleted_text(count: int) -> str:
+    if is_en():
+        return f"Deleted {count} {'task' if count == 1 else 'tasks'}." if count else "These tasks are already deleted."
     return f"Удалила {count} {plural(count, 'задачу', 'задачи', 'задач')}." if count else "Эти задачи уже удалены."
 
 
@@ -1935,7 +2022,7 @@ async def complete_request(session: AsyncSession, user: User, text: str, tz: Zon
     events, _ = await select_events(session, user, text, tz, period_default=datetime.now(tz).date())
     events = [event for event in events if event.completed_at is None]
     if not events:
-        return {"kind": "not_found", "text": "Не нашла невыполненных задач по запросу. Напишите название, например: «отметь отчёт выполненным»."}
+        return {"kind": "not_found", "text": tr("Не нашла невыполненных задач по запросу. Напишите название, например: «отметь отчёт выполненным».", "Couldn't find unfinished tasks for that. Give the title, for example: “mark the report done”.")}
     moment = datetime.now(timezone.utc)
     for event in events[:200]:
         event.completed_at = moment
@@ -1945,7 +2032,7 @@ async def complete_request(session: AsyncSession, user: User, text: str, tz: Zon
         "kind": "completed",
         "events": [event_view(event, tz) for event in events[:20]],
         "event_ids": [event.id for event in events[:200]],
-        "text": f"Отметила выполненными: {count} ✓",
+        "text": tr(f"Отметила выполненными: {count} ✓", f"Marked done: {count} ✓"),
     }
 
 
@@ -1989,7 +2076,7 @@ async def analyze_request(session: AsyncSession, user: User, text: str, tz: Zone
             items.append(item)
     if items:
         draft = await create_draft(session, user, items)
-        return proposal(draft, tz, answer=summary, note="Предлагаю перенести эти задачи — проверьте и сохраните или отмените.")
+        return proposal(draft, tz, answer=summary, note=tr("Предлагаю перенести эти задачи — проверьте и сохраните или отмените.", "I suggest moving these tasks — check them and save or cancel."))
     return {"kind": "answer", "text": summary}
 
 
@@ -2000,6 +2087,12 @@ BREAKDOWN_MAX_STEPS = 12
 
 BREAKDOWN_UNAVAILABLE = "Разбивка на шаги сейчас недоступна. Добавьте шаги сами — например, «повторить билеты 1–10 завтра в 18:00»."
 BREAKDOWN_FAILED = "Не получилось разбить задачу — попробуйте ещё раз чуть позже."
+BREAKDOWN_UNAVAILABLE_EN = "Breaking into steps isn't available right now. Add the steps yourself — for example, “review topics 1–10 tomorrow at 18:00”."
+BREAKDOWN_FAILED_EN = "Couldn't break the task into steps — please try again a bit later."
+BREAKDOWN_UNCLEAR_EN = (
+    "Couldn't break the task into steps. Tell me what to prepare for and by when — for example, "
+    "“break preparing for the history exam into steps by 20 October”."
+)
 BREAKDOWN_UNCLEAR = (
     "Не получилось разбить задачу. Напишите, к чему и к какому сроку готовиться — например, "
     "«разбей подготовку к экзамену по истории на шаги до 20 октября»."
@@ -2010,13 +2103,13 @@ async def breakdown_request(session: AsyncSession, user: User, text: str, tz: Zo
     """A big task ("подготовиться к экзамену 20 октября") split into steps laid out over the days before it,
     shown as a draft: the user sees how it fits the calendar, edits and saves it."""
     if not settings.llm_enabled:
-        return {"kind": "answer", "text": BREAKDOWN_UNAVAILABLE}
+        return {"kind": "answer", "text": tr(BREAKDOWN_UNAVAILABLE, BREAKDOWN_UNAVAILABLE_EN)}
     found = await breakdown_items(session, user, text, tz)
     if isinstance(found, str):
         return {"kind": "answer", "text": found}
     items, answer = found
     draft = await create_draft(session, user, items)
-    return proposal(draft, tz, answer=honest(answer), note="Так шаги лягут в календарь. Поправьте, удалите лишнее и сохраните.")
+    return proposal(draft, tz, answer=honest(answer), note=tr("Так шаги лягут в календарь. Поправьте, удалите лишнее и сохраните.", "This is how the steps fit the calendar. Adjust them, remove what you don't need and save."))
 
 
 async def breakdown_items(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> tuple[list[dict], str | None] | str:
@@ -2065,12 +2158,12 @@ async def breakdown_items(session: AsyncSession, user: User, text: str, tz: Zone
             result = await GigaChatClient().breakdown(text, facts)
         except Exception:
             logger.exception("GigaChat breakdown failed")
-            return BREAKDOWN_FAILED
+            return tr(BREAKDOWN_FAILED, BREAKDOWN_FAILED_EN)
         items = breakdown_steps(result, start, deadline, now)
         if items:
             break
     if not items:
-        return BREAKDOWN_UNCLEAR
+        return tr(BREAKDOWN_UNCLEAR, BREAKDOWN_UNCLEAR_EN)
     items.sort(key=lambda item: (item["date"], item["time"] or ""))
     answer = result.get("answer") if isinstance(result.get("answer"), str) else None
     return items[:BREAKDOWN_MAX_STEPS], answer
@@ -2246,7 +2339,7 @@ async def move_draft(session: AsyncSession, user: User, draft: AssistantDraft, d
         items.append(moved)
     draft.items = items
     draft.awaiting = None
-    reply = proposal(draft, tz, note=f"Перенесла на {date_day(day)} ✓")
+    reply = proposal(draft, tz, note=tr(f"Перенесла на {date_day(day)} ✓", f"Moved to {date_day(day)} ✓"))
     await update_draft_messages(session, user, draft.id, reply)
     await session.commit()
     return reply
@@ -2285,7 +2378,7 @@ async def move_many(session: AsyncSession, user: User, text: str, tz: ZoneInfo) 
     elif context or (everything and not keywords):
         found = await context_events(session, user, phrase, tz)
         if found is None:
-            return {"kind": "answer", "text": "С какого дня перенести? Например: «перенеси все задачи с 9 на 8 октября» или «перенеси задачи на завтра на пятницу»."}
+            return {"kind": "answer", "text": tr("С какого дня перенести? Например: «перенеси все задачи с 9 на 8 октября» или «перенеси задачи на завтра на пятницу».", "Which day should I move them from? For example: “move all tasks from 9 to 8 October” or “move tomorrow's tasks to Friday”.")}
         if everything and not context:
             # "перенеси всё на 8-е" after adding tasks: every task of the days they are on
             days = sorted({event.start_at.astimezone(tz).date() for event in found})
@@ -2305,18 +2398,27 @@ async def move_many(session: AsyncSession, user: User, text: str, tz: ZoneInfo) 
         events = [event for event in candidates if all(stem in searchable(event) for stem in keywords)]
     events = list({event.id: event for event in events if event.completed_at is None}.values())
     if not events:
+        if is_en():
+            where = f" on {date_day(source_day)}" if source_day else ""
+            return {"kind": "not_found", "text": f"Couldn't find unfinished tasks{where} to move. Be more specific, for example: “move all tasks from 9 to 8 October”."}
         where = f" на {date_day(source_day)}" if source_day else ""
         return {"kind": "not_found", "text": f"Не нашла невыполненных задач{where}, которые можно перенести. Уточните, например: «перенеси все задачи с 9 на 8 октября»."}
     items = [item for item in (change_item(event, {"date": day}, tz)[0] for event in events[:MAX_DRAFT_ITEMS]) if item]
     if not items:
-        return {"kind": "answer", "text": f"Эти задачи уже стоят на {date_day(day)}."}
+        return {"kind": "answer", "text": tr(f"Эти задачи уже стоят на {date_day(day)}.", f"These tasks are already on {date_day(day)}.")}
     draft = await create_draft(session, user, items)
     count = len(items)
-    origin = f" с {date_day(source_day)}" if source_day else ""
-    answer = f"Перенесу {count} {plural(count, 'задачу', 'задачи', 'задач')}{origin} на {date_day(day)} — время сохранится. Проверьте и сохраните:"
-    if len(events) > MAX_DRAFT_ITEMS:
-        answer += f"\nЗадач больше {MAX_DRAFT_ITEMS}: здесь первые {MAX_DRAFT_ITEMS}, остальные перенесите следующим сообщением."
-    note = "Среди них есть неперемещаемые задачи — проверьте." if any(event.is_fixed for event in events[:MAX_DRAFT_ITEMS]) else None
+    if is_en():
+        origin = f" from {date_day(source_day)}" if source_day else ""
+        answer = f"I'll move {count} {'task' if count == 1 else 'tasks'}{origin} to {date_day(day)} — the times stay. Check and save:"
+        if len(events) > MAX_DRAFT_ITEMS:
+            answer += f"\nThere are more than {MAX_DRAFT_ITEMS} tasks: here are the first {MAX_DRAFT_ITEMS}, move the rest with the next message."
+    else:
+        origin = f" с {date_day(source_day)}" if source_day else ""
+        answer = f"Перенесу {count} {plural(count, 'задачу', 'задачи', 'задач')}{origin} на {date_day(day)} — время сохранится. Проверьте и сохраните:"
+        if len(events) > MAX_DRAFT_ITEMS:
+            answer += f"\nЗадач больше {MAX_DRAFT_ITEMS}: здесь первые {MAX_DRAFT_ITEMS}, остальные перенесите следующим сообщением."
+    note = tr("Среди них есть неперемещаемые задачи — проверьте.", "Some of them are fixed tasks — please check.") if any(event.is_fixed for event in events[:MAX_DRAFT_ITEMS]) else None
     return proposal(draft, tz, answer=join_text(night_note(text, now), answer), note=note)
 
 
@@ -2340,7 +2442,7 @@ async def move_event(session: AsyncSession, user: User, event_id: int, day: date
     old_day = event.start_at.astimezone(tz).date()
     item, problem = change_item(event, {"date": day}, tz)
     if problem:
-        text = f"«{title}» уже стоит на {date_day(day)}." if problem == NOTHING_CHANGES else problem
+        text = tr(f"«{title}» уже стоит на {date_day(day)}.", f"“{title}” is already on {date_day(day)}.") if problem in (NOTHING_CHANGES, NOTHING_CHANGES_EN) else problem
         return {"kind": "answer", "text": text}
     changed = await apply_changes(session, user, [item], tz)
     reply = {
@@ -2348,7 +2450,7 @@ async def move_event(session: AsyncSession, user: User, event_id: int, day: date
         "events": [event_view(found, tz) for found in changed],
         "event_ids": [found.id for found in changed],
         "answer": None,
-        "text": f"Перенесла «{title}» на {date_day(day)}.",
+        "text": tr(f"Перенесла «{title}» на {date_day(day)}.", f"Moved “{title}” to {date_day(day)}."),
         # "Вернуть" moves it back to this day
         "moved": {"event_id": event_id, "from": old_day.isoformat(), "to": day.isoformat(), "from_label": short_day(old_day)},
     }
