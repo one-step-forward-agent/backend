@@ -49,8 +49,7 @@ class AppleCalendarIntegration(IntegrationProvider):
     fields = [
         ConfigField("username", "Apple ID", placeholder="name@icloud.com"),
         ConfigField("app_password", "Пароль приложения", type="password", secret=True, placeholder="xxxx-xxxx-xxxx-xxxx"),
-        ConfigField("calendar_name", "Календарь для экспорта", required=False, placeholder="Пусто — первый доступный"),
-        ConfigField("server_url", "CalDAV сервер", type="url", required=False, default="https://caldav.icloud.com/", help="Можно указать любой CalDAV-сервер"),
+        ConfigField("calendar_name", "Календарь для экспорта", type="select", required=False, placeholder="Пусто — первый доступный"),
     ]
     auth_error = "Неверный Apple ID или пароль приложения"
 
@@ -121,6 +120,14 @@ class AppleCalendarIntegration(IntegrationProvider):
                         if item:
                             items.append(item)
         return items
+
+    async def list_calendars(self) -> list[dict]:
+        """Возвращает список доступных календарей для формы"""
+        async with self._client() as client:
+            calendars = await self._calendars(client)
+        return [{"id": url, "name": name} for url, name in calendars]
+    
+    
 
     @staticmethod
     def _to_item(component, tz: ZoneInfo, calendar_name: str) -> RemoteItem | None:

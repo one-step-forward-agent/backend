@@ -46,6 +46,35 @@ async def list_integrations(user: User = Depends(get_current_user), session: Asy
     ]
 
 
+@router.post("/integrations/{slug}/calendars")
+async def get_integration_calendars(
+    slug: str, 
+    payload: IntegrationConnect, 
+    user: User = Depends(get_current_user), 
+    session: AsyncSession = Depends(get_session)
+):
+    provider_class = _provider_class(slug)
+    
+    if not hasattr(provider_class, "list_calendars"):
+        raise HTTPException(status_code=400, detail="Провайдер не поддерживает список календарей")
+
+    integration = await _integration(session, user, slug)
+    previous_secrets = decrypt_json(integration.credentials_encrypted) if integration else {}
+    
+    values = {**previous_secrets, **{key: value for key, value in payload.values.items() if value not in (None, "")}}
+    
+    try:
+        config, secrets = provider_class.split_values(values)
+        provider = provider_class(ProviderContext(
+            config=config, 
+            secrets=secrets, 
+            timezone=service.user_timezone(user)
+        ))
+        calendars = await provider.list_calendars()
+        return {"calendars": calendars}
+    except IntegrationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
 @router.post("/integrations/{slug}/connect")
 async def connect_integration(slug: str, payload: IntegrationConnect, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     provider_class = _provider_class(slug)
