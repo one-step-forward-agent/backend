@@ -752,21 +752,30 @@ VOICE_TYPES = {".webm": "audio/webm", ".ogg": "audio/ogg", ".oga": "audio/ogg", 
 async def assistant_chat_voice(
     audio: UploadFile = File(...),
     duration: float = Form(default=0, ge=0, le=3600),
+    file: UploadFile | None = File(default=None),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """A voice message, as in a messenger: the chat keeps and shows the recording, the assistant gets what was said."""
-    from app.services import kept_files
+    """A voice message, as in a messenger: the chat keeps and shows the recording, the assistant gets what was said.
+    `file`: a file attached to it, read like one sent with a typed message ("пришли этот файл в 21:00" said aloud)."""
+    from app.services import attachments, kept_files
 
     limit_uploads(user)
     await limit_assistant(session, user, None)
+    attachment = None
+    if file is not None:
+        data = await file.read(settings.max_file_size_mb * 1024 * 1024 + 1)
+        try:
+            attachment = await attachments.read(file.filename or "file", data)
+        except attachments.UnreadableFile as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
     suffix, content = await read_audio(audio)
     text = await transcribe(content, suffix)
     if not text.strip():
         raise HTTPException(status_code=422, detail="Не удалось разобрать речь — попробуйте ещё раз")
     file_id = kept_files.save(kept_files.VOICE, user.id, content, suffix)
     try:
-        return await chat.handle_message(session, user, text, voice={"id": file_id, "duration": round(duration, 1)})
+        return await chat.handle_message(session, user, text, attachment, voice={"id": file_id, "duration": round(duration, 1)})
     except chat.AssistantUnavailable:
         kept_files.remove(kept_files.VOICE, user.id, file_id)
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from None

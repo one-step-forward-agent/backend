@@ -551,6 +551,26 @@ def search_title(filters: dict, today: date) -> str:
     return tr("Найденные события", "Found events")
 
 
+# "Пришли / отправь мне этот файл (в телеграм) в 21:00" — asks for a file that has to come with the message
+# Only a file meant for the user ("мне") or a file named as this one ("этот файл"): "отправить документы в налоговую"
+# is a task to add, not this
+SEND_VERB_RU = r"(?:пришл|присла|отправ|скин|перешл)\w*"
+FILE_NOUN_RU = r"(?:файл|документ|фото|картинк|скрин)"
+FILE_WITHOUT_FILE = re.compile(
+    rf"{SEND_VERB_RU}\s+(?:мне|нам)\s+(?:\w+\s+){{0,2}}?{FILE_NOUN_RU}"
+    rf"|{SEND_VERB_RU}\s+(?:\w+\s+){{0,2}}?(?:эт\w+|тот|ту)\s+{FILE_NOUN_RU}"
+    r"|\bsend\s+(?:me\s+)?(?:this|that|the)\s+(?:file|document|photo|picture)",
+    re.I,
+)
+NO_FILE_ATTACHED = (
+    "Файл не пришёл вместе с сообщением. Прикрепите его скрепкой и в том же сообщении напишите или скажите, когда прислать, "
+    "например: «пришли этот файл в 21:00» — бот Dayla пришлёт его в Telegram в это время."
+)
+NO_FILE_ATTACHED_EN = (
+    "The file didn't come with the message. Attach it with the paperclip and, in the same message, write or say when to send it — "
+    "for example, “send this file at 9 pm” — and the Dayla bot will send it to Telegram then."
+)
+
 # "Какое у меня свободное время в понедельник?", "когда я свободна завтра?", "есть окно в пятницу?":
 # the schedule is shown and the free time is written out, counted by the app, not by the model
 FREE_TIME_REQUEST = re.compile(
@@ -1915,7 +1935,8 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     caption = text.strip()[:50000]
     shown = {"kind": "file", "caption": caption, "file": attachment.meta()} if attachment else None
     if voice:
-        shown = {"kind": "voice", "voice": voice, "transcript": caption}
+        # A voice message may carry a file too ("пришли этот файл в 21:00" said aloud): both are shown
+        shown = {"kind": "voice", "voice": voice, "transcript": caption, **({"file": attachment.meta()} if attachment else {})}
     if attachment:
         from app.services.attachments import message_text
 
@@ -1949,6 +1970,9 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, atta
     name = command(text)
     if name:
         return await run_command(session, user, name)
+    if attachment is None and FILE_WITHOUT_FILE.search(text):
+        # "Отправь мне этот файл в телеграм в 21:00" with no file: the model would say it has no access to files
+        return {"kind": "answer", "text": tr(NO_FILE_ATTACHED, NO_FILE_ATTACHED_EN)}
     if attachment is None and is_free_time_question(text):
         # "В какие дни на этой неделе есть окно с 14 до 16?": counted by the app, so the model is not waited for.
         # Only when the days are clear from the words; a follow-up ("а во вторник?") goes to the agent for context

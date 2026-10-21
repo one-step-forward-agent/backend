@@ -256,6 +256,42 @@ async def test_a_file_without_send_words_sets_no_reminder(client, user, agent, m
     assert "remind" not in offered_actions[0]
 
 
+async def test_a_voice_message_brings_the_attached_file(client, user, monkeypatch):
+    """A file attached, then "отправь мне этот файл в телеграм в 21:00" said aloud: the file goes with the voice
+    message and the reminder brings it (the 2026-10-21 screenshot: the file was dropped)."""
+    headers, _ = user
+    fake_transcription(monkeypatch, "Отправь мне этот файл в телеграм в 21:00")
+    response = await client.post(
+        "/api/assistant/chat/voice",
+        files={"audio": ("voice.webm", b"x", "audio/webm"), "file": CSV},
+        data={"duration": "4"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["kind"] == "reminder", reply
+    assert reply["reminders"][0]["file"] == "отчёт.csv" and reply["reminders"][0]["label"].endswith("21:00")
+    sent = await last_sent(client, headers)
+    assert sent["reply"]["kind"] == "voice" and sent["reply"]["file"]["name"] == "отчёт.csv"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Отправь мне этот файл в телеграм в 11:04", "пришли мне файл в 21:00", "скинь этот документ вечером", "send me this file at 9 pm"],
+)
+async def test_asking_for_a_file_without_one_says_how(client, user, agent, text):
+    headers, _ = user
+    requests = agent([])  # answered by the app: the model said it had no access to files or Telegram
+    reply = await say(client, headers, text)
+    assert requests == [] and reply["kind"] == "answer"
+    assert reply["text"].startswith("Файл не пришёл вместе с сообщением")
+
+
+def test_sending_documents_somewhere_is_still_a_task():
+    for text in ("отправить документы в налоговую завтра", "отправь отчёт Ивану в пятницу", "send the report to Anna tomorrow"):
+        assert not chat.FILE_WITHOUT_FILE.search(text), text
+
+
 async def test_deleting_the_account_deletes_kept_files(client, user, monkeypatch):
     headers, _ = user
     fake_transcription(monkeypatch, SAID)
