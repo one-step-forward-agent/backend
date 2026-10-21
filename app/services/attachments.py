@@ -4,6 +4,8 @@ Documents and tables give their text; photos and scanned PDFs are read by the vi
 file's name next to the caption, the way any messenger shows an attachment; the model gets the file's text."""
 
 import logging
+import mimetypes
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
@@ -22,6 +24,15 @@ UNKNOWN_TYPE_EN = "I can't read this kind of file: send a PDF, Word, Excel, CSV,
 EXTRACTOR_ERRORS_EN = {UNKNOWN_TYPE: UNKNOWN_TYPE_EN, "Не удалось прочитать документ": "Couldn't read the document"}
 # What the model reads of one file: the agent takes 8000 characters of a message
 MAX_FILE_TEXT = 7000
+# A file sent to the chat, of any kind (and the most the Telegram bot can download)
+MAX_CHAT_FILE_MB = 20
+# "Пришли / отправь / скинь / кинь / перешли … в 21:00", "send / forward this at 9", "… в телеграм": the user wants
+# the file itself back later, so it is kept even when its text cannot be read
+SEND_INTENT = re.compile(
+    r"пришл|присла|присыл|отправ|скин|\bкинь|\bкидай|перешл|пересл|вышл|\bsend\b|\bforward\b|\bremind|напомн|напомин"
+    r"|в\s+(?:телеграм\w*|telegram|тг|tg)\b|to\s+telegram",
+    re.I,
+)
 
 
 class UnreadableFile(ValueError):
@@ -69,13 +80,33 @@ async def images_text(images: list[tuple[bytes, str]]) -> str:
     return "\n\n".join(part for part in parts if part).strip()
 
 
+def too_big(data: bytes) -> bool:
+    return len(data) > MAX_CHAT_FILE_MB * 1024 * 1024
+
+
+async def read_for(name: str, data: bytes, caption: str) -> Attachment:
+    """A file sent to the chat. A message that asks to send it back ("пришли этот файл в 21:00") takes any file up
+    to MAX_CHAT_FILE_MB, read or not: an archive, a video or a picture the model cannot see is still sent with
+    the reminder. Otherwise the file has to be readable. Raises UnreadableFile with words for the user."""
+    name = Path(name or "file").name[:200] or "file"
+    if too_big(data):
+        raise UnreadableFile(tr(f"Файл больше {MAX_CHAT_FILE_MB} МБ", f"The file is larger than {MAX_CHAT_FILE_MB} MB"))
+    try:
+        return await read(name, data)
+    except UnreadableFile:
+        if not data or not SEND_INTENT.search(caption or ""):
+            raise
+        logger.info("Kept a %s file that cannot be read: it is to be sent back", Path(name).suffix.lower() or "plain")
+        return Attachment(name, mimetypes.guess_type(name)[0] or "application/octet-stream", len(data), "", data)
+
+
 async def read(name: str, data: bytes) -> Attachment:
     """The file's text for the assistant. Raises UnreadableFile with words for the user."""
     name = Path(name or "file").name[:200] or "file"
     if not data:
         raise UnreadableFile(tr("Файл пустой", "The file is empty"))
-    if len(data) > settings.max_file_size_mb * 1024 * 1024:
-        raise UnreadableFile(tr(f"Файл больше {settings.max_file_size_mb} МБ", f"The file is larger than {settings.max_file_size_mb} MB"))
+    if too_big(data):
+        raise UnreadableFile(tr(f"Файл больше {MAX_CHAT_FILE_MB} МБ", f"The file is larger than {MAX_CHAT_FILE_MB} MB"))
     kind = kind_of(name)
     suffix = Path(name).suffix.lower()
     if kind == "image":
@@ -119,5 +150,6 @@ async def read(name: str, data: bytes) -> Attachment:
 
 
 def message_text(caption: str, attachment: Attachment) -> str:
-    """What the assistant reads: the user's words and the file's text."""
-    return f"{caption}\n\n📎 {attachment.name}:\n{attachment.text}" if caption else f"📎 {attachment.name}:\n{attachment.text}"
+    """What the assistant reads: the user's words and the file's text (a file kept only to be sent back: its name)."""
+    body = f"📎 {attachment.name}:\n{attachment.text}" if attachment.text else f"📎 {attachment.name} (файл приложен, его текст не прочитан)"
+    return f"{caption}\n\n{body}" if caption else body

@@ -23,7 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import ConversationMessage, Event, Tag, User
-from app.services import chat, dates, insights, reminders, tasks
+from app.services import attachments, chat, dates, insights, reminders, tasks
 from app.core.lang import is_en, tr
 from app.services.ru import MONTHS, WEEKDAYS, WEEKDAYS_SHORT, day_label, plural
 
@@ -169,7 +169,7 @@ ADVICE_REQUEST = re.compile(
 TIMED_HINT = re.compile(r"врем|весь\s+день|целый\s+день|встреч|созвон", re.I)
 REMINDER_WORDS = re.compile(r"напомн|напомин|будильник", re.I)
 # "Пришли мне этот файл в Telegram в 21:00" with a file attached: a reminder that brings the file
-SEND_WORDS = re.compile(r"пришл|присла|отправ|скин|перешл|\bsend\b|\bremind", re.I)
+SEND_WORDS = attachments.SEND_INTENT
 # The model's repeat is taken only when the user said something about it
 REPEAT_HINT = re.compile(r"кажд|ежедн|еженед|ежемес|ежечас|регулярн|повтор|по\s+будн|по\s+утрам|по\s+вечерам", re.I)
 DELETE_WORDS = re.compile(r"удал|сотр|стер|очист|почист|убер|убра|отмен|не\s+нужн|больше\s+не", re.I)
@@ -911,9 +911,15 @@ REMINDER_VERB = re.compile(r"(?:поставь(?:те)?\s+)?(?:напомни(?:
 WHAT_LEAD = re.compile(r"^(?:о|об|про|что|чтобы|что\s+надо|что\s+нужно)\s+", re.I)
 
 
+FILE_WORDS = (
+    r"(?:это?т?|эту|его|её|ее|файл\w*|документ\w*|фото\w*|картинк\w*|скрин\w*|видео|архив|в\s+телеграм\w*|в\s+telegram|в\s+тг|в\s+tg"
+    r"|\bthis\b|\bthat\b|\bit\b|\bthe\b|\bfiles?\b|\bdocument\b|\bphoto\b|\bpicture\b|to\s+telegram)"
+)
 SEND_FILE_VERB = re.compile(
-    r"(?:пришли(?:те)?|присылай(?:те)?|отправь(?:те)?|скинь(?:те)?|перешли(?:те)?)(?:\s+(?:мне|нам))?"
-    r"(?:\s+(?:это?т?|эту|его|её|ее|файл|документ|фото|в\s+телеграм\w*|в\s+telegram|в\s+тг))*",
+    r"(?:(?:пришли|присылай|отправь|отправляй|скинь|кинь|перешли|пересли|вышли)(?:те)?|\bsend\b|\bforward\b)(?:\s+(?:мне|нам|me))?"
+    rf"(?:\s+{FILE_WORDS})*"
+    # "этот файл в телеграм в 11:40" without a verb: the file and Telegram say it
+    rf"|(?:\b{FILE_WORDS}\s+)*в\s+(?:телеграм\w*|telegram|тг|tg)\b",
     re.I,
 )
 
@@ -925,7 +931,7 @@ async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
     full = text
     if attachment is not None:
         text = own_words(text)
-    sending = attachment is not None and bool(SEND_FILE_VERB.search(text))
+    sending = attachment is not None and bool(SEND_FILE_VERB.search(text) or SEND_WORDS.search(text))
     if not (REMINDER_VERB.search(text) or sending) or re.search(r"напоминани[яей]\b.*\?|какие\s+у\s+меня|отмени", text, re.I):
         return None
     now = datetime.now(tz)

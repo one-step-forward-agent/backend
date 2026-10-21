@@ -206,18 +206,17 @@ def record_offered(monkeypatch) -> list[set[str]]:
     return seen
 
 
-async def test_send_this_file_at_nine_brings_the_file(client, user, agent, monkeypatch):
+async def test_send_this_file_at_nine_brings_the_file(client, user, agent):
     headers, _ = user
-    offered_actions = record_offered(monkeypatch)
-    agent([act(op("remind", text="", at="в 21:00"))])
+    requests = agent([act(op("remind", text="", at="в 21:00"))])
     response = await client.post(
         "/api/assistant/chat/file", files={"file": CSV}, data={"text": "Пришли мне этот файл в Telegram в 21:00"}, headers=headers
     )
     assert response.status_code == 200, response.text
     reply = response.json()
     assert reply["kind"] == "reminder", reply
-    # "remind" was offered to the model for "пришли этот файл" with no "напомни" in it
-    assert "remind" in offered_actions[0]
+    # The app sets it from the words; the model is not asked
+    assert requests == []
     reminder = reply["reminders"][0]
     assert reminder["file"] == "отчёт.csv" and reminder["label"].endswith("21:00")
 
@@ -290,6 +289,53 @@ async def test_asking_for_a_file_without_one_says_how(client, user, agent, text)
 def test_sending_documents_somewhere_is_still_a_task():
     for text in ("отправить документы в налоговую завтра", "отправь отчёт Ивану в пятницу", "send the report to Anna tomorrow"):
         assert not chat.FILE_WITHOUT_FILE.search(text), text
+
+
+PHOTO = ("0494.jpg", b"\xff\xd8\xff\xe0 not a real picture", "image/jpeg")
+ARCHIVE = ("photos.zip", b"PK\x03\x04 archive", "application/zip")
+
+
+async def test_a_photo_said_to_go_to_telegram_becomes_a_reminder_not_a_task(client, user, agent, monkeypatch):
+    """The 2026-10-21 screenshot: a photo and "Этот файл в Telegram в 11:40" said aloud became a task named
+    "Этот файл в Telegram". The app sets the reminder itself, before the model, even for a picture it can't read."""
+    headers, _ = user
+    fake_transcription(monkeypatch, "Этот файл в Telegram в 11:40")
+    # What the model did: a task. It must not be asked at all
+    requests = agent([act(op("create", events=[{"title": "Этот файл в Telegram", "date": "сегодня", "start_time": "11:40"}]))])
+    response = await client.post(
+        "/api/assistant/chat/voice", files={"audio": ("voice.webm", b"x", "audio/webm"), "file": PHOTO}, data={"duration": "3"}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert requests == []
+    assert reply["kind"] == "reminder", reply
+    reminder = reply["reminders"][0]
+    assert reminder["file"] == "0494.jpg" and reminder["label"].endswith("11:40")
+
+
+@pytest.mark.parametrize("said", ["пришли этот архив в 21:00", "кинь мне это в тг в 21:00", "перешли в телеграм в 21:00", "send me this at 21:00"])
+async def test_any_file_is_sent_back_when_asked(client, user, said):
+    headers, _ = user
+    response = await client.post("/api/assistant/chat/file", files={"file": ARCHIVE}, data={"text": said}, headers=headers)
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["kind"] == "reminder", reply
+    assert reply["reminders"][0]["file"] == "photos.zip"
+    file = await client.get(f"/internal/bot/notifications/{reply['reminders'][0]['id']}/file", headers=BOT_HEADERS)
+    assert file.status_code == 200 and file.content == ARCHIVE[1]
+
+
+async def test_a_file_that_cannot_be_read_and_is_not_to_be_sent_is_said_in_words(client, user):
+    headers, _ = user
+    response = await client.post("/api/assistant/chat/file", files={"file": ARCHIVE}, data={"text": "что тут?"}, headers=headers)
+    assert response.status_code == 422 and "PDF" in response.json()["detail"]
+
+
+async def test_a_file_over_20_mb_is_refused(client, user):
+    headers, _ = user
+    big = ("video.mp4", b"0" * (20 * 1024 * 1024 + 1), "video/mp4")
+    response = await client.post("/api/assistant/chat/file", files={"file": big}, data={"text": "пришли в 21:00"}, headers=headers)
+    assert response.status_code == 422 and "20 МБ" in response.json()["detail"]
 
 
 async def test_deleting_the_account_deletes_kept_files(client, user, monkeypatch):

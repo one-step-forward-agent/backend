@@ -762,17 +762,18 @@ async def assistant_chat_voice(
 
     limit_uploads(user)
     await limit_assistant(session, user, None)
-    attachment = None
-    if file is not None:
-        data = await file.read(settings.max_file_size_mb * 1024 * 1024 + 1)
-        try:
-            attachment = await attachments.read(file.filename or "file", data)
-        except attachments.UnreadableFile as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
     suffix, content = await read_audio(audio)
     text = await transcribe(content, suffix)
     if not text.strip():
         raise HTTPException(status_code=422, detail="Не удалось разобрать речь — попробуйте ещё раз")
+    attachment = None
+    if file is not None:
+        # Read after the speech: what was said decides whether a file that cannot be read is kept to be sent back
+        data = await file.read(attachments.MAX_CHAT_FILE_MB * 1024 * 1024 + 1)
+        try:
+            attachment = await attachments.read_for(file.filename or "file", data, text)
+        except attachments.UnreadableFile as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
     file_id = kept_files.save(kept_files.VOICE, user.id, content, suffix)
     try:
         return await chat.handle_message(session, user, text, attachment, voice={"id": file_id, "duration": round(duration, 1)})
@@ -820,7 +821,8 @@ async def assistant_chat_file(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """A message with a file — a PDF, Word, Excel, CSV, text or photo: read here and answered like any message."""
+    """A message with a file — a PDF, Word, Excel, CSV, text or photo is read here and answered like any message;
+    any file up to 20 MB is taken when the message asks to send it back ("пришли этот файл в 21:00")."""
     return await chat_with_file(session, user, file, text)
 
 
@@ -830,9 +832,9 @@ async def chat_with_file(session: AsyncSession, user: User, file: UploadFile, te
 
     limit_uploads(user)
     await limit_assistant(session, user, None)
-    data = await file.read(settings.max_file_size_mb * 1024 * 1024 + 1)
+    data = await file.read(attachments.MAX_CHAT_FILE_MB * 1024 * 1024 + 1)
     try:
-        attachment = await attachments.read(file.filename or "file", data)
+        attachment = await attachments.read_for(file.filename or "file", data, text)
     except attachments.UnreadableFile as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     try:

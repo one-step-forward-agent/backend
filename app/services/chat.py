@@ -1970,6 +1970,15 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, atta
     name = command(text)
     if name:
         return await run_command(session, user, name)
+    if attachment is not None:
+        from app.services import agent as file_rules
+
+        if file_rules.sends_file(text, True):
+            # "Отправь этот файл в телеграм в 11:40" with a file: the app sets the reminder that brings it; the model
+            # made it a task named "Этот файл в Telegram". No time said — the model asks or does something else
+            reminder = await file_rules.reminder_by_rules(session, user, text, tz, attachment)
+            if reminder is not None:
+                return reminder
     if attachment is None and FILE_WITHOUT_FILE.search(text):
         # "Отправь мне этот файл в телеграм в 21:00" with no file: the model would say it has no access to files
         return {"kind": "answer", "text": tr(NO_FILE_ATTACHED, NO_FILE_ATTACHED_EN)}
