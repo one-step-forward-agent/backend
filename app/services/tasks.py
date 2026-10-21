@@ -418,7 +418,9 @@ async def streaks(session: AsyncSession, user: User, now: datetime) -> tuple[int
     """The current and the best series of completed days.
 
     A day counts when it had tasks and all of them are done. A day without tasks neither
-    counts nor breaks the series; today counts once finished and never breaks it, since it is in progress."""
+    counts nor breaks the series; today counts once finished and never breaks it, since it is in progress.
+    A day of nothing but meetings from other calendars is a day without tasks: they pass by themselves,
+    and the series must not grow while the user does nothing."""
     tz = now.tzinfo
     today = now.date()
     first = today - timedelta(days=STREAK_DAYS - 1)
@@ -427,15 +429,16 @@ async def streaks(session: AsyncSession, user: User, now: datetime) -> tuple[int
     for event in events:
         day = event.start_at.astimezone(tz).date()
         if first <= day <= today:
-            counts = per_day.setdefault(day, [0, 0])
+            counts = per_day.setdefault(day, [0, 0, 0])
             counts[0] += 1
             counts[1] += is_done(event, now)
+            counts[2] += event.source not in EXTERNAL_SOURCES
     current = best = run = 0
     current_open = True
     for offset in range(STREAK_DAYS):
         day = today - timedelta(days=offset)
-        total, done = per_day.get(day, (0, 0))
-        if not total:
+        total, done, own = per_day.get(day, (0, 0, 0))
+        if not own:
             continue
         if done == total:
             run += 1

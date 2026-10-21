@@ -690,17 +690,20 @@ async def evening(session: AsyncSession, user: User, now: datetime) -> tuple[str
         return None
     profile = user.profile or {}
     tone = profile.get("toneOfVoice") if isinstance(profile, dict) else None
-    done = sum(tasks.is_done(event, now) for event in todays)
+    # The progress counts what the stats count; «all done» needs the user's own tasks ticked, not meetings that just passed
+    progress_events = await tasks.counted(session, user, todays)
+    done = sum(tasks.is_done(event, now) for event in progress_events)
+    all_done = bool(progress_events) and done == len(progress_events) and any(event.source not in tasks.EXTERNAL_SOURCES for event in progress_events)
     streak, _ = await tasks.streaks(session, user, now)
     if lang.is_en():
-        return evening_en(todays, upcoming, unfinished, done, streak, tomorrow, tz, tone)
+        return evening_en(todays, progress_events, upcoming, unfinished, done, all_done, streak, tomorrow, tz, tone)
     lines = [f"🌙 <b>{EVENING_GREETINGS.get(tone, 'Итоги дня')}</b>", ""]
     if todays:
-        progress = f"✅ Выполнено {done} из {len(todays)}"
+        progress = f"✅ Выполнено {done} из {len(progress_events)}" if progress_events else "✅ Задачи в прогресс не идут"
         if streak >= 2:
             progress += f" · 🔥 серия {streak} {plural(streak, 'день', 'дня', 'дней')}"
         lines.append(progress)
-        if done == len(todays):
+        if all_done:
             lines.append("Все задачи дня выполнены — отличная работа! 🎉")
     else:
         lines.append("Сегодня задач не было.")
@@ -724,17 +727,17 @@ async def evening(session: AsyncSession, user: User, now: datetime) -> tuple[str
     return "\n".join(lines), payload
 
 
-def evening_en(todays, upcoming, unfinished, done, streak, tomorrow, tz, tone) -> tuple[str, dict]:
+def evening_en(todays, progress_events, upcoming, unfinished, done, all_done, streak, tomorrow, tz, tone) -> tuple[str, dict]:
     """The evening summary on the English site."""
     from app.services.ru import WEEKDAYS_SHORT_EN, day_month
 
     lines = [f"🌙 <b>{EVENING_GREETINGS_EN.get(tone, 'The day in review')}</b>", ""]
     if todays:
-        progress = f"✅ Done {done} of {len(todays)}"
+        progress = f"✅ Done {done} of {len(progress_events)}" if progress_events else "✅ Today's tasks don't count in the progress"
         if streak >= 2:
             progress += f" · 🔥 {streak}-day streak"
         lines.append(progress)
-        if done == len(todays):
+        if all_done:
             lines.append("Every task of the day is done — great work! 🎉")
     else:
         lines.append("There were no tasks today.")

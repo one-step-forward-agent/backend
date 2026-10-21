@@ -237,6 +237,37 @@ async def test_streak_skips_empty_days(client, user):
     assert stats["streak"] == 2 and stats["best_streak"] == 2
 
 
+async def test_passed_meetings_are_not_all_done(client, user):
+    """A day of meetings synced from Google passes by itself: no «all done», no streak, while the user's task is not ticked."""
+    headers, chat_id = user
+    async with session_factory() as session:
+        row = await user_row(session, chat_id)
+        calendar = await tasks.default_calendar(session, row, "Europe/Moscow")
+        now = datetime.now(TZ).replace(second=0, microsecond=0)
+        for offset in (1, 2, 3):
+            start = datetime.combine(now.date() - timedelta(days=offset), time(10), TZ)
+            session.add(Event(calendar_id=calendar.id, user_id=row.id, title=f"Встреча {offset}", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google"))
+        start = now - timedelta(hours=2)
+        session.add(Event(calendar_id=calendar.id, user_id=row.id, title="Планёрка", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google"))
+        await session.commit()
+        assert await tasks.streaks(session, row, now) == (0, 0)
+        text, _ = await insights.evening(session, row, now)
+        assert "Все задачи дня выполнены" not in text
+
+        task_start = datetime.combine(now.date(), time.min, TZ)
+        task = Event(calendar_id=calendar.id, user_id=row.id, title="Отчёт", start_at=task_start, end_at=task_start + timedelta(days=1), all_day=True, timezone="Europe/Moscow")
+        session.add(task)
+        await session.commit()
+        text, _ = await insights.evening(session, row, now)
+        assert "Выполнено 1 из 2" in text and "Все задачи дня выполнены" not in text
+
+        task.completed_at = now
+        await session.commit()
+        text, _ = await insights.evening(session, row, now)
+        assert "Все задачи дня выполнены" in text
+        assert await tasks.streaks(session, row, now) == (1, 1)
+
+
 async def test_calendar_recommendations_and_chat_topic(client, user):
     headers, _ = user
     for text in ["разобрать документы завтра", "встреча с юристом завтра в 12:00, нельзя переносить"]:
