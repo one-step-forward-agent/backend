@@ -22,9 +22,8 @@ def _timezone(value: str | None) -> str | None:
     return value
 
 
-class Credentials(BaseModel):
+class EmailAddress(BaseModel):
     email: str = Field(max_length=320)
-    password: str = Field(max_length=128)
 
     @field_validator("email")
     @classmethod
@@ -35,6 +34,10 @@ class Credentials(BaseModel):
         return value
 
 
+class Credentials(EmailAddress):
+    password: str = Field(max_length=128)
+
+
 class RegisterRequest(Credentials):
     password: str = Field(min_length=8, max_length=128)
     name: str | None = Field(default=None, max_length=200)
@@ -42,11 +45,26 @@ class RegisterRequest(Credentials):
     # Spam protection from the sign-up form: a field hidden from people, and how long the form was open
     website: str | None = Field(default=None, max_length=200)
     form_ms: int | None = None
+    # The code mailed to the email and the token that came with it (POST /auth/register/code), when mail is set up
+    email_code: str | None = Field(default=None, max_length=12)
+    email_token: str | None = Field(default=None, max_length=1000)
 
     @field_validator("timezone")
     @classmethod
     def check_timezone(cls, value: str | None) -> str | None:
         return _timezone(value)
+
+
+class EmailCodeRequest(EmailAddress):
+    website: str | None = Field(default=None, max_length=200)
+
+
+class EmailCodeSent(BaseModel):
+    """`required` false: mail is not set up and the sign-up needs no code"""
+
+    required: bool
+    email_token: str | None = None
+    expires_in: int | None = None
 
 
 class LoginRequest(Credentials):

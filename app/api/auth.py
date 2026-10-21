@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -15,16 +16,17 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import ACCESS_COOKIE, REFRESH_COOKIE, get_current_user
-from app.core import ratelimit
+from app.core import lang, ratelimit
 from app.core.auth import create_access_token, decode_access_token, create_refresh_token, decode_refresh_token, hash_password, verify_password
 from app.core.config import settings
 from app.core.database import get_session
 from app.core.dataenc import email_lookup
 from app.models.models import Calendar, Integration, RefreshToken, User, UserIdentity
 from app.services.google_calendar import CALENDAR_SCOPES, revoke_google_access
+from app.services.mailer import send_email
 from app.services.integrations import service as integration_service
 from app.services.integrations.service import integration_secrets, store_secrets
-from app.schemas import LoginRequest, OAuthStart, RefreshRequest, RegisterRequest, TokenResponse
+from app.schemas import EmailCodeRequest, EmailCodeSent, LoginRequest, OAuthStart, RefreshRequest, RegisterRequest, TokenResponse
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,13 @@ DISPOSABLE_DOMAINS = {
     "fakeinbox.com", "mohmal.com", "emailondeck.com", "mintemail.com", "tempail.com", "dropmail.me", "1secmail.com",
 }
 REFRESH_REUSE_GRACE = timedelta(seconds=30)
+# Sign-up codes: how long one works, how often one is sent, how many wrong ones an email may get
+EMAIL_CODE_LIFETIME = timedelta(minutes=15)
+EMAIL_CODE_RESEND_SECONDS = 60
+EMAIL_CODES_PER_EMAIL_HOUR = 5
+EMAIL_CODES_PER_IP_HOUR = 15
+EMAIL_CODE_MAX_FAILURES = 5
+EMAIL_CODE_TOKEN = "email_code"
 
 
 async def _issue_tokens(session: AsyncSession, user_id: int) -> TokenResponse:
@@ -112,6 +121,90 @@ async def _authenticate(session: AsyncSession, email: str, password: str, ip: st
     return user
 
 
+def _check_new_email(email: str) -> None:
+    if email.rsplit("@", 1)[-1] in DISPOSABLE_DOMAINS:
+        raise HTTPException(status_code=422, detail="Временные почтовые ящики не подходят — укажите свой email")
+
+
+def _code_digest(email: str, code: str) -> str:
+    return hmac.new(settings.secret_key.encode(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+def _email_code_token(email: str, code: str) -> str:
+    """The code is not kept on the server: the token signs which email it was sent to and a digest of it."""
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {"sub": email, "type": EMAIL_CODE_TOKEN, "code": _code_digest(email, code), "iat": now, "exp": now + EMAIL_CODE_LIFETIME},
+        settings.secret_key,
+        algorithm=settings.jwt_algorithm,
+    )
+
+
+def _check_email_code(email: str, token: str | None, code: str | None) -> None:
+    failures_key = f"email-code-fail:{email}"
+    if ratelimit.is_limited(failures_key, EMAIL_CODE_MAX_FAILURES, EMAIL_CODE_LIFETIME.total_seconds()):
+        raise HTTPException(status_code=429, detail="Слишком много неверных кодов — запросите новый через 15 минут")
+    if not token or not code:
+        raise HTTPException(status_code=422, detail="Введите код из письма, отправленного на ваш email")
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm], options={"require": ["sub", "exp", "type"]})
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=422, detail="Код устарел — запросите новый") from None
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=422, detail="Запросите код подтверждения ещё раз") from None
+    if payload.get("type") != EMAIL_CODE_TOKEN or payload.get("sub") != email:
+        raise HTTPException(status_code=422, detail="Код отправлен на другой email — запросите новый")
+    if not hmac.compare_digest(str(payload.get("code", "")), _code_digest(email, code.strip())):
+        ratelimit.record(failures_key)
+        raise HTTPException(status_code=422, detail="Неверный код из письма")
+
+
+def _code_letter(code: str) -> tuple[str, str, str]:
+    minutes = int(EMAIL_CODE_LIFETIME.total_seconds() // 60)
+    if lang.is_en():
+        subject = f"{code} — your Dayla sign-up code"
+        lead = "Your code to confirm the email:"
+        note = f"It works for {minutes} minutes. If you did not sign up for Dayla, ignore this letter."
+    else:
+        subject = f"{code} — код для регистрации в Dayla"
+        lead = "Код подтверждения email:"
+        note = f"Он действует {minutes} минут. Если вы не регистрировались в Dayla, просто проигнорируйте это письмо."
+    html = (
+        '<div style="font-family:Arial,sans-serif;font-size:15px;color:#111827">'
+        f"<p>{lead}</p>"
+        f'<p style="font-size:30px;font-weight:bold;letter-spacing:6px;margin:16px 0">{code}</p>'
+        f'<p style="color:#6b7280;font-size:13px">{note}</p></div>'
+    )
+    return subject, f"{lead} {code}\n\n{note}", html
+
+
+@session_router.post("/register/code", response_model=EmailCodeSent)
+async def send_register_code(payload: EmailCodeRequest, request: Request, session: AsyncSession = Depends(get_session)):
+    """Mails a code that confirms the email; the sign-up then sends it with the returned token."""
+    if not settings.email_verification:
+        return EmailCodeSent(required=False)
+    ip = ratelimit.client_ip(request)
+    if payload.website:
+        logger.info("Sign-up code refused as spam from %s", ip)
+        raise HTTPException(status_code=422, detail="Не удалось отправить код — обновите страницу и попробуйте ещё раз")
+    _check_new_email(payload.email)
+    if await session.scalar(select(User.id).where(User.email_hash.in_(email_lookup(payload.email)))):
+        raise HTTPException(status_code=409, detail="Пользователь с таким email уже существует")
+    ratelimit.hit(f"email-code-resend:{payload.email}", 1, EMAIL_CODE_RESEND_SECONDS, "Код уже отправлен — новый можно запросить через минуту")
+    ratelimit.hit(f"email-code:{payload.email}", EMAIL_CODES_PER_EMAIL_HOUR, 3600, "Слишком много писем на этот email, попробуйте через час")
+    ratelimit.hit(f"email-code-ip:{ip}", EMAIL_CODES_PER_IP_HOUR, 3600, "Слишком много писем с вашего адреса, попробуйте через час")
+    code = f"{secrets.randbelow(10**6):06d}"
+    with lang.using(lang.from_header(request.headers.get("accept-language"))):
+        subject, text, html = _code_letter(code)
+    try:
+        await send_email(payload.email, subject, text, html)
+    except Exception:
+        logger.exception("Sign-up code was not sent")
+        ratelimit.reset(f"email-code-resend:{payload.email}")
+        raise HTTPException(status_code=502, detail="Не удалось отправить письмо — проверьте email или попробуйте позже") from None
+    return EmailCodeSent(required=True, email_token=_email_code_token(payload.email, code), expires_in=int(EMAIL_CODE_LIFETIME.total_seconds()))
+
+
 @session_router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(payload: RegisterRequest, request: Request, session: AsyncSession = Depends(get_session)):
     ratelimit.hit(
@@ -124,10 +217,11 @@ async def register(payload: RegisterRequest, request: Request, session: AsyncSes
     if payload.website or (payload.form_ms is not None and payload.form_ms < REGISTER_MIN_FORM_MS):
         logger.info("Sign-up rejected as spam from %s", ratelimit.client_ip(request))
         raise HTTPException(status_code=422, detail="Не удалось зарегистрироваться — обновите страницу и попробуйте ещё раз")
-    if payload.email.rsplit("@", 1)[-1] in DISPOSABLE_DOMAINS:
-        raise HTTPException(status_code=422, detail="Временные почтовые ящики не подходят — укажите свой email")
+    _check_new_email(payload.email)
     if await session.scalar(select(User.id).where(User.email_hash.in_(email_lookup(payload.email)))):
         raise HTTPException(status_code=409, detail="Пользователь с таким email уже существует")
+    if settings.email_verification:
+        _check_email_code(payload.email, payload.email_token, payload.email_code)
     user = User(
         email=payload.email,
         name=payload.name,
