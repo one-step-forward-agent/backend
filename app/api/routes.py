@@ -11,7 +11,7 @@ from uuid import uuid4
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import any_, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -145,10 +145,15 @@ async def delete_current_user(user: User = Depends(get_current_user), session: A
     if google:
         await revoke_google_access(integration_secrets(google))
     event_ids = list(await session.scalars(select(Event.id).where(Event.user_id == user.id)))
+    user_id = user.id
     await session.execute(delete(User).where(User.id == user.id))
     await session.commit()
     for event_id in event_ids:
         shutil.rmtree(settings.storage_path / "events" / str(event_id), ignore_errors=True)
+    from app.services import kept_files
+
+    # Voice messages and files waiting to be sent with reminders
+    kept_files.remove_user(user_id)
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
     response.delete_cookie(ACCESS_COOKIE)
     response.delete_cookie(REFRESH_COOKIE, path="/auth")
@@ -725,12 +730,61 @@ async def extract_file_text(file_id: int, user: User = Depends(get_current_user)
 @router.post("/assistant/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...), user: User = Depends(get_current_user)):
     limit_uploads(user)
+    suffix, content = await read_audio(audio)
+    return {"text": await transcribe(content, suffix)}
+
+
+async def read_audio(audio: UploadFile) -> tuple[str, bytes]:
     suffix = Path(audio.filename or "audio").suffix.lower()
     if suffix not in AUDIO_EXTENSIONS:
         suffix = ".audio"
     content = await audio.read()
     if len(content) > settings.max_file_size_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Файл слишком большой")
+    return suffix, content
+
+
+VOICE_TYPES = {".webm": "audio/webm", ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg", ".mp3": "audio/mpeg",
+               ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".wav": "audio/wav", ".aac": "audio/aac"}
+
+
+@router.post("/assistant/chat/voice")
+async def assistant_chat_voice(
+    audio: UploadFile = File(...),
+    duration: float = Form(default=0, ge=0, le=3600),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """A voice message, as in a messenger: the chat keeps and shows the recording, the assistant gets what was said."""
+    from app.services import kept_files
+
+    limit_uploads(user)
+    await limit_assistant(session, user, None)
+    suffix, content = await read_audio(audio)
+    text = await transcribe(content, suffix)
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="Не удалось разобрать речь — попробуйте ещё раз")
+    file_id = kept_files.save(kept_files.VOICE, user.id, content, suffix)
+    try:
+        return await chat.handle_message(session, user, text, voice={"id": file_id, "duration": round(duration, 1)})
+    except chat.AssistantUnavailable:
+        kept_files.remove(kept_files.VOICE, user.id, file_id)
+        raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from None
+
+
+@router.get("/assistant/voice/{file_id}")
+async def assistant_voice(file_id: str, user: User = Depends(get_current_user)):
+    """The recording of the user's own voice message in the chat."""
+    from app.services import kept_files
+
+    path = kept_files.find(kept_files.VOICE, user.id, file_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    return FileResponse(path, media_type=VOICE_TYPES.get(path.suffix, "application/octet-stream"))
+
+
+async def transcribe(content: bytes, suffix: str) -> str:
+    """What is said in the recording. Raises HTTPException with words for the user."""
     target = settings.storage_path / f"transcription-{uuid4().hex}{suffix}"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
@@ -738,7 +792,7 @@ async def transcribe_audio(audio: UploadFile = File(...), user: User = Depends(g
         from services.speech import recognize_audio
 
         # ffmpeg and speech recognition block; keep them off the event loop so other requests go on
-        return {"text": await run_in_threadpool(recognize_audio, str(target))}
+        return await run_in_threadpool(recognize_audio, str(target))
     except subprocess.TimeoutExpired as error:
         raise HTTPException(status_code=422, detail="Аудиофайл обрабатывается слишком долго") from error
     except subprocess.CalledProcessError as error:

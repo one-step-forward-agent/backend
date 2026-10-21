@@ -4,7 +4,7 @@ Documents and tables give their text; photos and scanned PDFs are read by the vi
 file's name next to the caption, the way any messenger shows an attachment; the model gets the file's text."""
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
@@ -34,9 +34,15 @@ class Attachment:
     mime: str
     size: int
     text: str
+    # The file itself, while the message is answered: a reminder set in it keeps a copy (see kept_files)
+    data: bytes = field(default=b"", repr=False)
 
     def meta(self) -> dict:
         return {"name": self.name, "mime": self.mime, "size": self.size}
+
+    @property
+    def suffix(self) -> str:
+        return Path(self.name).suffix.lower()
 
 
 def kind_of(name: str) -> str:
@@ -83,7 +89,7 @@ async def read(name: str, data: bytes) -> Attachment:
             raise UnreadableFile(tr("Не получилось прочитать картинку — попробуйте ещё раз", "Couldn't read the picture — please try again")) from error
         if not text:
             raise UnreadableFile(tr("На картинке не нашла ничего о планах", "I found nothing about plans in the picture"))
-        return Attachment(name, mime, len(data), text[:MAX_FILE_TEXT])
+        return Attachment(name, mime, len(data), text[:MAX_FILE_TEXT], data)
 
     from services.text_extractors import extract_document, pdf_images, SCAN_TEXT_CHARS
 
@@ -109,7 +115,7 @@ async def read(name: str, data: bytes) -> Attachment:
         target.unlink(missing_ok=True)
     if not text.strip():
         raise UnreadableFile(tr("В файле не нашла текста", "I found no text in the file"))
-    return Attachment(name, "application/octet-stream" if suffix != ".pdf" else "application/pdf", len(data), text[:MAX_FILE_TEXT])
+    return Attachment(name, "application/octet-stream" if suffix != ".pdf" else "application/pdf", len(data), text[:MAX_FILE_TEXT], data)
 
 
 def message_text(caption: str, attachment: Attachment) -> str:

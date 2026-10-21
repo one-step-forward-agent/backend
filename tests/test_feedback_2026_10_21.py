@@ -1,0 +1,266 @@
+"""Feedback of 2026-10-21: free time in a part of the day, two priorities, a file sent with a reminder ("пришли этот
+файл в 21:00"), voice messages kept as audio. The first tests need no database; the ones with `client` do."""
+
+from datetime import datetime, time, timedelta, timezone
+
+import pytest
+from sqlalchemy import update
+
+from app.core.database import session_factory
+from app.models.models import Notification, plain_priority
+from app.schemas import EventCreate, EventUpdate
+from app.services import agent as agent_service, chat, kept_files
+from app.services.attachments import Attachment, message_text
+from tests.conftest import BOT_HEADERS
+from tests.test_agent import TZ, act, agent, op, say  # noqa: F401 - agent is a fixture
+
+CSV = ("отчёт.csv", "Дата,Дело\nзавтра,Сдать отчёт\n".encode(), "text/csv")
+
+
+@pytest.mark.parametrize(
+    "text, window",
+    [
+        ("В какие дни на этой неделе у меня есть окно на час с 14 до 16?", (time(14), time(16), 60)),
+        ("On which days do I have an hour slot from 2 to 4 p.m. this week?", (time(14), time(16), 60)),
+        ("есть окно на 30 минут после 18 завтра?", (time(18), None, 30)),
+        ("когда я свободна до 12 в пятницу?", (None, time(12), None)),
+        ("свободное окно на полчаса между 9:30 и 11 сегодня", (time(9, 30), time(11), 30)),
+        ("есть окно на 2 часа завтра?", (None, None, 120)),
+        # Days, not hours
+        ("есть свободное время с 20 по 25 октября?", (None, None, None)),
+        ("когда я свободна в понедельник?", (None, None, None)),
+    ],
+)
+def test_the_asked_part_of_the_day_is_read(text, window):
+    assert chat.is_free_time_question(text)
+    assert chat.free_time_window(text) == window
+
+
+def test_the_answer_says_the_days_first():
+    from datetime import date
+
+    days = [date(2026, 10, 21), date(2026, 10, 23)]
+    summary = chat.free_time_summary(days, time(14), time(16), 60, False)
+    assert summary.startswith("Окно на 1 ч с 14:00 до 16:00 есть:") and " и " in summary
+    assert "нет ни в один" in chat.free_time_summary([], time(14), time(16), 60, False)
+
+
+def test_two_priorities():
+    assert plain_priority("urgent") == "high" and plain_priority("high") == "high"
+    assert plain_priority("low") == "medium" and plain_priority(None) == "medium"
+    assert EventUpdate(priority="urgent").priority == "high" and EventUpdate().priority is None
+    created = EventCreate(title="Отчёт", start_at="2026-10-21T10:00:00+03:00", end_at="2026-10-21T11:00:00+03:00", priority="low")
+    assert created.priority == "medium"
+
+
+def test_send_this_file_at_nine_is_a_reminder():
+    attachment = Attachment("отчёт.pdf", "application/pdf", 3, "сдавать каждый день в 9", b"abc")
+    text = message_text("Пришли мне этот файл в Telegram в 21:00", attachment)
+    assert agent_service.own_words(text) == "Пришли мне этот файл в Telegram в 21:00"
+    assert "remind" in agent_service.offered(text, "", attached=True)
+    # Without a file "пришли" is not a reminder, and the file's own words never set a repeat
+    assert "remind" not in agent_service.offered(text, "", attached=False)
+    assert agent_service.repeat_of(agent_service.own_words(text)) == (None, None)
+
+
+def test_kept_files_stay_in_their_folder(tmp_path, monkeypatch):
+    import dataclasses
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(kept_files, "settings", dataclasses.replace(settings, storage_path=tmp_path))
+    file_id = kept_files.save(kept_files.VOICE, 1, b"ogg", ".ogg")
+    assert kept_files.find(kept_files.VOICE, 1, file_id).read_bytes() == b"ogg"
+    assert kept_files.find(kept_files.VOICE, 2, file_id) is None
+    assert kept_files.find(kept_files.VOICE, 1, "../../etc/passwd") is None
+    kept_files.remove_user(1)
+    assert kept_files.find(kept_files.VOICE, 1, file_id) is None
+
+
+# ---------- with the database ----------
+
+
+async def make_task(client, headers, title: str, start: datetime, minutes: int = 60, priority: str = "medium") -> dict:
+    body = {
+        "title": title,
+        "start_at": start.isoformat(),
+        "end_at": (start + timedelta(minutes=minutes)).isoformat(),
+        "timezone": "Europe/Moscow",
+        "priority": priority,
+    }
+    response = await client.post("/api/events", json=body, headers=headers)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def fake_transcription(monkeypatch, said: str) -> None:
+    from app.api import routes
+
+    async def transcribe(content, suffix):
+        return said
+
+    monkeypatch.setattr(routes, "transcribe", transcribe)
+
+
+async def last_sent(client, headers) -> dict:
+    history = (await client.get("/api/assistant/history", headers=headers)).json()
+    return [item for item in history if item["role"] == "user"][-1]
+
+
+async def test_old_priorities_are_stored_as_the_two(client, user):
+    headers, _ = user
+    start = datetime.combine(datetime.now(TZ).date() + timedelta(days=2), time(10), TZ)
+    assert (await make_task(client, headers, "Сдать отчёт", start, priority="urgent"))["priority"] == "high"
+    low = await make_task(client, headers, "Полить цветы", start + timedelta(hours=2), priority="low")
+    assert low["priority"] == "medium"
+    changed = await client.put(f"/api/events/{low['id']}", json={"priority": "urgent"}, headers=headers)
+    assert changed.status_code == 200 and changed.json()["priority"] == "high"
+
+
+async def test_free_time_in_a_part_of_the_day_without_the_model(client, user, agent):
+    headers, _ = user
+    tomorrow = datetime.now(TZ).date() + timedelta(days=1)
+    await make_task(client, headers, "Созвон", datetime.combine(tomorrow, time(14), TZ), minutes=90)
+    # The model must not be asked: a call would find the script empty
+    requests = agent([])
+    reply = await say(client, headers, "есть окно на час с 14 до 16 завтра?")
+    assert requests == []
+    assert reply["kind"] == "agenda"
+    # 14:00–15:30 is taken, 15:30–16:00 is only half an hour
+    assert reply["answer"].startswith("Окно на 1 ч с 14:00 до 16:00 в этот день нет."), reply["answer"]
+
+    reply = await say(client, headers, "есть окно на полчаса с 14 до 16 завтра?")
+    assert reply["answer"].startswith("Окно на 30 мин с 14:00 до 16:00 есть."), reply["answer"]
+    assert "15:30–16:00" in reply["answer"]
+
+
+async def test_a_voice_message_is_kept_and_shown_as_audio(client, user, monkeypatch):
+    headers, _ = user
+    fake_transcription(monkeypatch, "купить хлеб завтра в 18:00")
+    recording = b"\x1aE\xdf\xa3 voice"
+    response = await client.post(
+        "/api/assistant/chat/voice", files={"audio": ("voice.webm", recording, "audio/webm")}, data={"duration": "3.4"}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    # The assistant answered what was said
+    assert response.json()["kind"] == "proposal"
+
+    sent = await last_sent(client, headers)
+    assert sent["reply"]["kind"] == "voice" and sent["reply"]["voice"]["duration"] == 3.4
+    assert sent["reply"]["transcript"] == "купить хлеб завтра в 18:00" and sent["text"] == "купить хлеб завтра в 18:00"
+    voice_id = sent["reply"]["voice"]["id"]
+
+    played = await client.get(f"/api/assistant/voice/{voice_id}", headers=headers)
+    assert played.status_code == 200 and played.content == recording and played.headers["content-type"] == "audio/webm"
+
+    # Clearing the chat deletes the recording (a fresh one waits FRESH_SECONDS; the test does not)
+    monkeypatch.setattr(kept_files, "FRESH_SECONDS", 0)
+    await client.delete("/api/assistant/history", headers=headers)
+    assert (await client.get(f"/api/assistant/voice/{voice_id}", headers=headers)).status_code == 404
+
+
+# Said to the rule-based assistant, which answers without the model (small talk would need it)
+SAID = "купить хлеб завтра в 18:00"
+
+
+async def test_someone_elses_voice_message_is_not_served(client, user, monkeypatch):
+    headers, _ = user
+    fake_transcription(monkeypatch, SAID)
+    await client.post("/api/assistant/chat/voice", files={"audio": ("voice.webm", b"x", "audio/webm")}, headers=headers)
+    voice_id = (await last_sent(client, headers))["reply"]["voice"]["id"]
+    other = await client.post(
+        "/auth/register",
+        json={"email": f"other-{voice_id[:10]}@example.com", "password": "password-123", "name": "Другой", "timezone": "Europe/Moscow"},
+    )
+    other_headers = {"Authorization": f"Bearer {other.json()['access_token']}"}
+    assert (await client.get(f"/api/assistant/voice/{voice_id}", headers=other_headers)).status_code == 404
+
+
+async def test_speech_that_is_not_made_out_is_said_in_words(client, user, monkeypatch):
+    headers, _ = user
+    fake_transcription(monkeypatch, "  ")
+    response = await client.post("/api/assistant/chat/voice", files={"audio": ("voice.webm", b"x", "audio/webm")}, headers=headers)
+    assert response.status_code == 422 and "речь" in response.json()["detail"]
+
+
+async def claim(client, notification_id: int) -> dict:
+    """The bot's side: the reminder is due and the bot claims it."""
+    async with session_factory() as session:
+        due = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await session.execute(update(Notification).where(Notification.id == notification_id).values(scheduled_for=due))
+        await session.commit()
+    claimed = (await client.post("/internal/bot/notifications/claim", json={"limit": 50}, headers=BOT_HEADERS)).json()
+    return next(item for item in claimed if item["id"] == notification_id)
+
+
+def record_offered(monkeypatch) -> list[set[str]]:
+    """The actions the agent offers the model for each message."""
+    seen: list[set[str]] = []
+    original = agent_service.offered
+
+    def spy(*args, **kwargs):
+        seen.append(original(*args, **kwargs))
+        return seen[-1]
+
+    monkeypatch.setattr(agent_service, "offered", spy)
+    return seen
+
+
+async def test_send_this_file_at_nine_brings_the_file(client, user, agent, monkeypatch):
+    headers, _ = user
+    offered_actions = record_offered(monkeypatch)
+    agent([act(op("remind", text="", at="в 21:00"))])
+    response = await client.post(
+        "/api/assistant/chat/file", files={"file": CSV}, data={"text": "Пришли мне этот файл в Telegram в 21:00"}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["kind"] == "reminder", reply
+    # "remind" was offered to the model for "пришли этот файл" with no "напомни" in it
+    assert "remind" in offered_actions[0]
+    reminder = reply["reminders"][0]
+    assert reminder["file"] == "отчёт.csv" and reminder["label"].endswith("21:00")
+
+    item = await claim(client, reminder["id"])
+    assert item["payload"]["file"]["name"] == "отчёт.csv"
+    file = await client.get(f"/internal/bot/notifications/{reminder['id']}/file", headers=BOT_HEADERS)
+    assert file.status_code == 200 and file.content == CSV[1]
+
+    # Sent: the file is not kept any longer
+    await client.post(f"/internal/bot/notifications/{reminder['id']}/ack", json={"ok": True}, headers=BOT_HEADERS)
+    assert (await client.get(f"/internal/bot/notifications/{reminder['id']}/file", headers=BOT_HEADERS)).status_code == 404
+
+
+async def test_the_file_reminder_works_without_the_model(client, user):
+    """The rule-based assistant (the model is down or off) sets the same reminder with the file."""
+    headers, _ = user
+    response = await client.post("/api/assistant/chat/file", files={"file": CSV}, data={"text": "пришли этот файл в 21:00"}, headers=headers)
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["kind"] == "reminder", reply
+    reminder = reply["reminders"][0]
+    assert reminder["file"] == "отчёт.csv" and reminder["label"].endswith("21:00")
+
+    # Cancelled: the file goes too
+    cancelled = await client.delete(f"/api/assistant/reminders/{reminder['id']}", headers=headers)
+    assert cancelled.status_code == 200, cancelled.text
+    assert (await client.get(f"/internal/bot/notifications/{reminder['id']}/file", headers=BOT_HEADERS)).status_code == 404
+
+
+async def test_a_file_without_send_words_sets_no_reminder(client, user, agent, monkeypatch):
+    headers, _ = user
+    offered_actions = record_offered(monkeypatch)
+    agent(["Вижу в файле: сдать отчёт завтра."])
+    response = await client.post("/api/assistant/chat/file", files={"file": CSV}, data={"text": "что тут?"}, headers=headers)
+    assert response.status_code == 200 and response.json()["kind"] != "reminder"
+    assert "remind" not in offered_actions[0]
+
+
+async def test_deleting_the_account_deletes_kept_files(client, user, monkeypatch):
+    headers, _ = user
+    fake_transcription(monkeypatch, SAID)
+    await client.post("/api/assistant/chat/voice", files={"audio": ("voice.webm", b"x", "audio/webm")}, headers=headers)
+    user_id = (await client.get("/api/me", headers=headers)).json()["id"]
+    assert any(kept_files.folder(kept_files.VOICE, user_id).iterdir())
+    assert (await client.delete("/api/me", headers=headers)).status_code == 204
+    assert not kept_files.folder(kept_files.VOICE, user_id).exists()

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
-from app.models.models import Priority, Provider
+from app.models.models import Priority, Provider, plain_priority
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MAX_PROFILE_CHARS = 20_000
@@ -160,6 +160,11 @@ class EventCreate(BaseModel):
     is_fixed: bool = False
     tag_ids: list[int] = Field(default_factory=list, max_length=20)
 
+    @field_validator("priority", mode="after")
+    @classmethod
+    def two_priorities(cls, value: Priority) -> Priority:
+        return Priority(plain_priority(value))
+
 
 class EventUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=300)
@@ -176,6 +181,11 @@ class EventUpdate(BaseModel):
     tag_ids: list[int] | None = Field(default=None, max_length=20)
     # A new repeat from this occurrence on ("" or null: no longer repeats); left out: the repeat stays
     recurrence_rule: str | None = Field(default=None, max_length=300)
+
+    @field_validator("priority", mode="after")
+    @classmethod
+    def two_priorities(cls, value: Priority | None) -> Priority | None:
+        return None if value is None else Priority(plain_priority(value))
 
 
 class EventRead(EventCreate):

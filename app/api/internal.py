@@ -3,6 +3,7 @@ from datetime import date
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -272,6 +273,16 @@ async def ack(notification_id: int, payload: BotAckRequest, session: AsyncSessio
         raise HTTPException(status_code=404, detail="Notification not found")
     await reminders.acknowledge(session, notification, payload.ok, payload.error, payload.chat_unreachable)
     return {"status": notification.status}
+
+
+@router.get("/notifications/{notification_id}/file")
+async def notification_file(notification_id: int, session: AsyncSession = Depends(get_session)):
+    """The file a reminder brings ("пришли этот файл в 21:00"): the bot sends it with the reminder's text."""
+    notification = await session.get(Notification, notification_id)
+    path = reminders.reminder_file(notification) if notification else None
+    if not path:
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, filename=str(notification.payload["file"].get("name") or path.name))
 
 
 @router.post("/notifications/{notification_id}/snooze")

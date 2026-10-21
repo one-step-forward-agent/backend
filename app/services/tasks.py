@@ -9,7 +9,7 @@ from dateutil.rrule import rrulestr
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Event, Tag, User
+from app.models.models import Event, Tag, User, plain_priority
 from app.services.dates import describe_rrule, valid_rrule
 from app.services.events import default_calendar, delete_from_calendars, push_changes, push_new_events_to_google
 from app.services.integrations.service import user_timezone
@@ -206,7 +206,7 @@ async def create_tasks(
             end_at=ends,
             timezone=str(tz),
             location=str(item["location"]).strip()[:500] if item.get("location") else None,
-            priority=item.get("priority") if item.get("priority") in ("low", "medium", "high", "urgent") else "medium",
+            priority=plain_priority(item.get("priority")),
             all_day=all_day,
             reminder_minutes=reminder,
             recurrence_rule=rule,

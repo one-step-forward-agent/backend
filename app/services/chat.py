@@ -303,6 +303,8 @@ async def clear_history(session: AsyncSession, user: User) -> int:
         .values(hidden_at=datetime.now(timezone.utc))
     )
     await session.commit()
+    # Voice messages are not kept for analysis: clearing the chat deletes the recordings
+    await sweep_voice(session, user.id)
     return result.rowcount or 0
 
 
@@ -361,6 +363,24 @@ async def prune_history(session: AsyncSession, user_id: int) -> None:
                 ConversationMessage.hidden_at.is_(None),
             )
         )
+    await sweep_voice(session, user_id)
+
+
+async def sweep_voice(session: AsyncSession, user_id: int) -> None:
+    """Delete the recordings of voice messages the chat no longer shows (pruned or cleared)."""
+    from app.services import kept_files
+
+    rows = await session.scalars(
+        select(ConversationMessage).where(
+            ConversationMessage.user_id == user_id, ConversationMessage.role == "user", ConversationMessage.hidden_at.is_(None)
+        )
+    )
+    shown = {
+        str(row.reply["voice"].get("id"))
+        for row in rows
+        if isinstance(row.reply, dict) and row.reply.get("kind") == "voice" and isinstance(row.reply.get("voice"), dict)
+    }
+    kept_files.keep_only(kept_files.VOICE, user_id, shown)
 
 
 async def recent_context(session: AsyncSession, user_id: int) -> str:
@@ -535,7 +555,7 @@ def search_title(filters: dict, today: date) -> str:
 # the schedule is shown and the free time is written out, counted by the app, not by the model
 FREE_TIME_REQUEST = re.compile(
     r"свободн\w*\s+(?:время|времени|окн|час|слот|промежут|минут)|\bокн[оаы]\b|\bокошк|когда\s+(?:я\s+|у\s+меня\s+)?свобод"
-    r"|свобод(?:ен|на|ны)\b|не\s+занят|\bfree\s+(?:time|slot)",
+    r"|свобод(?:ен|на|ны)\b|не\s+занят|\b(?:free|open)\s+(?:time|slot|window)|\bslots?\b|\bam\s+i\s+free\b|\bi'?m\s+free\b",
     re.I,
 )
 # "Поставь пробежку в свободное окно": a task to create, not a question
@@ -546,6 +566,70 @@ FREE_TIME_MAX_DAYS = 7
 
 def is_free_time_question(text: str) -> bool:
     return bool(FREE_TIME_REQUEST.search(text)) and not FREE_TIME_ACTION.search(text)
+
+
+MONTH_AHEAD = r"(?!\s*(?:-?го\s+)?(?:янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec))"
+MERIDIEM = r"(утра|дня|вечера|ночи|a\.?\s?m\.?|p\.?\s?m\.?)"
+CLOCK = r"(\d{1,2})(?:[:.](\d{2}))?\s*(?:час\w*\s*)?"
+# "с 14 до 16", "с 2 до 4 дня", "между 14:00 и 16:00", "from 2 to 4 p.m.", "between 2 and 4pm"; "с 20 по 25 октября" is days
+FREE_RANGE = re.compile(
+    rf"(?:\bс|\bот|между|\bfrom|\bbetween)\s+{CLOCK}{MERIDIEM}?\s*(?:до|и|-|–|—|\band\b|\bto\b|\btill\b|\buntil\b)\s*{CLOCK}{MONTH_AHEAD}{MERIDIEM}?",
+    re.I,
+)
+FREE_AFTER = re.compile(rf"(?:после|\bafter)\s+{CLOCK}{MONTH_AHEAD}{MERIDIEM}?", re.I)
+FREE_BEFORE = re.compile(rf"(?:\bдо|\bbefore)\s+{CLOCK}{MONTH_AHEAD}{MERIDIEM}?(?!\s*\d)", re.I)
+# How long the free time has to be: "на час", "на 2 часа", "на полчаса", "30 минут", "an hour", "a 2-hour slot"
+FREE_HALF_HOUR = re.compile(r"полчаса|пол\s+часа|half\s+an\s+hour", re.I)
+FREE_HOURS = re.compile(
+    r"\bна\s+(\d+(?:[.,]5)?)\s*(?:час|ч\b)|(\d+(?:\.5)?)[\s-]*hours?\b|\b(?:на|в)\s+час\b|\bчасов\w*\s+(?:окн|слот|промежут)|\b(?:an?|one)[\s-]+hour\b",
+    re.I,
+)
+FREE_MINUTES = re.compile(r"(\d+)\s*(?:-\s*)?(?:мин\w*|minutes?|mins?\b)", re.I)
+
+
+def clock_of(hour: str, minute: str | None, meridiem: str | None, afternoon: bool) -> time | None:
+    """A time said in a question; a bare small hour ("с 2 до 4") means the afternoon, nobody asks about 2 a.m."""
+    value = int(hour)
+    mark = (meridiem or "").lower().replace(" ", "").replace(".", "")
+    if mark in ("дня", "вечера", "pm") and value < 12:
+        value += 12
+    elif mark in ("am", "утра", "ночи") and value == 12:
+        value = 0
+    elif not mark and afternoon and 1 <= value < 8:
+        value += 12
+    if value > 23 or (minute and int(minute) > 59):
+        return None
+    return time(value, int(minute or 0))
+
+
+def free_time_window(text: str) -> tuple[time | None, time | None, int | None]:
+    """The part of the day and the length a free-time question asks about: "окно на час с 14 до 16" →
+    (14:00, 16:00, 60). None where the question does not say."""
+    start = end = None
+    found = FREE_RANGE.search(text)
+    if found:
+        # "from 2 to 4 p.m.": the second mark is for both
+        mark = found.group(3) or found.group(6)
+        start = clock_of(found.group(1), found.group(2), mark, True)
+        end = clock_of(found.group(4), found.group(5), found.group(6) or mark, True)
+        if start and end and end <= start:
+            start = end = None
+    else:
+        after = FREE_AFTER.search(text)
+        before = FREE_BEFORE.search(text)
+        start = clock_of(after.group(1), after.group(2), after.group(3), True) if after else None
+        end = clock_of(before.group(1), before.group(2), before.group(3), False) if before else None
+    minutes = None
+    if FREE_HALF_HOUR.search(text):
+        minutes = 30
+    elif hours := FREE_HOURS.search(text):
+        number = hours.group(1) or hours.group(2)
+        minutes = int(float(number.replace(",", ".")) * 60) if number else 60
+    elif counted := FREE_MINUTES.search(text):
+        minutes = int(counted.group(1))
+    if minutes is not None and not 5 <= minutes <= 12 * 60:
+        minutes = None
+    return start, end, minutes
 
 
 def free_span(profile: dict, day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
@@ -566,8 +650,10 @@ def hours_text(minutes: int) -> str:
     return f"{hours} {hour} {rest} {minute}" if rest else f"{hours} {hour}"
 
 
-async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first: date, last: date) -> str:
-    """The free windows of each day, written out: "Понедельник, 20 октября — свободно: 08:00–10:00, 11:00–21:00 (12 ч)"."""
+async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first: date, last: date, question: str = "") -> str:
+    """The free windows of each day, written out: "Понедельник, 20 октября — свободно: 08:00–10:00, 11:00–21:00 (12 ч)".
+    A question that names a part of the day or a length ("окно на час с 14 до 16") is answered about just that,
+    with the days that have it said first."""
     from app.services import insights
 
     now = datetime.now(tz)
@@ -577,22 +663,37 @@ async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first:
         session, user, datetime.combine(first, time.min, tz), datetime.combine(last + timedelta(days=1), time.min, tz), limit=3000
     )
     profile = user.profile or {}
-    lines = []
+    asked_start, asked_end, asked_minutes = free_time_window(question)
+    asked = asked_start is not None or asked_end is not None or asked_minutes is not None
+    minimum = asked_minutes or FREE_MIN_MINUTES
+    lines, fitting = [], []
     for offset in range((last - first).days + 1):
         day = first + timedelta(days=offset)
         begin, end = free_span(profile, day, tz)
+        if asked_start is not None:
+            begin = datetime.combine(day, asked_start, tz)
+        if asked_end is not None:
+            end = datetime.combine(day, asked_end, tz)
         begin = max(begin, now)
         label = short_day(day)
         label = label[:1].upper() + label[1:]
-        if begin >= end:
-            lines.append(tr(f"{label} — день уже закончился.", f"{label} — the day is already over."))
+        if begin >= end or (end - begin).total_seconds() < minimum * 60:
+            past = tr("это время уже прошло", "that time has already passed") if asked_start or asked_end else tr("день уже закончился", "the day is already over")
+            lines.append(f"{label} — {past}.")
             continue
         timed = [event for event in events if not event.all_day and event.start_at < end and event.end_at > begin]
         untimed = [event for event in events if event.all_day and event.start_at.astimezone(tz).date() <= day < event.end_at.astimezone(tz).date()]
-        windows = insights.free_windows(timed, begin, end, minimum=FREE_MIN_MINUTES)
+        windows = insights.free_windows(timed, begin, end, minimum=minimum)
         total = sum(int((finish - start).total_seconds() // 60) for start, finish in windows)
         # Window edges taken from tasks come from the database in UTC
         spans = ", ".join(f"{start.astimezone(tz):%H:%M}–{finish.astimezone(tz):%H:%M}" for start, finish in windows)
+        if asked:
+            if windows:
+                fitting.append(day)
+                lines.append(tr(f"{label} — есть: {spans}.", f"{label} — yes: {spans}."))
+            else:
+                lines.append(tr(f"{label} — нет, занято.", f"{label} — no, it's taken."))
+            continue
         if not timed:
             text = tr(f"{label} — свободно весь день: {spans} ({hours_text(total)})", f"{label} — free all day: {spans} ({hours_text(total)})")
         elif windows:
@@ -606,7 +707,27 @@ async def free_time_text(session: AsyncSession, user: User, tz: ZoneInfo, first:
                 f". Also {count} {'task' if count == 1 else 'tasks'} without a time — they can go into these windows",
             )
         lines.append(text + ".")
+    if asked:
+        lines.insert(0, free_time_summary(fitting, asked_start, asked_end, asked_minutes, first == last))
     return "\n".join(lines)
+
+
+def free_time_summary(days: list[date], start: time | None, end: time | None, minutes: int | None, one_day: bool) -> str:
+    """The answer itself, before the days: "Окно на 1 ч с 14:00 до 16:00 есть: в среду, в четверг и в пятницу"."""
+    what = tr("Окно", "A free slot") + (f" {tr('на', 'of')} {hours_text(minutes)}" if minutes else "")
+    if start and end:
+        what += tr(f" с {start:%H:%M} до {end:%H:%M}", f" from {start:%H:%M} to {end:%H:%M}")
+    elif start:
+        what += tr(f" после {start:%H:%M}", f" after {start:%H:%M}")
+    elif end:
+        what += tr(f" до {end:%H:%M}", f" before {end:%H:%M}")
+    if not days:
+        return f"{what} " + (tr("в этот день нет.", "isn't there that day.") if one_day else tr("нет ни в один из этих дней.", "isn't there on any of these days."))
+    if one_day:
+        return f"{what} " + tr("есть.", "is there.")
+    names = [short_day(day).split(",")[0] for day in days]
+    listed = ", ".join(names[:-1]) + tr(" и ", " and ") + names[-1] if len(names) > 1 else names[0]
+    return f"{what} " + tr(f"есть: {listed}.", f"is there: {listed}.")
 
 
 def free_time_period(text: str, tz: ZoneInfo) -> tuple[date, date]:
@@ -631,7 +752,7 @@ async def free_time_reply(session: AsyncSession, user: User, text: str, tz: Zone
         "title": search_title(filters, today),
         "date": first.isoformat() if first == last else None,
         "days": group_by_day(events, tz, today),
-        "answer": await free_time_text(session, user, tz, first, last),
+        "answer": await free_time_text(session, user, tz, first, last, text),
     }
 
 
@@ -1784,13 +1905,17 @@ def simple_task(text: str, now: datetime) -> list[dict]:
     return local_items(text, now)
 
 
-async def handle_message(session: AsyncSession, user: User, text: str, attachment=None) -> dict:
+async def handle_message(session: AsyncSession, user: User, text: str, attachment=None, voice: dict | None = None) -> dict:
     """One message of the chat (the site's and Telegram's are the same). `attachment`: a file read by
-    app.services.attachments; the chat shows its name with the caption, the assistant reads its text."""
+    app.services.attachments; the chat shows its name with the caption, the assistant reads its text.
+    `voice`: a recorded voice message ({"id", "duration"} of kept_files) — the chat shows it as audio, `text` is
+    what was said and is all the assistant reads."""
     usage.current_user_id.set(user.id)
     tz = tasks.local_tz(user)
     caption = text.strip()[:50000]
     shown = {"kind": "file", "caption": caption, "file": attachment.meta()} if attachment else None
+    if voice:
+        shown = {"kind": "voice", "voice": voice, "transcript": caption}
     if attachment:
         from app.services.attachments import message_text
 
@@ -1799,7 +1924,7 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
         text = caption
     await prune_history(session, user.id)
     try:
-        reply = await route(session, user, text, tz)
+        reply = await route(session, user, text, tz, attachment)
     except AssistantUnavailable:
         if not settings.llm_enabled:
             raise
@@ -1813,8 +1938,9 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     return {**reply, "message_id": message.id}
 
 
-async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
-    """Recognized actions run here and never depend on what the model writes about them."""
+async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict:
+    """Recognized actions run here and never depend on what the model writes about them. `attachment`: the file
+    sent with the message, which a reminder set in it delivers ("пришли этот файл в 21:00")."""
     draft = await pending_edit(session, user)
     if draft:
         reply = await apply_edit_text(session, user, draft, text, tz)
@@ -1823,17 +1949,23 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> d
     name = command(text)
     if name:
         return await run_command(session, user, name)
+    if attachment is None and is_free_time_question(text):
+        # "В какие дни на этой неделе есть окно с 14 до 16?": counted by the app, so the model is not waited for.
+        # Only when the days are clear from the words; a follow-up ("а во вторник?") goes to the agent for context
+        filters = local_filters(text, tz)
+        if filters and filters.get("date_from"):
+            return await free_time_reply(session, user, text, tz)
     if settings.assistant_agent and settings.llm_enabled:
         from app.services import agent
 
         try:
-            return await agent.run(session, user, text, tz)
+            return await agent.run(session, user, text, tz, attachment)
         except agent.AgentFailed:
             # GigaChat is unreachable before anything was done: the rules below still handle the usual requests
             pass
     from app.services import agent as reminder_rules
 
-    reminder = await reminder_rules.reminder_by_rules(session, user, text, tz)
+    reminder = await reminder_rules.reminder_by_rules(session, user, text, tz, attachment)
     if reminder is not None:
         return reminder
     # Only the rules' model requests read the conversation as text; the agent reads it itself

@@ -429,9 +429,12 @@ async def test_meetings_of_a_day_are_shifted_by_an_hour(client, user, agent):
     times = {item["event_id"]: item["time"] for item in reply["events"]}
     assert times == {morning: "11:00", evening: "19:00"} and other not in times
 
-    # Only the evening ones: a time of day narrows the tasks down
-    agent([act(op("change", filter={"date_from": day, "time_from": "17:00", "all": True}, to_date="в пятницу"))])
-    reply = await say(client, headers, "перенеси вечерние задачи послезавтра на пятницу")
+    # Only the evening ones: a time of day narrows the tasks down. The day moved to differs from theirs
+    # (run on a Wednesday, "послезавтра" is Friday itself and there would be nothing to move)
+    friday = (datetime.now(TZ).date() + timedelta(days=2)).weekday() == 4
+    target, said = ("в субботу", "на субботу") if friday else ("в пятницу", "на пятницу")
+    agent([act(op("change", filter={"date_from": day, "time_from": "17:00", "all": True}, to_date=target))])
+    reply = await say(client, headers, f"перенеси вечерние задачи послезавтра {said}")
     assert [item["event_id"] for item in reply["events"]] == [evening]
 
 

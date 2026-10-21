@@ -345,12 +345,16 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
         if not user.telegram_chat_id:
             notification.status = NotificationStatus.FAILED
             notification.error = "Telegram is not linked"
+            await session.flush()
+            await release_file(session, notification)
             continue
         repeating = notification.kind == CUSTOM_KIND and is_repeating(notification.payload)
         if notification.expires_at and notification.expires_at <= now:
             notification.status = NotificationStatus.EXPIRED
             if repeating:
                 await queue_next(session, notification, user, now)
+            await session.flush()
+            await release_file(session, notification)
             continue
         local_time = now.astimezone(ZoneInfo(user_timezone(user))).time()
         # A test and a reminder the user asked for at a set time are sent even in quiet hours
@@ -396,6 +400,8 @@ async def acknowledge(session: AsyncSession, notification: Notification, ok: boo
             if user:
                 user.telegram_chat_id = None
                 user.telegram_username = None
+    await session.flush()
+    await release_file(session, notification)
     await session.commit()
 
 
@@ -588,6 +594,8 @@ def custom_view(notification: Notification, tz: ZoneInfo) -> dict:
         # For the edit form of the reminders screen
         "repeat_kind": payload.get("repeat") if payload.get("repeat") in REPEATS else None,
         "every_minutes": payload.get("every"),
+        # The file the bot sends with it ("пришли этот файл в 21:00")
+        "file": (payload.get("file") or {}).get("name"),
     }
 
 
@@ -647,6 +655,42 @@ async def create_custom(
     return notification
 
 
+def attach_file(notification: Notification, user: User, attachment) -> None:
+    """"Пришли этот файл в 21:00": the file is kept (kept_files) and the bot sends it with the reminder. A repeating
+    reminder passes it on to the next one (queue_next copies the payload)."""
+    from app.services import kept_files
+
+    file_id = kept_files.save(kept_files.REMINDER, user.id, attachment.data, attachment.suffix)
+    notification.payload = {**(notification.payload or {}), "file": {"id": file_id, "name": attachment.name, "size": attachment.size}}
+
+
+def reminder_file(notification: Notification):
+    """The path of the file a reminder brings, or None."""
+    from app.services import kept_files
+
+    meta = (notification.payload or {}).get("file")
+    return kept_files.find(kept_files.REMINDER, notification.user_id, str(meta.get("id"))) if isinstance(meta, dict) else None
+
+
+async def release_file(session: AsyncSession, notification: Notification) -> None:
+    """The reminder is sent, missed or cancelled: its file goes unless a reminder still to come brings it."""
+    from app.services import kept_files
+
+    meta = (notification.payload or {}).get("file")
+    if not isinstance(meta, dict) or notification.status in (NotificationStatus.PENDING, NotificationStatus.SENDING):
+        return
+    waiting = await session.scalars(
+        select(Notification).where(
+            Notification.user_id == notification.user_id,
+            Notification.kind == CUSTOM_KIND,
+            Notification.id != notification.id,
+            Notification.status.in_((NotificationStatus.PENDING, NotificationStatus.SENDING)),
+        )
+    )
+    if not any(((other.payload or {}).get("file") or {}).get("id") == meta.get("id") for other in waiting):
+        kept_files.remove(kept_files.REMINDER, notification.user_id, str(meta.get("id")))
+
+
 async def pending_custom(session: AsyncSession, user: User) -> list[Notification]:
     return list(
         await session.scalars(
@@ -679,4 +723,5 @@ async def cancel_custom(session: AsyncSession, user: User, notification_id: int)
         return None
     notification.status = NotificationStatus.CANCELLED
     await session.flush()
+    await release_file(session, notification)
     return notification

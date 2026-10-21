@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import lang, ratelimit
 from app.core.config import settings
-from app.models.models import Event, RecommendationCache, Tag, User
+from app.models.models import Event, RecommendationCache, Tag, User, plain_priority
 from app.services import dates, tasks, usage
 from app.services.ru import MONTHS, MONTHS_NOMINATIVE, WEEKDAYS_SHORT, plural
 
@@ -91,8 +91,8 @@ def load_minutes(events: list[Event], now: datetime) -> int:
 
 
 def suggest_moves(remaining: list[Event], overloaded_by: int) -> list[Event]:
-    """Tasks that are easiest to move: untimed first, then lower priority, then later ones; urgent and fixed ones stay."""
-    movable = [event for event in remaining if event.priority != "urgent" and not event.series_id and not tasks.is_fixed(event)]
+    """Tasks that are easiest to move: untimed first, then later ones; high-priority and fixed ones stay."""
+    movable = [event for event in remaining if plain_priority(event.priority) != "high" and not event.series_id and not tasks.is_fixed(event)]
     movable.sort(key=lambda event: (not event.all_day, PRIORITY_RANK.get(event.priority, 1), -event.start_at.timestamp()))
     chosen, freed = [], 0
     for event in movable:

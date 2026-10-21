@@ -16,6 +16,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -108,7 +109,8 @@ ACTIONS = {
     "delete": "удалить задачи",
     "complete": "отметить задачи выполненными",
     "reopen": "вернуть выполненные задачи в невыполненные",
-    "remind": "поставить напоминание в Telegram, только когда просят «напомни»: text и in_minutes или at, repeat, every_minutes",
+    "remind": "поставить напоминание в Telegram, только когда просят «напомни» или прислать приложенный файл к сроку "
+    "(«пришли этот файл в 21:00» — файл придёт вместе с напоминанием): text и in_minutes или at, repeat, every_minutes",
     "reminders": "показать активные напоминания",
     "cancel_reminder": "отменить напоминание: reminder_id из блока «Напоминания»",
     "analyze": "анализ загрузки, советы, «что перенести», «как всё успеть», «разгрузи»: period",
@@ -166,19 +168,31 @@ ADVICE_REQUEST = re.compile(
 )
 TIMED_HINT = re.compile(r"врем|весь\s+день|целый\s+день|встреч|созвон", re.I)
 REMINDER_WORDS = re.compile(r"напомн|напомин|будильник", re.I)
+# "Пришли мне этот файл в Telegram в 21:00" with a file attached: a reminder that brings the file
+SEND_WORDS = re.compile(r"пришл|присла|отправ|скин|перешл|\bsend\b|\bremind", re.I)
 # The model's repeat is taken only when the user said something about it
 REPEAT_HINT = re.compile(r"кажд|ежедн|еженед|ежемес|ежечас|регулярн|повтор|по\s+будн|по\s+утрам|по\s+вечерам", re.I)
 DELETE_WORDS = re.compile(r"удал|сотр|стер|очист|почист|убер|убра|отмен|не\s+нужн|больше\s+не", re.I)
 REOPEN_WORDS = re.compile(r"верни|вернуть|не\s+(?:сделал|выполнил|закончил)|сними\s+отметк|сними\s+галочк|сними\s+выполн|сними\s+«выполн", re.I)
 
 
-def offered(text: str, history: str) -> set[str]:
+def own_words(text: str) -> str:
+    """The user's words of a message with a file (attachments.message_text): without the file's text."""
+    return "" if text.startswith("📎") else text.split("\n\n📎", 1)[0]
+
+
+def sends_file(text: str, attached: bool) -> bool:
+    return attached and bool(SEND_WORDS.search(own_words(text)))
+
+
+def offered(text: str, history: str, attached: bool = False) -> set[str]:
     """The actions a message may need. A small model confuses look-alike actions, so a reminder or a deletion
     is offered only when the message (or, for a follow-up, the previous one) speaks about it; this also keeps
-    a misread request from deleting anything."""
+    a misread request from deleting anything. `attached`: the message has a file, which "пришли его в 21:00"
+    asks to bring with a reminder."""
     names = set(ACTIONS)
     context = f"{text}\n{history}"
-    if not REMINDER_WORDS.search(context):
+    if not REMINDER_WORDS.search(context) and not sends_file(text, attached):
         names -= {"remind", "reminders", "cancel_reminder"}
     if not DELETE_WORDS.search(context):
         names -= {"delete"}
@@ -232,6 +246,8 @@ class Turn:
     tz: ZoneInfo
     now: datetime
     text: str
+    # The file sent with the message (attachments.Attachment): a reminder set in this turn brings it
+    attachment: Any = None
     # New tasks and changes of existing ones: one draft the user confirms
     items: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -838,10 +854,15 @@ def named_weekday(text: str) -> int | None:
 
 async def create_reminder(turn: Turn, args: dict) -> dict:
     text = args.get("text") if isinstance(args.get("text"), str) else ""
-    repeat, every = repeat_of(turn.text)
+    attachment = turn.attachment if turn.attachment is not None and turn.attachment.data else None
+    if attachment and not text.strip():
+        text = attachment.name
+    # The repeat comes from what the user said, never from the text of an attached file
+    said = own_words(turn.text) if attachment else turn.text
+    repeat, every = repeat_of(said)
     if repeat is None and every is None:
         repeat = args.get("repeat") if args.get("repeat") in reminders.REPEATS else None
-        every = as_int(args.get("every_minutes")) if repeat is None and REPEAT_HINT.search(turn.text) else None
+        every = as_int(args.get("every_minutes")) if repeat is None and REPEAT_HINT.search(said) else None
     minutes = as_int(args.get("in_minutes"))
     if minutes is not None and minutes > 0:
         moment = datetime.now(turn.tz) + timedelta(minutes=minutes)
@@ -852,23 +873,25 @@ async def create_reminder(turn: Turn, args: dict) -> dict:
         moment = datetime.now(turn.tz) + timedelta(minutes=every)
     if moment is None:
         return {"error": "Не указано, когда напомнить: передай in_minutes или at (YYYY-MM-DDTHH:MM)."}
-    weekday = named_weekday(turn.text) if repeat == "weekly" else None
+    weekday = named_weekday(said) if repeat == "weekly" else None
     if weekday is not None and moment.weekday() != weekday:
         # "каждую пятницу в 18:00": the first one is on the nearest Friday
         moment += timedelta(days=(weekday - moment.weekday()) % 7)
         if moment <= datetime.now(turn.tz):
             moment += timedelta(days=7)
     try:
-        text = reminders.with_links(text, turn.text)
+        text = reminders.with_links(text, said)
         notification = await reminders.create_custom(turn.session, turn.user, text, moment.astimezone(timezone.utc), repeat, every)
     except reminders.ReminderError as error:
         if "Telegram" in str(error):
             turn.blocked = tr(NO_TELEGRAM, NO_TELEGRAM_EN)
         return {"error": str(error)}
+    if attachment:
+        reminders.attach_file(notification, turn.user, attachment)
     view = reminders.custom_view(notification, turn.tz)
     turn.reminders.append(view)
     return {
-        "status": "Напоминание поставлено, бот пришлёт его в Telegram.",
+        "status": "Напоминание поставлено, бот пришлёт его в Telegram" + (" вместе с файлом." if attachment else "."),
         "reminder_id": notification.id,
         "text": view["text"],
         "when": view["label"],
@@ -888,15 +911,30 @@ REMINDER_VERB = re.compile(r"(?:поставь(?:те)?\s+)?(?:напомни(?:
 WHAT_LEAD = re.compile(r"^(?:о|об|про|что|чтобы|что\s+надо|что\s+нужно)\s+", re.I)
 
 
-async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict | None:
+SEND_FILE_VERB = re.compile(
+    r"(?:пришли(?:те)?|присылай(?:те)?|отправь(?:те)?|скинь(?:те)?|перешли(?:те)?)(?:\s+(?:мне|нам))?"
+    r"(?:\s+(?:это?т?|эту|его|её|ее|файл|документ|фото|в\s+телеграм\w*|в\s+telegram|в\s+тг))*",
+    re.I,
+)
+
+
+async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict | None:
     """"напомни …" / "напоминай …" set without the model: when it is down or answered without calling create_reminder.
-    The time, the repeat and what to remind of come from the user's words."""
-    if not REMINDER_VERB.search(text) or re.search(r"напоминани[яей]\b.*\?|какие\s+у\s+меня|отмени", text, re.I):
+    The time, the repeat and what to remind of come from the user's words. With a file, "пришли этот файл в 21:00"
+    is such a reminder too, and the file comes with it."""
+    full = text
+    if attachment is not None:
+        text = own_words(text)
+    sending = attachment is not None and bool(SEND_FILE_VERB.search(text))
+    if not (REMINDER_VERB.search(text) or sending) or re.search(r"напоминани[яей]\b.*\?|какие\s+у\s+меня|отмени", text, re.I):
         return None
     now = datetime.now(tz)
     parsed = dates.parse(text, now)
+    if sending and not parsed.time and not REMINDER_VERB.search(text):
+        # "Пришли файл" without a time is not a reminder
+        return None
     what = dates.strip_spans(text, parsed.spans)
-    for pattern in (REMINDER_VERB, EVERY_PERIOD, *(words for _, words in REPEAT_WORDS)):
+    for pattern in (REMINDER_VERB, SEND_FILE_VERB, EVERY_PERIOD, *(words for _, words in REPEAT_WORDS)):
         what = pattern.sub(" ", what)
     what = re.sub(r"\b(?:в|во|на|к|до)\s*$|^\s*(?:в|во|на|к)\s+", " ", " ".join(what.split())).strip(" ,.:;!-—")
     what = WHAT_LEAD.sub("", what).strip(" ,.:;!-—")
@@ -906,7 +944,7 @@ async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
         if parsed.date is None and moment <= now:
             moment += timedelta(days=1)
         args["at"] = moment.strftime("%Y-%m-%dT%H:%M")
-    turn = Turn(session=session, user=user, tz=tz, now=now, text=text)
+    turn = Turn(session=session, user=user, tz=tz, now=now, text=full, attachment=attachment)
     result = await create_reminder(turn, args)
     if result.get("error"):
         problem = result["error"]
@@ -1308,15 +1346,16 @@ async def history_messages(turn: Turn) -> list[dict]:
 # ---------- the loop ----------
 
 
-async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
-    """Answer one message: the model calls functions until it writes the answer; the reply shows what was done."""
+async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict:
+    """Answer one message: the model calls functions until it writes the answer; the reply shows what was done.
+    `attachment`: the file sent with the message (a reminder set in it brings the file)."""
     from services.gigachat import GigaChatClient
 
-    turn = Turn(session=session, user=user, tz=tz, now=datetime.now(tz), text=text)
+    turn = Turn(session=session, user=user, tz=tz, now=datetime.now(tz), text=text, attachment=attachment)
     messages = [{"role": "system", "content": await system_prompt(turn)}, *await history_messages(turn), {"role": "user", "content": text[:8000]}]
     client = GigaChatClient()
     previous = next((message["content"] for message in reversed(messages[1:-1]) if message["role"] == "user"), "")
-    turn.allowed = offered(text, previous)
+    turn.allowed = offered(text, previous, attachment is not None)
     turn.free_time = chat.is_free_time_question(text) or (
         len(text) <= FOLLOW_UP_LIMIT and chat.is_free_time_question(previous) and not chat.FREE_TIME_ACTION.search(text)
     )
@@ -1381,7 +1420,8 @@ async def by_rules(turn: Turn) -> dict | None:
     with words instead of a function call: the rule-based handler does what was asked."""
     session, user, text, tz = turn.session, turn.user, turn.text, turn.tz
     reply = None
-    if not turn.reminders and not turn.cancelled and REMINDER_WORDS.search(text) and (reminder := await reminder_by_rules(session, user, text, tz)):
+    wants_reminder = REMINDER_WORDS.search(own_words(text) if turn.attachment else text) or sends_file(text, turn.attachment is not None)
+    if not turn.reminders and not turn.cancelled and wants_reminder and (reminder := await reminder_by_rules(session, user, text, tz, turn.attachment)):
         # "напомни …" the model answered with words: the reminder is set all the same
         return reminder if reminder.get("kind") == "reminder" else None
     if chat.is_delete_request(text):

@@ -19,10 +19,18 @@ class Provider(StrEnum):
 
 
 class Priority(StrEnum):
+    """Tasks have two priorities, regular (medium) and high. "low" and "urgent" are still accepted from older
+    clients and the model and are stored as medium and high (see plain_priority)."""
+
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
     URGENT = "urgent"
+
+
+def plain_priority(value) -> str:
+    """One of the two priorities: "high" and "urgent" are high, everything else is regular."""
+    return Priority.HIGH if str(value or "") in (Priority.HIGH, Priority.URGENT) else Priority.MEDIUM
 
 
 class SyncStatus(StrEnum):
