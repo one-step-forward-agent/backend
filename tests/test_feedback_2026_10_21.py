@@ -325,6 +325,26 @@ async def test_any_file_is_sent_back_when_asked(client, user, said):
     assert file.status_code == 200 and file.content == ARCHIVE[1]
 
 
+@pytest.mark.parametrize(
+    "said, title",
+    [
+        ("отправь мне эту фотку через минуту", "Файл «photos.zip»"),
+        ("пришли этот архив в 21:00", "Файл «photos.zip»"),
+        ("пришли этот файл в 21:00 — договор для Анны", "Договор для Анны"),
+    ],
+)
+async def test_the_answer_says_the_file_is_coming(client, user, said, title):
+    """The 2026-10-21 screenshot: "отправь мне эту фотку через минуту" was set as "У фотку", and the answer did not
+    say the photo would come."""
+    headers, _ = user
+    response = await client.post("/api/assistant/chat/file", files={"file": ARCHIVE}, data={"text": said}, headers=headers)
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["kind"] == "reminder", reply
+    assert reply["reminders"][0]["text"] == title
+    assert reply["text"].startswith("Пришлю ") and "файл «photos.zip»" in reply["text"]
+
+
 async def test_a_file_that_cannot_be_read_and_is_not_to_be_sent_is_said_in_words(client, user):
     headers, _ = user
     response = await client.post("/api/assistant/chat/file", files={"file": ARCHIVE}, data={"text": "что тут?"}, headers=headers)

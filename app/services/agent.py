@@ -912,7 +912,8 @@ WHAT_LEAD = re.compile(r"^(?:о|об|про|что|чтобы|что\s+надо|
 
 
 FILE_WORDS = (
-    r"(?:это?т?|эту|его|её|ее|файл\w*|документ\w*|фото\w*|картинк\w*|скрин\w*|видео|архив|в\s+телеграм\w*|в\s+telegram|в\s+тг|в\s+tg"
+    r"(?:(?:этот|это|эта|эту|эти|этих|его|её|ее|файл\w*|документ\w*|фото\w*|фотк\w*|фотограф\w*|снимок|снимк\w*|картин\w*"
+    r"|изображени\w*|скрин\w*|видео|архив\w*)(?![\w-])|в\s+телеграм\w*|в\s+telegram|в\s+тг\b|в\s+tg\b"
     r"|\bthis\b|\bthat\b|\bit\b|\bthe\b|\bfiles?\b|\bdocument\b|\bphoto\b|\bpicture\b|to\s+telegram)"
 )
 SEND_FILE_VERB = re.compile(
@@ -944,6 +945,9 @@ async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
         what = pattern.sub(" ", what)
     what = re.sub(r"\b(?:в|во|на|к|до)\s*$|^\s*(?:в|во|на|к)\s+", " ", " ".join(what.split())).strip(" ,.:;!-—")
     what = WHAT_LEAD.sub("", what).strip(" ,.:;!-—")
+    if sending and not re.search(r"\w{3}", re.sub(rf"\b{FILE_WORDS}", " ", what, flags=re.I)):
+        # "отправь мне эту фотку через минуту": nothing is left but the file, so the reminder is named after it
+        what = tr(f"Файл «{attachment.name}»", f"File “{attachment.name}”")
     args: dict = {"text": what}
     if parsed.time:
         moment = datetime.combine(parsed.date or now.date(), parsed.time, tz)
@@ -1512,6 +1516,13 @@ async def finish(turn: Turn, answer: str | None) -> dict:
     return {"kind": "nothing"}
 
 
+def file_sent_line(item: dict) -> str:
+    """"Пришли эту фотку через минуту": the answer says the file is coming, not only what it is called."""
+    name = item["file"]
+    about = "" if name in item["text"] else f" — {item['text']}"
+    return tr(f"Пришлю {item['label']} в Telegram файл «{name}»{about} 📎", f"I'll send “{name}” to Telegram {item['label']}{about} 📎")
+
+
 def done_lines(turn: Turn) -> list[str]:
     """What this turn did at once, said by the app: marked done, reopened, reminders set and cancelled."""
     lines = []
@@ -1529,16 +1540,21 @@ def done_lines(turn: Turn) -> list[str]:
     # The time is the app's: the model's wording about it may be off
     if is_en():
         lines += [
-            f"I'll remind you {item['repeat']}: {item['text']} 🔁 The first one is {item['label']}." if item.get("repeat") else f"I'll remind you {item['label']}: {item['text']} 🔔"
+            f"I'll remind you {item['repeat']}: {item['text']} 🔁 The first one is {item['label']}." if item.get("repeat")
+            else file_sent_line(item) if item.get("file")
+            else f"I'll remind you {item['label']}: {item['text']} 🔔"
             for item in turn.reminders
         ]
         lines += [f"Reminder cancelled: {item['text']}" for item in turn.cancelled]
     else:
         lines += [
-            f"Буду напоминать {item['repeat']}: {item['text']} 🔁 Первое — {item['label']}." if item.get("repeat") else f"Напомню {item['label']}: {item['text']} 🔔"
+            f"Буду напоминать {item['repeat']}: {item['text']} 🔁 Первое — {item['label']}." if item.get("repeat")
+            else file_sent_line(item) if item.get("file")
+            else f"Напомню {item['label']}: {item['text']} 🔔"
             for item in turn.reminders
         ]
         lines += [f"Напоминание отменено: {item['text']}" for item in turn.cancelled]
+    lines += [tr(f"Файл «{item['file']}» придёт вместе с напоминанием.", f"The file “{item['file']}” comes with the reminder.") for item in turn.reminders if item.get("repeat") and item.get("file")]
     if turn.changed or turn.shown is not None:
         # Part of the request worked and part did not: the user must not think it is all done
         if is_en():
