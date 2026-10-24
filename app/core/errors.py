@@ -24,7 +24,7 @@ CHECK_INPUT = "Проверьте введённые данные."
 # Names users know from the interface; any other Latin word marks a technical message
 KNOWN_WORDS = {
     "google", "calendar", "notion", "jira", "apple", "id", "icloud", "telegram", "dayla", "atlassian", "email", "pdf", "docx", "connections",
-    "word", "excel", "csv", "yandex", "samsung",
+    "word", "excel", "csv", "yandex", "samsung", "ics",
 }
 # The same on the English site (see app.core.lang): the site sends its language with every request
 ENGLISH = {

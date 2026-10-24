@@ -692,6 +692,28 @@ async def export_calendar(user: User = Depends(get_current_user), session: Async
     return Response(content=content, media_type="text/calendar", headers={"Content-Disposition": "attachment; filename=dayla.ics"})
 
 
+@router.post("/calendar/import")
+async def import_calendar_file(
+    file: UploadFile = File(...),
+    date_from: date | None = Form(default=None),
+    date_to: date | None = Form(default=None),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Events from an .ics file: all of them, or only those of date_from..date_to (a day or a month of the calendar)."""
+    from app.services import ics_import
+
+    limit_uploads(user)
+    data = await file.read(ics_import.MAX_ICS_MB * 1024 * 1024 + 1)
+    try:
+        result = await ics_import.import_ics(session, user, data, date_from, date_to)
+    except ics_import.ImportFailed as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    ids = [event.id for event in result["created"]]
+    await session.commit()
+    return {"created": len(ids), "skipped": result["skipped"], "found": result["found"], "event_ids": ids, "text": ics_import.result_text(result)}
+
+
 @router.post("/assistant/search")
 async def assistant_search(payload: AssistantMessage, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     if not settings.llm_enabled:

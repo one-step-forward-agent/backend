@@ -423,7 +423,8 @@ class BotRatingRequest(RatingRequest):
 
 
 class UndoRequest(BaseModel):
-    event_ids: list[int] = Field(min_length=1, max_length=500)
+    # An imported .ics file can add up to 2000 events at once (services.calendar.MAX_IMPORT_EVENTS)
+    event_ids: list[int] = Field(min_length=1, max_length=2000)
 
 
 class MoveToDayRequest(BaseModel):

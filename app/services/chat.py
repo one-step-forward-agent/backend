@@ -1959,6 +1959,80 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     return {**reply, "message_id": message.id}
 
 
+# "Импортируй на ноябрь", "в декабре", "events of March": a month without a day number
+MONTH_NAMES = [
+    r"январ[ьеи]", r"феврал[ьеи]", r"март[е]?", r"апрел[ьеи]", r"ма[йе]", r"июн[ьеи]",
+    r"июл[ьеи]", r"август[е]?", r"сентябр[ьеи]", r"октябр[ьеи]", r"ноябр[ьеи]", r"декабр[ьеи]",
+]
+MONTHS_EN_LOWER = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+IMPORT_SHOWN = 10
+
+
+def import_period(text: str, tz: ZoneInfo) -> tuple[date | None, date | None]:
+    """The days of an .ics file's caption: a month ("на ноябрь", "этот месяц"), a week, a day ("на завтра",
+    "25 октября") — or (None, None) for the whole file."""
+    lowered = text.lower()
+    today = datetime.now(tz).date()
+
+    def month(year: int, number: int) -> tuple[date, date]:
+        first = date(year, number, 1)
+        following = date(year + number // 12, number % 12 + 1, 1)
+        return first, following - timedelta(days=1)
+
+    if re.search(r"(?:эт\w+|текущ\w+)\s+месяц|\bthis\s+month\b", lowered):
+        return month(today.year, today.month)
+    if re.search(r"следующ\w+\s+месяц|\bnext\s+month\b", lowered):
+        return month(today.year + today.month // 12, today.month % 12 + 1)
+    year_match = re.search(r"\b(20\d\d)\b", lowered)
+    year = int(year_match.group(1)) if year_match else today.year
+    # "25 ноября" is a day, "на ноябрь" and "в ноябре" a month
+    for number, pattern in enumerate(MONTH_NAMES, start=1):
+        if re.search(rf"\b{pattern}\b", lowered) and not re.search(rf"\d\s*{pattern}\b", lowered):
+            return month(year, number)
+    for number, name in enumerate(MONTHS_EN_LOWER, start=1):
+        # "may" is a month only after "for / in / of": "you may add them" is not May
+        named = rf"\b(?:for|in|of|during)\s+{name}\b" if name == "may" else rf"\b{name}\b"
+        if re.search(named, lowered) and not re.search(rf"\d\s*(?:st|nd|rd|th)?\s*(?:of\s+)?{name}\b|\b{name}\s+\d{{1,2}}\b", lowered):
+            return month(year, number)
+    filters = local_filters(text, tz)
+    if filters and filters.get("date_from"):
+        parsed = dates.parse(text, datetime.now(tz))
+        return filters["date_from"], parsed.end_date if parsed.end_date and parsed.date == filters["date_from"] else filters["date_to"]
+    return None, None
+
+
+async def import_ics_reply(session: AsyncSession, user: User, data: bytes, caption: str, tz: ZoneInfo) -> dict:
+    """An .ics file sent to the chat: its events are added at once — the reply can undo them, like any added tasks."""
+    from app.services import ics_import
+
+    date_from, date_to = import_period(caption, tz)
+    try:
+        result = await ics_import.import_ics(session, user, data, date_from, date_to)
+    except ics_import.ImportFailed as error:
+        return {"kind": "answer", "text": str(error)}
+    created = result["created"]
+    if not created:
+        return {"kind": "answer", "text": ics_import.result_text(result)}
+    # A series is shown once, with the number of its other days
+    firsts: dict[str, Event] = {}
+    counts: dict[str, int] = {}
+    for event in created:
+        key = event.series_id or f"event-{event.id}"
+        firsts.setdefault(key, event)
+        counts[key] = counts.get(key, 0) + 1
+    shown = list(firsts.items())[:IMPORT_SHOWN]
+    hidden = len(firsts) - len(shown)
+    return {
+        "kind": "created",
+        "events": [event_view(event, tz, repeats=counts[key] - 1) for key, event in shown],
+        "event_ids": [event.id for event in created],
+        "count": len(created),
+        "answer": None,
+        # The site and the bot show the note under the tasks
+        "note": ics_import.result_text(result) + (tr(f" Здесь показаны не все: ещё {hidden} — в календаре.", f" Not all are shown here: {hidden} more are in the calendar.") if hidden else ""),
+    }
+
+
 async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict:
     """Recognized actions run here and never depend on what the model writes about them. `attachment`: the file
     sent with the message, which a reminder set in it delivers ("пришли этот файл в 21:00")."""
@@ -1973,6 +2047,9 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, atta
     if attachment is not None:
         from app.services import agent as file_rules
 
+        if attachment.suffix == ".ics" and attachment.data and not file_rules.sends_file(text, True):
+            # A calendar file is imported by the app, not read by the model: all of it, or the period named
+            return await import_ics_reply(session, user, attachment.data, file_rules.own_words(text), tz)
         if file_rules.sends_file(text, True):
             # "Отправь этот файл в телеграм в 11:40" with a file: the app sets the reminder that brings it; the model
             # made it a task named "Этот файл в Telegram". No time said — the model asks or does something else
