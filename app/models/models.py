@@ -74,6 +74,8 @@ class User(Base):
     telegram_link_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The secret of the user's calendar feed link (/api/calendar/feed/<token>.ics); a new one cuts off the old link
     calendar_feed_token: Mapped[str | None] = mapped_column(String(64), unique=True)
+    # Points, levels and badges (app.services.rewards): off hides them on the site and in the evening summary
+    rewards_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     # Onboarding answers: purpose, spheres, goals, tone of voice, work days and hours
     profile: Mapped[dict] = mapped_column(EncryptedJSON("users.profile"), default=dict, server_default="{}")
     # Calendars the assistant also adds new tasks to ("google", "yandex", ...), the last choice; NULL: never chosen

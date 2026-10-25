@@ -108,11 +108,13 @@ class UserRead(BaseModel):
     telegram_linked_at: datetime | None = None
     profile: dict = Field(default_factory=dict)
     is_admin: bool = False
+    rewards_enabled: bool = True
 
 
 class UserUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=200)
     timezone: str | None = None
+    rewards_enabled: bool | None = None
 
     @field_validator("timezone")
     @classmethod

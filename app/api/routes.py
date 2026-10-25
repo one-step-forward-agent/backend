@@ -45,7 +45,7 @@ from app.schemas import (
     UserRead,
     UserUpdate,
 )
-from app.services import chat, insights, tasks, usage
+from app.services import chat, insights, rewards, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
 from app.services.google_calendar import revoke_google_access
@@ -131,6 +131,9 @@ async def current_user(user: User = Depends(get_current_user)):
 @router.patch("/me", response_model=UserRead)
 async def update_current_user(payload: UserUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     for key, value in payload.model_dump(exclude_unset=True).items():
+        # A switch is on or off: null leaves it as it is
+        if key == "rewards_enabled" and value is None:
+            continue
         setattr(user, key, value)
     await session.commit()
     await session.refresh(user)
@@ -165,6 +168,8 @@ async def save_onboarding(payload: OnboardingProfile, user: User = Depends(get_c
     user.profile = payload.model_dump()
     if payload.timezone and not user.timezone:
         user.timezone = payload.timezone
+    # Each sphere gets its tag: tasks tagged with it count towards the sphere's badges
+    await tasks.tags_by_name(session, user, [sphere.get("name") for sphere in payload.spheres])
     await session.commit()
     await session.refresh(user)
     return user
@@ -300,6 +305,11 @@ async def move_events(payload: MoveRequest, user: User = Depends(get_current_use
 @router.get("/stats")
 async def stats(days: int = 7, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await tasks.daily_stats(session, user, min(max(days, 1), 90))
+
+
+@router.get("/rewards")
+async def rewards_progress(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return await rewards.progress(session, user)
 
 
 @router.get("/recommendations")
