@@ -19,6 +19,7 @@ from app.api.deps import ACCESS_COOKIE, REFRESH_COOKIE, get_current_user
 from app.core import ratelimit
 from app.core.config import settings
 from app.core.database import get_session
+from app.core.lang import tr
 from app.models.models import Calendar, Event, EventFile, Integration, Tag, User
 from app.schemas import (
     AssistantConfirmation,
@@ -30,6 +31,7 @@ from app.schemas import (
     ChatTopic,
     CompleteRequest,
     MoveToDayRequest,
+    QuestionAnswerRequest,
     RatingRequest,
     UndoRequest,
     DraftCalendars,
@@ -424,6 +426,24 @@ async def rate_answer(message_id: int, payload: RatingRequest, user: User = Depe
         return await chat.rate(session, user, message_id, payload.value)
     except LookupError:
         raise HTTPException(status_code=404, detail="Сообщение не найдено") from None
+
+
+@router.post("/assistant/questions/{question_id}/answer")
+async def answer_question(question_id: int, payload: QuestionAnswerRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """The answer to a hypothesis question under a chat reply: a button, the user's own words or «Пропустить»."""
+    return await save_question_answer(session, user, question_id, payload, "web")
+
+
+async def save_question_answer(session: AsyncSession, user: User, question_id: int, payload: QuestionAnswerRequest, channel: str) -> dict:
+    from app.services import research
+
+    source = "skip" if payload.skip else "option" if payload.option else "text"
+    try:
+        reply = await research.record_answer(session, user, question_id, None if payload.skip else payload.option or payload.answer, source, channel, payload.message_id)
+    except research.UnknownQuestion:
+        raise HTTPException(status_code=404, detail=tr("Вопрос не найден", "Question not found")) from None
+    await session.commit()
+    return reply
 
 
 @router.get("/assistant/history")
@@ -858,7 +878,7 @@ async def assistant_chat_file(
     return await chat_with_file(session, user, file, text)
 
 
-async def chat_with_file(session: AsyncSession, user: User, file: UploadFile, text: str) -> dict:
+async def chat_with_file(session: AsyncSession, user: User, file: UploadFile, text: str, channel: str = "web") -> dict:
     """The same for the site and the Telegram bot."""
     from app.services import attachments
 
@@ -870,6 +890,6 @@ async def chat_with_file(session: AsyncSession, user: User, file: UploadFile, te
     except attachments.UnreadableFile as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     try:
-        return await chat.handle_message(session, user, text, attachment)
+        return await chat.handle_message(session, user, text, attachment, channel=channel)
     except chat.AssistantUnavailable:
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from None

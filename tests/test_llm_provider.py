@@ -18,7 +18,7 @@ from app.models.models import LlmUsage
 @pytest.fixture
 async def openai_api(monkeypatch):
     """openai_api(answers) serves the answers in order at /v1/chat/completions; returns the request bodies it got."""
-    from app.services import chat
+    from app.services import agent, chat
     from services import gigachat
 
     received: list[dict] = []
@@ -51,6 +51,7 @@ async def openai_api(monkeypatch):
     )
     monkeypatch.setattr(gigachat, "settings", configured)
     monkeypatch.setattr(chat, "settings", configured)
+    monkeypatch.setattr(agent, "settings", configured)
 
     def serve(messages: list[dict]) -> list[dict]:
         answers[:] = messages
@@ -114,6 +115,35 @@ async def test_plain_requests_use_openai_model(openai_api):
     received = openai_api([{"role": "assistant", "content": "Совет: начните с «Отчёта»."}])
     assert await GigaChatClient().analysis({"tasks": []}, "проанализируй день") == "Совет: начните с «Отчёта»."
     assert received[0]["model"] == "test-model" and received[0]["messages"][0]["role"] == "user"
+
+
+async def test_the_cached_part_of_the_agent_request_is_the_same_for_every_message(client, user, openai_api):
+    """The rules and the function spec come first and do not change between messages, so the API serves them from its
+    prompt cache; the time, the plan and the actions a message may need follow in a second system message."""
+    headers, _ = user
+    received = openai_api([{"role": "assistant", "content": "Готово."}])
+    await client.post("/api/assistant/chat", json={"text": "как дела?"}, headers=headers)
+    plain = received[0]
+    received = openai_api([{"role": "assistant", "content": "Готово."}])
+    await client.post("/api/assistant/chat", json={"text": "удали встречу с Олей"}, headers=headers)
+    deletion = received[0]
+    assert plain["tools"] == deletion["tools"] and plain["messages"][0] == deletion["messages"][0]
+    rules, context = plain["messages"][0]["content"], plain["messages"][1]["content"]
+    assert plain["messages"][1]["role"] == "system" and "ПРАВИЛА" in rules and "СЕЙЧАС" not in rules
+    # The tone the user chose is theirs: it is in the context, so every user shares the cached rules
+    assert "Говори" not in rules and context.startswith("Говори") and "СЕЙЧАС" in context and "ПЛАН" in context
+    # "Удали" is not in the first message: delete is left out of its actions, and act() refuses it
+    assert "delete" not in context.split("ДЕЙСТВИЯ для этого сообщения:")[1]
+    assert "delete" in deletion["messages"][1]["content"].split("ДЕЙСТВИЯ для этого сообщения:")[1]
+
+
+def test_gigachat_gets_one_system_message():
+    from services.gigachat import one_system_message
+
+    joined = one_system_message([{"role": "system", "content": "Правила"}, {"role": "system", "content": "План"}, {"role": "user", "content": "привет"}])
+    assert joined == [{"role": "system", "content": "Правила\n\nПлан"}, {"role": "user", "content": "привет"}]
+    single = [{"role": "system", "content": "Правила"}, {"role": "user", "content": "привет"}]
+    assert one_system_message(single) == single
 
 
 async def test_a_parallel_tool_call_is_taken_one_at_a_time():

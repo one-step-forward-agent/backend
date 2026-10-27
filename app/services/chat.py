@@ -72,21 +72,21 @@ FIXED_PHRASE = re.compile(
 HASHTAG = re.compile(r"(?<![\w#])#([0-9a-zа-яё_-]{1,40})", re.I)
 # A request to change a task that already exists: "перенеси встречу на пятницу", "продли созвон до 16:00"
 EDIT_REQUEST = re.compile(
-    r"^\s*(?:dayla[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?:(?:можешь|можно|могла\s+бы|нужно|надо)\s+(?:ли\s+)?)?"
+    r"^\s*(?:(?:deyla|dayla|дейла|дайла)[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?:(?:можешь|можно|могла\s+бы|нужно|надо)\s+(?:ли\s+)?)?"
     r"(?P<verb>перенеси\w*|перенест\w*|перенес(?:и|ти)\w*|передвин\w*|подвин\w*|сдвин\w*|измени\w*|поменя\w*|исправ\w*"
     r"|отлож\w*|переименуй\w*|переименова\w*|продли\w*)\b",
     re.I,
 )
 # Removing existing tasks: "удали все события", "удали встречу с Олей", "отмени задачи на завтра"
 DELETE_REQUEST = re.compile(
-    r"^\s*(?:dayla[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?P<asks>(?:можешь|можно|могла\s+бы)\s+(?:ли\s+)?)?(?:(?:нужно|надо)\s+)?"
+    r"^\s*(?:(?:deyla|dayla|дейла|дайла)[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?P<asks>(?:можешь|можно|могла\s+бы)\s+(?:ли\s+)?)?(?:(?:нужно|надо)\s+)?"
     r"(?P<verb>удали\w*|удалить|сотри|стереть|очисти\w*|почисти\w*|убери|убрать|отмени|отменить)\b",
     re.I,
 )
 STRONG_DELETE = ("удали", "сотри", "очисти", "почисти")
 # Marking done: "отметь отчёт выполненным", "я сделала отчёт", "отметь все задачи на сегодня выполненными"
 COMPLETE_REQUEST = re.compile(
-    r"^\s*(?:dayla[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?:"
+    r"^\s*(?:(?:deyla|dayla|дейла|дайла)[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?:"
     r"(?:отметь|отметить|пометь|пометить|закрой|закрыть)\b.*\b(?:выполнен\w*|сделан\w*|готов\w*|заверш[её]н\w*|выполнено)"
     r"|(?:я\s+)?(?:уже\s+)?(?:сделал|сделала|выполнил|выполнила|закончил|закончила|завершил|завершила)\b.+)",
     re.I,
@@ -118,7 +118,7 @@ NIGHT_WORDS = re.compile(r"\b(?:после)?завтра\b", re.I)
 # Tasks added one message after another count together for "их": within this time of the latest batch
 CONTEXT_BATCH_WINDOW = timedelta(hours=1)
 # Words that name the action, the calendar itself or nothing in particular — not a task
-ACTION_WORDS = ("удал", "убер", "убра", "стер", "сотр", "очист", "почист", "отмен", "отмет", "помет", "выполн", "сдела", "законч", "заверш", "закр", "можеш", "можно", "пожалуйст", "календар", "dayla")
+ACTION_WORDS = ("удал", "убер", "убра", "стер", "сотр", "очист", "почист", "отмен", "отмет", "помет", "выполн", "сдела", "законч", "заверш", "закр", "можеш", "можно", "пожалуйст", "календар", "dayla", "deyla", "дейла")
 NOISE_WORDS = {"больше", "нужны", "нужен", "нужна", "нужно", "надо", "эти", "этих", "эту", "этот", "мой", "мою", "моего", "моих", "свои", "своих", "из", "как", "уже", "ещё", "еще", "дела"}
 # A reply that claims a change the app did not make ("удалила все события") is never shown
 ACTION_CLAIM = re.compile(
@@ -162,7 +162,7 @@ HONEST_ANSWER_EN = (
 MAX_DELETE = 5000
 # "Добавь …" already says what to do: a single clear task is added at once, with an undo button
 ADD_REQUEST = re.compile(
-    r"^\s*(?:dayla[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?:добавь|добавить|создай|создать|запиши|записать|запланируй|запланировать|поставь|поставить)\b",
+    r"^\s*(?:(?:deyla|dayla|дейла|дайла)[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?:добавь|добавить|создай|создать|запиши|записать|запланируй|запланировать|поставь|поставить)\b",
     re.I,
 )
 SUPERSEDED_TEXT = "Черновик закрыт: вы отправили новый запрос."
@@ -564,11 +564,11 @@ FILE_WITHOUT_FILE = re.compile(
 )
 NO_FILE_ATTACHED = (
     "Файл не пришёл вместе с сообщением. Прикрепите его скрепкой и в том же сообщении напишите или скажите, когда прислать, "
-    "например: «пришли этот файл в 21:00» — бот Dayla пришлёт его в Telegram в это время."
+    "например: «пришли этот файл в 21:00» — бот Deyla пришлёт его в Telegram в это время."
 )
 NO_FILE_ATTACHED_EN = (
     "The file didn't come with the message. Attach it with the paperclip and, in the same message, write or say when to send it — "
-    "for example, “send this file at 9 pm” — and the Dayla bot will send it to Telegram then."
+    "for example, “send this file at 9 pm” — and the Deyla bot will send it to Telegram then."
 )
 
 # "Какое у меня свободное время в понедельник?", "когда я свободна завтра?", "есть окно в пятницу?":
@@ -1118,7 +1118,7 @@ DEFAULT_CALENDARS = ("google", "yandex", "apple")
 
 
 async def calendar_targets(session: AsyncSession, user: User) -> list[dict]:
-    """The connected calendars that accept events: new tasks are always in Dayla and can also go to any of them."""
+    """The connected calendars that accept events: new tasks are always in Deyla and can also go to any of them."""
     connected = set(await session.scalars(select(Integration.provider).where(Integration.user_id == user.id)))
     return [{"slug": slug, "title": calendar_title(slug)} for slug, provider in PROVIDERS.items() if provider.supports_push and slug in connected]
 
@@ -1134,7 +1134,7 @@ def calendar_title(slug: str) -> str:
 
 
 def default_calendars(user: User, targets: list[dict]) -> list[str]:
-    """The last choice, as far as it is still connected (an empty one means Dayla only); without one the first
+    """The last choice, as far as it is still connected (an empty one means Deyla only); without one the first
     connected calendar (Google first, as before there was a choice), since it was connected to get the tasks.
     Notion is a database, not a calendar: tasks go there only when it is ticked."""
     slugs = [item["slug"] for item in targets]
@@ -1468,7 +1468,7 @@ async def export_new(session: AsyncSession, user: User, calendars: list[str] | N
             done.append(calendar_title(slug))
     lines = [tr(f"Добавлено в {' и '.join(done)}", f"Added to {' and '.join(done)}")] if done else []
     if problems:
-        lines += problems + [tr("Задачи сохранены в Dayla", "The tasks are saved in Dayla")]
+        lines += problems + [tr("Задачи сохранены в Deyla", "The tasks are saved in Deyla")]
     return ". ".join(lines)
 
 
@@ -1844,7 +1844,7 @@ def summarize(reply: dict) -> str:
     if kind == "updated":
         return "Изменила: " + "; ".join(f"{event['title']} ({event['start']})" for event in reply["events"])
     if kind == "topic":
-        return f"Рекомендация Dayla — {reply['title']}: {reply['text']}"
+        return f"Рекомендация Deyla — {reply['title']}: {reply['text']}"
     if kind == "delete_proposal":
         return f"Предложила удалить {reply['count']} задач: {reply['title']}" + (f". {reply['answer']}" if reply.get("answer") else "")
     if kind == "completed":
@@ -1925,12 +1925,16 @@ def simple_task(text: str, now: datetime) -> list[dict]:
     return local_items(text, now)
 
 
-async def handle_message(session: AsyncSession, user: User, text: str, attachment=None, voice: dict | None = None) -> dict:
+async def handle_message(session: AsyncSession, user: User, text: str, attachment=None, voice: dict | None = None, channel: str = "web") -> dict:
     """One message of the chat (the site's and Telegram's are the same). `attachment`: a file read by
     app.services.attachments; the chat shows its name with the caption, the assistant reads its text.
     `voice`: a recorded voice message ({"id", "duration"} of kept_files) — the chat shows it as audio, `text` is
-    what was said and is all the assistant reads."""
+    what was said and is all the assistant reads. `channel`: "web" or "telegram", for the research answers.
+    A hypothesis question that is due goes with the reply (app.services.research)."""
+    from app.services import research
+
     usage.current_user_id.set(user.id)
+    research.current_channel.set(channel)
     tz = tasks.local_tz(user)
     caption = text.strip()[:50000]
     shown = {"kind": "file", "caption": caption, "file": attachment.meta()} if attachment else None
@@ -1944,6 +1948,7 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     else:
         text = caption
     await prune_history(session, user.id)
+    failed = False
     try:
         reply = await route(session, user, text, tz, attachment)
     except AssistantUnavailable:
@@ -1952,6 +1957,9 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
         # A model request of the rules failed: an answer in the chat, not a server error
         await session.rollback()
         reply = {"kind": "answer", "text": tr(MODEL_FAILED_ANSWER, MODEL_FAILED_ANSWER_EN)}
+        failed = True
+    if not failed:
+        reply = await research.attach(session, user, reply)
     await remember(session, user.id, "user", text, shown)
     message = await remember(session, user.id, "assistant", summarize(reply), reply)
     await session.commit()

@@ -30,7 +30,7 @@ async def get_current_user(
 ) -> User:
     token = bearer_token or cookie_token
     if not token:
-        raise _unauthorized("Сначала войдите в Dayla")
+        raise _unauthorized("Сначала войдите в Deyla")
     try:
         user_id = decode_access_token(token)
     except (jwt.InvalidTokenError, ValueError):

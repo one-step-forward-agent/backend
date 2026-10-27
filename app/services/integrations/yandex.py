@@ -24,7 +24,7 @@ class YandexCalendarIntegration(AppleCalendarIntegration):
 
     slug = "yandex"
     title = "Яндекс Календарь"
-    description = "Вход через Яндекс ID: импорт событий Яндекс Календаря в Dayla и отправка событий Dayla в него."
+    description = "Вход через Яндекс ID: импорт событий Яндекс Календаря в Deyla и отправка событий Deyla в него."
     auth_type = "oauth"
     fields = []
     auth_error = "Яндекс отклонил доступ к календарю — подключите Яндекс Календарь заново"

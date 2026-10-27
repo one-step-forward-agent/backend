@@ -693,7 +693,7 @@ async def evening(session: AsyncSession, user: User, now: datetime) -> tuple[str
     # The progress counts what the stats count; «all done» needs the user's own tasks ticked, not meetings that just passed
     progress_events = await tasks.counted(session, user, todays)
     done = sum(tasks.is_done(event, now) for event in progress_events)
-    all_done = bool(progress_events) and done == len(progress_events) and any(event.source not in tasks.EXTERNAL_SOURCES for event in progress_events)
+    all_done = bool(progress_events) and done == len(progress_events) and any(not tasks.is_external(event) for event in progress_events)
     streak, _ = await tasks.streaks(session, user, now)
     # Today's points and how far the next level and badge are, unless the user turned the awards off
     awards = rewards.evening_line(await rewards.progress(session, user, now), lang.is_en()) if user.rewards_enabled else None
@@ -712,7 +712,8 @@ async def evening(session: AsyncSession, user: User, now: datetime) -> tuple[str
     if awards:
         lines += ["", awards]
     if unfinished:
-        lines += ["", f"⏳ <b>Не успели</b> — {len(unfinished)}:"]
+        # With no tasks today they are all from the past days: said so, not "не успели" right after "задач не было"
+        lines += ["", f"⏳ <b>{'Не успели' if todays else 'Остались с прошлых дней'}</b> — {len(unfinished)}:"]
         for event in unfinished[:MAX_EVENING_ITEMS]:
             lines.append(f"• {html.escape(event.title)}")
         if len(unfinished) > MAX_EVENING_ITEMS:
@@ -748,7 +749,7 @@ def evening_en(todays, progress_events, upcoming, unfinished, done, all_done, st
     if awards:
         lines += ["", awards]
     if unfinished:
-        lines += ["", f"⏳ <b>Not done</b> — {len(unfinished)}:"]
+        lines += ["", f"⏳ <b>{'Not done' if todays else 'Left from the past days'}</b> — {len(unfinished)}:"]
         for event in unfinished[:MAX_EVENING_ITEMS]:
             lines.append(f"• {html.escape(event.title)}")
         if len(unfinished) > MAX_EVENING_ITEMS:

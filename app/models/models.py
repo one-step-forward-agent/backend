@@ -140,6 +140,9 @@ class Event(Base):
     priority: Mapped[str] = mapped_column(String(20), default=Priority.MEDIUM)
     location: Mapped[str | None] = mapped_column(EncryptedText("events.location"))
     source: Mapped[str] = mapped_column(String(20), default=Provider.LOCAL)
+    # Came from another calendar (a meeting from Google, Apple…). A task made in Deyla and sent to Google says
+    # source "google" too, for the sync, but stays the user's own task: it is ticked by hand and can be overdue
+    imported: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     external_id: Mapped[str | None] = mapped_column(String(255))
     sync_status: Mapped[str] = mapped_column(String(20), default=SyncStatus.NOT_SYNCED)
     all_day: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -214,7 +217,7 @@ class Integration(Base):
     calendars: Mapped[list[Calendar]] = relationship(back_populates="integration")
 
 class RemoteDeletion(Base):
-    """An event deleted in Dayla whose copy a connected calendar has not deleted yet (no access, the service was
+    """An event deleted in Deyla whose copy a connected calendar has not deleted yet (no access, the service was
     down). It is retried every minute and its copy is never imported back meanwhile."""
 
     __tablename__ = "remote_deletions"
@@ -223,7 +226,7 @@ class RemoteDeletion(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     provider: Mapped[str] = mapped_column(String(50))
-    # The id the calendar knows the event by (a Google event id, a CalDAV UID), without Dayla's prefix
+    # The id the calendar knows the event by (a Google event id, a CalDAV UID), without Deyla's prefix
     external_id: Mapped[str] = mapped_column(String(255))
     url: Mapped[str | None] = mapped_column(String(1000))
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
@@ -382,3 +385,68 @@ class AdminNote(Base):
     updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     locked_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ResearchQuestion(Base):
+    """A hypothesis about where to take Deyla, asked to users together with a chat answer (see app.services.research).
+    Admins add and switch them on the dashboard."""
+
+    __tablename__ = "research_questions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text: Mapped[str] = mapped_column(Text)
+    # The question on the English site; empty: the Russian text
+    text_en: Mapped[str | None] = mapped_column(Text)
+    # Answers offered as buttons; empty: the user answers in their own words
+    options: Mapped[list | None] = mapped_column(JSONB)
+    options_en: Mapped[list | None] = mapped_column(JSONB)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # Lower goes first when several questions are due
+    position: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ResearchAsk(Base):
+    """How often a user has been asked a question: it comes back after 2, 3, 4… days until it is answered."""
+
+    __tablename__ = "research_asks"
+    __table_args__ = (UniqueConstraint("user_id", "question_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("research_questions.id", ondelete="CASCADE"), index=True)
+    times_asked: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_asked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ResearchAnswer(Base):
+    """Every answer to a question, and every «Пропустить» (source "skip", no answer). Stored as plain text on purpose:
+    the dashboard shows it as written, unlike the encrypted chat messages it turns into pseudonyms."""
+
+    __tablename__ = "research_answers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("research_questions.id", ondelete="CASCADE"), index=True)
+    answer: Mapped[str | None] = mapped_column(Text)
+    # "option" (a button), "text" (typed under the question), "chat" (a chat message the assistant took as the answer), "skip"
+    source: Mapped[str] = mapped_column(String(16))
+    # The site or Telegram
+    channel: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class FeatureWish(Base):
+    """Something a user asked the assistant for that Deyla cannot do yet: plain text for the dashboard, like ResearchAnswer."""
+
+    __tablename__ = "feature_wishes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    wish: Mapped[str] = mapped_column(Text)
+    # The user's message as they wrote it (cut), so the wording of the wish is not lost
+    message: Mapped[str | None] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

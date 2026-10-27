@@ -40,7 +40,7 @@ class NotionIntegration(IntegrationProvider):
 
     slug = "notion"
     title = "Notion"
-    description = "Вход через Notion: выберите базы данных с датами — их записи появятся в календаре, а события Dayla можно отправить в Notion."
+    description = "Вход через Notion: выберите базы данных с датами — их записи появятся в календаре, а события Deyla можно отправить в Notion."
     auth_type = "oauth"
     fields = []
 
@@ -60,7 +60,7 @@ class NotionIntegration(IntegrationProvider):
         if response.status_code == 401:
             raise IntegrationError("Notion отклонил доступ — подключите Notion заново")
         if response.status_code == 404:
-            raise IntegrationError("База не найдена — откройте её в Notion → ··· → Connections и добавьте Dayla")
+            raise IntegrationError("База не найдена — откройте её в Notion → ··· → Connections и добавьте Deyla")
         if response.is_error:
             try:
                 message = response.json().get("message")

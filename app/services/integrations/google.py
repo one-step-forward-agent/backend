@@ -32,7 +32,7 @@ def google_patch_times(body: dict[str, Any]) -> dict[str, Any]:
 class GoogleIntegration(IntegrationProvider):
     slug = "google"
     title = "Google Calendar"
-    description = "OAuth 2.0: импорт событий из основного календаря и отправка событий Dayla в Google."
+    description = "OAuth 2.0: импорт событий из основного календаря и отправка событий Deyla в Google."
     auth_type = "oauth"
     fields = []
     scoped_external_ids = False
@@ -62,7 +62,7 @@ class GoogleIntegration(IntegrationProvider):
         raws: list[dict] = []
         params = {"timeMin": start.isoformat(), "timeMax": end.isoformat(), "singleEvents": "true", "orderBy": "startTime", "maxResults": "2500"}
         try:
-            # Every page: the sync deletes in Dayla what is missing here, so a cut-off list would delete real events
+            # Every page: the sync deletes in Deyla what is missing here, so a cut-off list would delete real events
             for _ in range(MAX_PAGES):
                 data = await client._request("GET", f"{client.base_url}/calendars/primary/events", params=params) or {}
                 raws += data.get("items", [])

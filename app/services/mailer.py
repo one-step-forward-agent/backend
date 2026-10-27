@@ -8,7 +8,7 @@ from email.utils import formataddr, make_msgid
 
 from app.core.config import settings
 
-SENDER_NAME = "Dayla"
+SENDER_NAME = "Deyla"
 
 
 def _send(message: EmailMessage) -> None:

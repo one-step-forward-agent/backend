@@ -59,7 +59,7 @@ REMOTE_DELETION_DAYS = 30
 
 def remember_deletion(session: AsyncSession, user_id: int, provider: str, external_id: str, url: str | None = None) -> None:
     """The copy could not be deleted now (no access, the service is down): the retry loop deletes it later, and
-    until then the import does not bring it back into Dayla."""
+    until then the import does not bring it back into Deyla."""
     session.add(RemoteDeletion(user_id=user_id, provider=provider, external_id=external_id[:255], url=url))
 
 
@@ -82,7 +82,7 @@ def series_copy(event: Event, external_id: str, whole_series: bool) -> str:
 
 
 async def delete_from_google(session: AsyncSession, user_id: int, events: list[Event], whole_series: bool = False) -> None:
-    """Remove the Google copies of events deleted in Dayla; otherwise they stay in Google (and the next import brings them back)."""
+    """Remove the Google copies of events deleted in Deyla; otherwise they stay in Google (and the next import brings them back)."""
     synced = list(dict.fromkeys(series_copy(event, event.external_id, whole_series) for event in events if event.external_id and event.source == "google"))
     if not synced:
         return
@@ -108,14 +108,14 @@ async def delete_from_google(session: AsyncSession, user_id: int, events: list[E
 
 
 def remote_id(integration: Integration, external_id: str) -> str:
-    """The calendar's own id of an imported event: Dayla keeps it as "<provider>:<integration id>:<id>"."""
+    """The calendar's own id of an imported event: Deyla keeps it as "<provider>:<integration id>:<id>"."""
     prefix = f"{integration.provider}:{integration.id}:"
     return external_id[len(prefix):] if external_id.startswith(prefix) else external_id
 
 
 async def delete_from_calendars(session: AsyncSession, user_id: int, events: list[Event], whole_series: bool = False) -> None:
-    """Remove the copies of events deleted in Dayla from every connected calendar: Google, and the Yandex and Apple
-    copies Dayla sent there (event links) or imported from there. A calendar that fails never stops the deletion:
+    """Remove the copies of events deleted in Deyla from every connected calendar: Google, and the Yandex and Apple
+    copies Deyla sent there (event links) or imported from there. A calendar that fails never stops the deletion:
     its copy is deleted later by retry_remote_deletions. `whole_series`: the days of a series imported from a calendar
     go there as the series itself, so its days beyond the imported weeks go too."""
     await delete_from_google(session, user_id, events, whole_series)
@@ -229,8 +229,8 @@ async def push_new_events_to_google(session: AsyncSession, user_id: int, events:
         await session.refresh(event)
 
 
-# Tasks made in Dayla that have not reached Google yet (a series' later days, a moment Google was unreachable)
-# are sent by a loop; tasks the user kept in Dayla only are "skipped" and stay out of it
+# Tasks made in Deyla that have not reached Google yet (a series' later days, a moment Google was unreachable)
+# are sent by a loop; tasks the user kept in Deyla only are "skipped" and stay out of it
 CATCH_UP_EVERY = 60
 CATCH_UP_BATCH = 50
 CATCH_UP_PAST = timedelta(days=1)
@@ -264,7 +264,7 @@ async def push_unsent_to_google(session: AsyncSession, user_id: int) -> int:
 
 
 async def google_catch_up_loop() -> None:
-    """Runs with the app: every minute the unsent Dayla tasks of each Google user go to Google."""
+    """Runs with the app: every minute the unsent Deyla tasks of each Google user go to Google."""
     from app.core.database import session_factory
 
     while True:
@@ -289,12 +289,12 @@ async def google_catch_up_loop() -> None:
             logger.exception("Sending unsent tasks to Google failed")
 
 
-# Google adds the event's own page to the description it gives; Dayla keeps it as the description's last line
+# Google adds the event's own page to the description it gives; Deyla keeps it as the description's last line
 GOOGLE_LINK = re.compile(r"\n?https://(?:www\.google\.com/calendar/event|calendar\.google\.com/)\S*$")
 
 
 def google_change(event: Event) -> dict:
-    """What a change made in Dayla sets in Google: guests, video links and Google's own reminders stay as they are."""
+    """What a change made in Deyla sets in Google: guests, video links and Google's own reminders stay as they are."""
     body = google_patch_times(google_event_body(event_payload(event)))
     description = GOOGLE_LINK.sub("", event.description or "")
     return {**{key: body[key] for key in ("summary", "start", "end", "location")}, "description": description or None}
@@ -312,7 +312,7 @@ async def _push_changes_to_google(session: AsyncSession, user_id: int, events: l
             await provider.patch_event("primary", event.external_id, google_change(event))
         except httpx.HTTPStatusError as error:
             if error.response.status_code in (404, 410):
-                # Deleted in Google: the import no longer brings it back, the Dayla copy keeps the change
+                # Deleted in Google: the import no longer brings it back, the Deyla copy keeps the change
                 event.sync_status = "error"
             else:
                 failed.add(event.id)
@@ -324,7 +324,7 @@ async def _push_changes_to_google(session: AsyncSession, user_id: int, events: l
 
 
 async def _push_changes_to_calendars(session: AsyncSession, user_id: int, events: list[Event], failed: set[int]) -> None:
-    """Yandex, Apple and the copies Dayla sent to a calendar (event links)."""
+    """Yandex, Apple and the copies Deyla sent to a calendar (event links)."""
     from app.services.integrations.registry import PROVIDERS
     from app.services.integrations.service import build_provider, user_timezone
 
@@ -359,11 +359,11 @@ async def _push_changes_to_calendars(session: AsyncSession, user_id: int, events
 
 
 async def push_changes(session: AsyncSession, user_id: int, events: list[Event] | None = None) -> None:
-    """Send the events changed in Dayla (moved, renamed, new time) to every calendar that has a copy of them.
+    """Send the events changed in Deyla (moved, renamed, new time) to every calendar that has a copy of them.
 
     Without it the next import brings the calendar's old version back and the change is lost. An imported event
     a calendar refused stays "pending": the import leaves it alone and the next change or sync tries again.
-    `events`: the ones just changed, also those kept in Dayla only, whose copies Dayla sent to a calendar."""
+    `events`: the ones just changed, also those kept in Deyla only, whose copies Deyla sent to a calendar."""
     pending = list(await session.scalars(select(Event).where(Event.user_id == user_id, Event.sync_status == "pending")))
     pending += [event for event in events or [] if event not in pending]
     if not pending:

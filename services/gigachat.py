@@ -19,9 +19,9 @@ from app.services import usage
 logger = logging.getLogger(__name__)
 
 
-# Dayla is a woman: every reply must use feminine forms about herself
+# Deyla is a woman: every reply must use feminine forms about herself
 PERSONA = (
-    "Ты — Dayla, девушка, ИИ-помощница по планированию дня. О себе всегда говори в женском роде: "
+    "Ты — Deyla, девушка, ИИ-помощница по планированию дня. О себе всегда говори в женском роде: "
     "«поняла», «рада помочь», «напомню», «уверена»; никогда не используй мужской род о себе. "
 )
 # The model only writes text; the app performs every change separately and reports it itself
@@ -34,7 +34,7 @@ PERSONAL_ADVICE = (
     "Советы должны быть персональными. Каждый совет обязательно опирается на конкретику из фактов: называет задачу "
     "в кавычках, день или время, или число из habits (сколько пользователь обычно выполняет за день, сферы с низким "
     "процентом, задачи, которые откладываются, время дня, когда он чаще всё делает, слабый день недели). "
-    "Не говори о целях и привычках пользователя и не предлагай их ставить или отслеживать — такого раздела в Dayla пока нет: "
+    "Не говори о целях и привычках пользователя и не предлагай их ставить или отслеживать — такого раздела в Deyla пока нет: "
     "говори о его задачах, днях и времени. "
     "Запрещены общие советы, которые подходят любому: «планируйте 3–5 дел», «делайте перерывы», «не забывайте отмечать задачи», "
     "«расставьте приоритеты», «берегите себя», «так держать». Если сказать нечего конкретного — дай меньше советов. "
@@ -205,6 +205,17 @@ def openai_messages(messages: list[dict]) -> list[dict]:
     return converted
 
 
+def one_system_message(messages: list[dict]) -> list[dict]:
+    """GigaChat takes one system message, the first: the agent's rules and context joined."""
+    leading = 0
+    while leading < len(messages) and messages[leading].get("role") == "system":
+        leading += 1
+    if leading < 2:
+        return messages
+    content = "\n\n".join(message.get("content") or "" for message in messages[:leading])
+    return [{"role": "system", "content": content}, *messages[leading:]]
+
+
 def gigachat_message(message: dict) -> dict:
     """An OpenAI answer in the agent's format. The agent runs one function per step: the first tool call is taken,
     and the model calls the others in the next steps, seeing this one's result."""
@@ -342,7 +353,7 @@ class GigaChatClient:
             "8. Анализируй события только из блока Текущий запрос. Контекст нужен лишь для ответа на вопросы о прошлом; "
             "не переноси из него события и не создавай их повторно.\n"
             "9. Если событий нет (вопрос, приветствие, просьба о совете), events — пустой массив, а в answer дай короткий "
-            "полезный ответ на русском от лица Dayla, в женском роде, опираясь на расписание пользователя ниже.\n"
+            "полезный ответ на русском от лица Deyla, в женском роде, опираясь на расписание пользователя ниже.\n"
             "10. intent — что хочет пользователь: \"create\" (новые дела), \"change\" (перенести или изменить существующее), "
             "\"delete\" (удалить или отменить существующее), \"complete\" (отметить выполненным), "
             "\"analyze\" (проанализировать загрузку, дать совет по плану, перепланировать), "
@@ -418,7 +429,7 @@ class GigaChatClient:
             "показывать расписание и присылать напоминания. "
             "Отвечай по-русски, тепло и по делу: до 5–6 коротких предложений или короткий список. "
             "Не используй markdown, заголовки и таблицы. Не выдумывай события и факты о расписании пользователя. "
-            "Если последнее твоё сообщение в диалоге — «Рекомендация Dayla», пользователь пришёл обсудить её: "
+            "Если последнее твоё сообщение в диалоге — «Рекомендация Deyla», пользователь пришёл обсудить её: "
             "объясни её и предложи конкретные шаги по его расписанию. "
             "Если пользователь хочет что-то запланировать, но не указал дату или время, коротко уточни, когда это сделать. "
             "Ты знаешь, как пользователь обычно выполняет задачи (блок «Что известно о пользователе»): опирайся на это, когда советуешь, — "
@@ -569,7 +580,7 @@ class GigaChatClient:
             payload |= {"messages": openai_messages(messages), "tools": openai_tools(functions), "tool_choice": "auto"}
             result = await self._complete(payload, "agent", timeout=60)
             return gigachat_message(result["choices"][0]["message"])
-        payload |= {"messages": messages, "functions": functions, "function_call": "auto"}
+        payload |= {"messages": one_system_message(messages), "functions": functions, "function_call": "auto"}
         result = await self._complete(payload, "agent", timeout=60)
         message = result["choices"][0]["message"]
         call = message.get("function_call")

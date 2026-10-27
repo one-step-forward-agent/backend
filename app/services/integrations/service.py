@@ -102,7 +102,7 @@ async def verify_integration(session: AsyncSession, user: User, integration: Int
 async def sync_integration(session: AsyncSession, user: User, integration: Integration) -> dict:
     from app.services.events import push_changes
 
-    # Changes made in Dayla go to the calendars first, so the import below does not undo them
+    # Changes made in Deyla go to the calendars first, so the import below does not undo them
     await push_changes(session, user.id)
     tz = user_timezone(user)
     provider = build_provider(integration, tz)
@@ -130,7 +130,7 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
     _persist_rotated_secrets(integration, provider)
     calendar = await import_calendar(session, user, integration)
     exported = set(await session.scalars(select(EventLink.external_id).where(EventLink.integration_id == integration.id)))
-    # Deleted in Dayla, not yet in the calendar: not brought back
+    # Deleted in Deyla, not yet in the calendar: not brought back
     exported |= set(await session.scalars(select(RemoteDeletion.external_id).where(RemoteDeletion.user_id == user.id, RemoteDeletion.provider == integration.provider)))
     created = updated = skipped = 0
     for item in items:
@@ -141,11 +141,11 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
         external_id = external_id[:255]
         event = await session.scalar(select(Event).where(Event.user_id == user.id, Event.external_id == external_id))
         if not event:
-            event = Event(calendar_id=calendar.id, user_id=user.id, external_id=external_id, source=integration.provider)
+            event = Event(calendar_id=calendar.id, user_id=user.id, external_id=external_id, source=integration.provider, imported=True)
             session.add(event)
             created += 1
         elif event.sync_status == "pending":
-            # Changed in Dayla and not accepted by the calendar yet: the local version wins until it is sent
+            # Changed in Deyla and not accepted by the calendar yet: the local version wins until it is sent
             skipped += 1
             continue
         before = (event.title, event.description, event.location, event.start_at, event.end_at, event.all_day, event.series_id)
@@ -171,7 +171,7 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
 
 
 def imported_here(user: User, integration: Integration, provider: IntegrationProvider, now: datetime) -> list:
-    """The events of this calendar inside the fetched period, except the ones changed in Dayla that the calendar
+    """The events of this calendar inside the fetched period, except the ones changed in Deyla that the calendar
     has not taken yet ("pending") or has refused ("error"): the local version of those wins."""
     prefix = f"{integration.provider}:{integration.id}:"
     return [
@@ -199,7 +199,7 @@ async def delete_missing(
     for event in gone:
         await session.delete(event)
     if gone:
-        logger.info("%d events of user %s deleted in %s are deleted in Dayla too", len(gone), user.id, integration.provider)
+        logger.info("%d events of user %s deleted in %s are deleted in Deyla too", len(gone), user.id, integration.provider)
     return len(gone)
 
 

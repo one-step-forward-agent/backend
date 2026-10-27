@@ -9,8 +9,8 @@ from app.services.calendar_provider import CalendarProvider
 
 logger = logging.getLogger(__name__)
 
-# The narrowest scopes Dayla works with: events of the user's calendars (read, create, change, delete) and the
-# list of calendars to choose from. Not the whole `calendar` scope: Dayla never changes calendars or their sharing.
+# The narrowest scopes Deyla works with: events of the user's calendars (read, create, change, delete) and the
+# list of calendars to choose from. Not the whole `calendar` scope: Deyla never changes calendars or their sharing.
 CALENDAR_SCOPES = (
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
@@ -18,8 +18,8 @@ CALENDAR_SCOPES = (
 
 
 async def revoke_google_access(secrets: dict) -> None:
-    """Withdraw Dayla's access in the Google account itself, not only forget the tokens: disconnecting and deleting
-    the account must leave Google without a grant to Dayla. Revoking the refresh token revokes the whole grant."""
+    """Withdraw Deyla's access in the Google account itself, not only forget the tokens: disconnecting and deleting
+    the account must leave Google without a grant to Deyla. Revoking the refresh token revokes the whole grant."""
     token = secrets.get("refresh_token") or secrets.get("access_token")
     if not token:
         return

@@ -269,9 +269,9 @@ async def test_batch_and_profile_limits(client, user):
 
 async def test_overdue_is_every_unmarked_one_off_task_of_the_user(client, user):
     from app.core.database import session_factory
-    from app.models.models import User
+    from app.models.models import Event, User
     from app.services import insights, tasks
-    from sqlalchemy import select
+    from sqlalchemy import select, update
 
     headers, chat_id = user
     yesterday = today() - timedelta(days=1)
@@ -286,8 +286,10 @@ async def test_overdue_is_every_unmarked_one_off_task_of_the_user(client, user):
                 {"title": "Зарядка", "date": yesterday.isoformat(), "time": None, "rrule": "FREQ=DAILY"},
             ],
         )
-        # A meeting from Google cannot be ticked in Dayla: it counts as done once over
+        # A meeting from Google cannot be ticked in Deyla: it counts as done once over
         await tasks.create_tasks(session, user_row, [{"title": "Планёрка", "date": yesterday.isoformat(), "time": "12:00"}], source="google", push_google=False)
+        await session.execute(update(Event).where(Event.user_id == user_row.id, Event.source == "google").values(imported=True))
+        await session.commit()
         data = await insights.facts(session, user_row, datetime.now(TZ))
     # A task of the user's with a time is not done until ticked, like one without (testers: the statistics lied)
     assert sorted(data["overdue"]) == ["Встреча вчера", "Купить молоко"]

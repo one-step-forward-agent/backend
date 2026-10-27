@@ -414,7 +414,7 @@ async def queue_test(session: AsyncSession, user: User) -> Notification:
         user_id=user.id,
         kind="test",
         dedupe_key=f"test:{user.id}:{secrets.token_hex(8)}",
-        text=tr(f"✅ Тестовое уведомление Dayla.\nНапоминания {state}, за: {leads}.", f"✅ A test notification from Dayla.\nReminders are {state}, before: {leads}."),
+        text=tr(f"✅ Тестовое уведомление Deyla.\nНапоминания {state}, за: {leads}.", f"✅ A test notification from Deyla.\nReminders are {state}, before: {leads}."),
         scheduled_for=now,
         expires_at=now + timedelta(hours=1),
         status=NotificationStatus.PENDING,
@@ -615,7 +615,7 @@ async def create_custom(
     if every is not None and not MIN_REPEAT_MINUTES <= every <= MAX_REPEAT_MINUTES:
         raise ReminderError(f"Повторять можно не чаще чем раз в {MIN_REPEAT_MINUTES} минут и не реже чем раз в сутки")
     if not user.telegram_chat_id:
-        raise ReminderError("Telegram не подключён: напоминания приходят в Telegram-бот Dayla")
+        raise ReminderError("Telegram не подключён: напоминания приходят в Telegram-бот Deyla")
     pending = await session.scalar(
         select(func.count()).select_from(Notification).where(
             Notification.user_id == user.id, Notification.kind == CUSTOM_KIND, Notification.status == NotificationStatus.PENDING

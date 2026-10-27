@@ -278,7 +278,7 @@ class AppleCalendarIntegration(IntegrationProvider):
                 calendar = ICalendar.from_ical(response.content)
                 found = [item for item in calendar.walk("VEVENT") if str(item.get("UID")) == external_id and item.get("RECURRENCE-ID") is None]
                 if not found or found[0].get("RRULE") is not None:
-                    # A repeating event there: Dayla changes one day, which is not the whole series
+                    # A repeating event there: Deyla changes one day, which is not the whole series
                     continue
                 component = found[0]
                 sequence = int(component.pop("SEQUENCE", 0) or 0)

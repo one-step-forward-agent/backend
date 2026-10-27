@@ -36,7 +36,7 @@ SEND_INTENT = re.compile(
 
 
 class UnreadableFile(ValueError):
-    """The file cannot be read: a type Dayla does not know, a broken file, nothing about plans in it."""
+    """The file cannot be read: a type Deyla does not know, a broken file, nothing about plans in it."""
 
 
 @dataclass

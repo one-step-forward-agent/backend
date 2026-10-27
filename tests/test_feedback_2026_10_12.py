@@ -175,7 +175,7 @@ async def test_calendar_feed_for_samsung(client, user, browser):
     # The same link until the user asks for a new one
     assert (await client.post("/api/calendar/feed", headers=headers)).json()["path"] == path
 
-    # The calendar app has no Dayla session: the secret in the link is enough
+    # The calendar app has no Deyla session: the secret in the link is enough
     feed = await browser.get(path)
     assert feed.status_code == 200 and feed.headers["content-type"].startswith("text/calendar")
     assert "SUMMARY:Созвон с Олей" in feed.text and "UID:dayla-" in feed.text
@@ -381,7 +381,7 @@ async def test_unsent_tasks_reach_google(client, user, services):
 def test_telegram_bot_message_is_shown_as_is():
     from app.core.errors import plain
 
-    message = "Telegram не подключён: напоминания приходят в Telegram-бот Dayla"
+    message = "Telegram не подключён: напоминания приходят в Telegram-бот Deyla"
     assert plain(message) == message
 
 

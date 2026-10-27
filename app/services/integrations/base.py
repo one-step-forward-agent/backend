@@ -96,7 +96,7 @@ class RemoteItem:
     description: str | None = None
     location: str | None = None
     url: str | None = None
-    # The calendar's own series this event is a day of (a repeating event there), so Dayla treats it as a series
+    # The calendar's own series this event is a day of (a repeating event there), so Deyla treats it as a series
     series_key: str | None = None
 
 
@@ -160,11 +160,11 @@ class IntegrationProvider(ABC):
         raise PushNotSupported(f"{self.title} does not support export")
 
     async def update_event(self, external_id: str, event: EventPayload, url: str | None = None) -> None:
-        """Send a change made in Dayla to the service's copy of the event. Not every service can."""
+        """Send a change made in Deyla to the service's copy of the event. Not every service can."""
         return None
 
     async def delete_event(self, external_id: str, url: str | None = None) -> None:
-        """Remove an event from the service (one Dayla pushed there, or one imported from it). Not every service can."""
+        """Remove an event from the service (one Deyla pushed there, or one imported from it). Not every service can."""
         return None
 
     @classmethod

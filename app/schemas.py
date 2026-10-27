@@ -424,6 +424,16 @@ class BotRatingRequest(RatingRequest):
     pass
 
 
+class QuestionAnswerRequest(BaseModel):
+    """An answer to a hypothesis question under a chat reply: a button (option), the user's own words (answer) or skip."""
+
+    option: str | None = Field(default=None, max_length=500)
+    answer: str | None = Field(default=None, max_length=2000)
+    skip: bool = False
+    # The chat message the question came with: it shows the answer after a reload
+    message_id: int | None = None
+
+
 class UndoRequest(BaseModel):
     # An imported .ics file can add up to 2000 events at once (services.calendar.MAX_IMPORT_EVENTS)
     event_ids: list[int] = Field(min_length=1, max_length=2000)
@@ -464,7 +474,7 @@ class BotRemoveRequest(BaseModel):
 
 
 class DraftCalendars(BaseModel):
-    """The ticked calendars; empty: Dayla only."""
+    """The ticked calendars; empty: Deyla only."""
 
     calendars: list[str] = Field(max_length=10)
 

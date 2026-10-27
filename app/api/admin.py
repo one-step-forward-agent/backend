@@ -24,7 +24,7 @@ from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import Base, get_session
 from app.core.dataenc import ENCRYPTED_COLUMNS, EncryptedJSON
-from app.models.models import AdminNote, User
+from app.models.models import AdminNote, ResearchAnswer, ResearchQuestion, User
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -248,3 +248,78 @@ async def save_note(payload: NoteSave, user: User = Depends(get_admin), session:
     note.locked_at = None
     await session.commit()
     return await _note_view(session, note, user)
+
+
+# ---------- hypotheses asked in the chat (app.services.research) ----------
+
+
+class QuestionSave(BaseModel):
+    text: str = Field(min_length=3, max_length=500)
+    text_en: str | None = Field(default=None, max_length=500)
+    options: list[str] = Field(default_factory=list, max_length=8)
+    options_en: list[str] = Field(default_factory=list, max_length=8)
+    active: bool = True
+    position: int = 0
+
+
+def _clean_options(options: list[str]) -> list[str]:
+    return [option.strip()[:60] for option in options if option and option.strip()]
+
+
+@router.get("/research")
+async def research_summary(user: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
+    """Every question with its numbers and latest answers, and the latest wishes. Answers and wishes are shown as the
+    users wrote them: asked for exactly this, unlike the rest of the dashboard."""
+    from app.services import research
+
+    return await research.summary(session)
+
+
+@router.post("/research/questions", status_code=status.HTTP_201_CREATED)
+async def create_question(payload: QuestionSave, user: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
+    from app.services import research
+
+    question = ResearchQuestion(
+        text=payload.text.strip(),
+        text_en=(payload.text_en or "").strip() or None,
+        options=_clean_options(payload.options) or None,
+        options_en=_clean_options(payload.options_en) or None,
+        active=payload.active,
+        position=payload.position,
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(question)
+    await session.commit()
+    return research.question_admin_view(question)
+
+
+@router.put("/research/questions/{question_id}")
+async def update_question(question_id: int, payload: QuestionSave, user: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
+    """Answers already given stay with the question; change the wording only slightly, or add a new question."""
+    from app.services import research
+
+    question = await session.get(ResearchQuestion, question_id)
+    if question is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Вопрос не найден")
+    question.text = payload.text.strip()
+    question.text_en = (payload.text_en or "").strip() or None
+    question.options = _clean_options(payload.options) or None
+    question.options_en = _clean_options(payload.options_en) or None
+    question.active = payload.active
+    question.position = payload.position
+    question.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    return research.question_admin_view(question)
+
+
+@router.delete("/research/questions/{question_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_question(question_id: int, user: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
+    """Only a question nobody has answered yet: one with answers is switched off instead, so the answers stay."""
+    question = await session.get(ResearchQuestion, question_id)
+    if question is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Вопрос не найден")
+    answered = await session.scalar(select(func.count()).select_from(ResearchAnswer).where(ResearchAnswer.question_id == question_id))
+    if answered:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="На вопрос уже отвечали — выключите его, чтобы ответы сохранились")
+    await session.delete(question)
+    await session.commit()

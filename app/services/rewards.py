@@ -41,7 +41,7 @@ async def _day_counts(session: AsyncSession, user: User, now: datetime) -> dict[
     tz = now.tzinfo
     end = datetime.combine(now.date() + timedelta(days=1), time.min, tz)
     day = cast(func.timezone(str(tz), Event.start_at), Date)
-    external = Event.source.in_(tasks.EXTERNAL_SOURCES)
+    external = and_(Event.imported.is_(True), Event.source.in_(tasks.EXTERNAL_SOURCES))
     passed = and_(external, Event.all_day.is_(False), Event.end_at <= now)
     conditions = [Event.user_id == user.id, Event.start_at < end]
     skipped = list(await session.scalars(select(Tag.id).where(Tag.user_id == user.id, Tag.counts_progress.is_(False))))

@@ -18,7 +18,7 @@ ONBOARDING = "/onboarding/integrations"
 
 @pytest.fixture
 async def browser():
-    """A browser without a Dayla session."""
+    """A browser without a Deyla session."""
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
         yield http
 

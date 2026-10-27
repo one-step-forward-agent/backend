@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_bot
-from app.api.routes import chat_with_file, limit_assistant
+from app.api.routes import chat_with_file, limit_assistant, save_question_answer
 from app.core import lang
 from app.core.config import settings
 from app.core.database import get_session
@@ -21,6 +21,7 @@ from app.schemas import (
     BotCompleteRequest,
     BotEditRequest,
     BotRatingRequest,
+    QuestionAnswerRequest,
     BotTopicRequest,
     BotRemoveRequest,
     BotLinkRequest,
@@ -77,7 +78,7 @@ async def chat_message(chat_id: int, payload: BotChatRequest, session: AsyncSess
     if not chat.command(payload.text):
         await limit_assistant(session, user, payload.text)
     try:
-        return await chat.handle_message(session, user, payload.text)
+        return await chat.handle_message(session, user, payload.text, channel="telegram")
     except chat.AssistantUnavailable:
         raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
 
@@ -85,7 +86,7 @@ async def chat_message(chat_id: int, payload: BotChatRequest, session: AsyncSess
 @router.post("/chat/{chat_id}/file")
 async def chat_file(chat_id: int, file: UploadFile = File(...), text: str = Form(default="", max_length=50000), session: AsyncSession = Depends(get_session)):
     """A document or photo sent to the bot: read and answered exactly as on the site."""
-    return await chat_with_file(session, await _user_by_chat(session, chat_id), file, text)
+    return await chat_with_file(session, await _user_by_chat(session, chat_id), file, text, channel="telegram")
 
 
 @router.post("/chat/{chat_id}/messages/{message_id}/rating")
@@ -95,6 +96,12 @@ async def chat_rating(chat_id: int, message_id: int, payload: BotRatingRequest, 
         return await chat.rate(session, user, message_id, payload.value)
     except LookupError:
         raise HTTPException(status_code=404, detail="Message not found") from None
+
+
+@router.post("/chat/{chat_id}/questions/{question_id}/answer")
+async def chat_question_answer(chat_id: int, question_id: int, payload: QuestionAnswerRequest, session: AsyncSession = Depends(get_session)):
+    """A button, the user's own words or «Пропустить» under a hypothesis question in Telegram."""
+    return await save_question_answer(session, await _user_by_chat(session, chat_id), question_id, payload, "telegram")
 
 
 @router.post("/chat/{chat_id}/topic")
@@ -111,8 +118,9 @@ async def chat_topic(chat_id: int, payload: BotTopicRequest, session: AsyncSessi
 
 
 @router.get("/chat/{chat_id}/agenda/{scope}")
-async def chat_agenda(chat_id: int, scope: Literal["today", "tomorrow", "week"], session: AsyncSession = Depends(get_session)):
-    return await chat.agenda(session, await _user_by_chat(session, chat_id), scope)
+async def chat_agenda(chat_id: int, scope: Literal["today", "tomorrow", "week"], mark: bool = False, session: AsyncSession = Depends(get_session)):
+    """`mark`: the checklist «Отметить выполненные» — for today it starts with the unticked tasks of the last days."""
+    return await chat.agenda(session, await _user_by_chat(session, chat_id), scope, mark)
 
 
 @router.post("/chat/{chat_id}/undo")

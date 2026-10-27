@@ -2,7 +2,7 @@
 
 The whole file or only a period (a day, a month). Each event keeps its file's UID as external_id, so importing the
 same file again adds only what is new; the days of a repeating event make one series. Imported events stay in
-Dayla: they are not copied to the connected calendars (the file most likely came from one of them)."""
+Deyla: they are not copied to the connected calendars (the file most likely came from one of them)."""
 
 import hashlib
 from datetime import date, datetime, time, timedelta, timezone

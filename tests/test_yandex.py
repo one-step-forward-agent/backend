@@ -26,7 +26,7 @@ class FakeYandex:
         self.profile = {"default_email": "olga@yandex.ru"}
         self.puts: list[tuple[str, str]] = []
         self.event_day = (datetime.now(TZ) + timedelta(days=1)).strftime("%Y%m%d")
-        # The meeting's file as Yandex keeps it once Dayla changed it
+        # The meeting's file as Yandex keeps it once Deyla changed it
         self.meeting: str | None = None
 
     def ical(self) -> str:
@@ -103,7 +103,7 @@ async def connect(client, headers, fake_yandex) -> httpx.Response:
     url = urlparse(started.json()["authorization_url"])
     query = parse_qs(url.query)
     assert url.netloc == "oauth.yandex.ru" and query["scope"] == ["calendar:all login:email"]
-    # Yandex sends the browser back with the Dayla session cookie
+    # Yandex sends the browser back with the Deyla session cookie
     client.cookies.set(ACCESS_COOKIE, headers["Authorization"].split()[1])
     return await client.get("/auth/yandex/callback", params={"code": "code-1", "state": query["state"][0]})
 

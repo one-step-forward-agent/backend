@@ -217,7 +217,7 @@ async def test_google(client, user, services):
     assert (await connection(client, headers, "google"))["status"] == "connected"
     synced = (await client.post("/api/integrations/google/sync", headers=headers)).json()
     assert synced["created"] == 0 and await titles(client, headers) == ["Стендап в Google"]
-    # A task created in Dayla goes to Google Calendar by itself
+    # A task created in Deyla goes to Google Calendar by itself
     reply = (await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)).json()
     await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)
     assert services.created["google"] == ["Купить хлеб"]
@@ -231,7 +231,7 @@ async def test_expired_google_access_is_said_not_hidden(client, user, services):
     services.google_expired = True
     reply = (await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)).json()
     confirmed = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
-    # The task is in Dayla, and the reply says why it is not in Google instead of claiming it is
+    # The task is in Deyla, and the reply says why it is not in Google instead of claiming it is
     assert services.created["google"] == [] and GOOGLE_ACCESS_LOST in json.dumps(confirmed, ensure_ascii=False)
     item = await connection(client, headers, "google")
     assert item["status"] == "error" and item["last_sync_error"] == GOOGLE_ACCESS_LOST
@@ -318,7 +318,7 @@ async def test_apple_with_app_password(client, user, services):
     assert created["note"] == "Добавлено в Apple Calendar"
     assert "SUMMARY:Позвонить маме" in services.created["apple"][0]
 
-    # Deleted in Dayla — deleted in Apple too: the copy Dayla sent by its address, the imported one found by UID
+    # Deleted in Deyla — deleted in Apple too: the copy Deyla sent by its address, the imported one found by UID
     events = (await client.get("/api/events", params={"limit": 50}, headers=headers)).json()
     for event in events:
         assert (await client.delete(f"/api/events/{event['id']}", headers=headers)).status_code in (200, 204)

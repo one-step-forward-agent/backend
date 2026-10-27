@@ -40,7 +40,7 @@ async def lifespan(_: FastAPI):
 
 
 docs = {} if settings.enable_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
-app = FastAPI(title="Dayla API", version="0.1.0", lifespan=lifespan, **docs)
+app = FastAPI(title="Deyla API", version="0.1.0", lifespan=lifespan, **docs)
 errors.install(app)
 
 

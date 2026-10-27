@@ -71,7 +71,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `INTEGRATIONS_ENCRYPTION_KEY` | Fernet key for integration credentials; derived from `SECRET_KEY` if empty |
 | `BOT_API_TOKEN` | Shared secret for the bot's `/internal/bot/*` API (same value in `tg_bot/.env`) |
 | `TELEGRAM_BOT_USERNAME` | Bot username, used for the `t.me/<bot>?start=<code>` linking link |
-| `PUBLIC_APP_URL` | Public `https://` address of the site; the bot links events to it with "Открыть в Dayla" buttons (hidden when empty) |
+| `PUBLIC_APP_URL` | Public `https://` address of the site; the bot links events to it with "Открыть в Deyla" buttons (hidden when empty) |
 | `DEFAULT_TIMEZONE` | Fallback user timezone (default `Europe/Moscow`) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth client |
 | `GOOGLE_REDIRECT_URI` | OAuth callback, must end with `/auth/google/callback` |

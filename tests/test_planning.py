@@ -246,9 +246,9 @@ async def test_passed_meetings_are_not_all_done(client, user):
         now = datetime.now(TZ).replace(second=0, microsecond=0)
         for offset in (1, 2, 3):
             start = datetime.combine(now.date() - timedelta(days=offset), time(10), TZ)
-            session.add(Event(calendar_id=calendar.id, user_id=row.id, title=f"Встреча {offset}", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google"))
+            session.add(Event(calendar_id=calendar.id, user_id=row.id, title=f"Встреча {offset}", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google", imported=True))
         start = now - timedelta(hours=2)
-        session.add(Event(calendar_id=calendar.id, user_id=row.id, title="Планёрка", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google"))
+        session.add(Event(calendar_id=calendar.id, user_id=row.id, title="Планёрка", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google", imported=True))
         await session.commit()
         assert await tasks.streaks(session, row, now) == (0, 0)
         text, _ = await insights.evening(session, row, now)
@@ -326,3 +326,32 @@ async def test_stats_compare_with_the_previous_week(client, user):
     headers, _ = user
     reply = await chat(client, headers, "Статистика")
     assert reply["kind"] == "stats" and "previous_percent" in reply and isinstance(reply["habits"], dict)
+
+
+async def test_a_dayla_task_sent_to_google_stays_the_users_own(client, user):
+    """Sent to Google, a task says source "google" for the sync, but it is not a meeting from there: it is not done
+    when its time passes, and an unticked one from a past day can be ticked from the evening summary (testers: «4 из 4»
+    with two tasks open, and «Не успели» tasks that «Отметить выполненные» did not list)."""
+    headers, chat_id = user
+    async with session_factory() as session:
+        row = await user_row(session, chat_id)
+        calendar = await tasks.default_calendar(session, row, "Europe/Moscow")
+        now = datetime.now(TZ).replace(second=0, microsecond=0)
+        start = now - timedelta(hours=2)
+        sent = Event(calendar_id=calendar.id, user_id=row.id, title="Стартап", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google", external_id="g-startup", sync_status="synced")
+        day = datetime.combine(now.date() - timedelta(days=2), time.min, TZ)
+        left = Event(calendar_id=calendar.id, user_id=row.id, title="Сдать САПР", start_at=day, end_at=day + timedelta(days=1), all_day=True, timezone="Europe/Moscow", source="google", external_id="g-sapr", sync_status="synced")
+        session.add_all([sent, left])
+        await session.commit()
+        assert not tasks.is_done(sent, now) and not tasks.is_fixed(sent) and tasks.is_overdue(left, now.date(), TZ)
+        text, _ = await insights.evening(session, row, now)
+        assert "Выполнено 0 из 1" in text and "Сдать САПР" in text
+        left_id = left.id
+
+    listed = (await client.get(f"/internal/bot/chat/{chat_id}/agenda/today?mark=true", headers=BOT_HEADERS)).json()
+    assert "Сдать САПР" in [event["title"] for day in listed["days"] for event in day["events"]]
+    done = await client.post(f"/internal/bot/chat/{chat_id}/events/{left_id}/complete", json={"completed": True}, headers=BOT_HEADERS)
+    assert done.status_code == 200
+    async with session_factory() as session:
+        text, _ = await insights.evening(session, await user_row(session, chat_id), now)
+    assert "Сдать САПР" not in text

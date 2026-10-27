@@ -1,6 +1,6 @@
 """The chat assistant as an agent.
 
-GigaChat reads the user's message together with what Dayla knows about them (the onboarding profile, habits,
+GigaChat reads the user's message together with what Deyla knows about them (the onboarding profile, habits,
 the plan for the coming days) and says, in one call of the function `act`, what the user wants: a list of operations
 (find, create, change, delete, complete, remind, analyse, …), each with a filter of the tasks it is about (ids,
 a period, words of the title, a state, tags, a time of day). The app finds the tasks by the filter and does the work
@@ -22,8 +22,9 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.models import ConversationMessage, Event, Tag, User
-from app.services import attachments, chat, dates, insights, reminders, tasks
+from app.services import attachments, chat, dates, insights, reminders, research, tasks
 from app.core.lang import is_en, tr
 from app.services.ru import MONTHS, WEEKDAYS, WEEKDAYS_SHORT, day_label, plural
 
@@ -116,6 +117,8 @@ ACTIONS = {
     "analyze": "анализ загрузки, советы, «что перенести», «как всё успеть», «разгрузи»: period",
     "breakdown": "разбить большую цель на шаги до срока: goal, deadline",
     "stats": "статистика выполнения",
+    "answer_question": "сообщение — ответ на вопрос из блока «ВОПРОС»: answer",
+    "wish": "просьба о том, чего Deyla не умеет: text",
 }
 
 OPERATION = {
@@ -132,7 +135,8 @@ OPERATION = {
         "new_title": {"type": "string", "description": "Для change: новое название"},
         "untimed": {"type": "boolean", "description": "Для change: true — убрать время, задача на весь день"},
         "tags": {"type": "array", "items": {"type": "string"}, "description": "Для change: поставить задачам эти теги, без #"},
-        "text": {"type": "string", "description": "Для remind: о чём напомнить, коротко: «Помыть посуду»"},
+        "text": {"type": "string", "description": "Для remind: о чём напомнить, коротко: «Помыть посуду». Для wish: что хочет пользователь, коротко: «Заказать такси»"},
+        "answer": {"type": "string", "description": "Для answer_question: ответ пользователя его словами, коротко"},
         "in_minutes": {"type": "integer", "description": "Для remind: через сколько минут от текущего момента"},
         "at": {"type": "string", "description": "Для remind: когда (первый раз): слова пользователя («завтра в 9:00», «в 18:30») или YYYY-MM-DDTHH:MM"},
         "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekly", "monthly"], "description": "Для remind: повтор — каждый день, по будням, каждую неделю, каждый месяц"},
@@ -157,6 +161,7 @@ EXAMPLES = [
     ("напомни через 2 часа выключить духовку", [{"action": "remind", "text": "Выключить духовку", "in_minutes": 120}]),
     ("напоминай каждый день в 9:00 пить витамины", [{"action": "remind", "text": "Пить витамины", "at": "в 9:00", "repeat": "daily"}]),
     ("Как мне всё успеть на этой неделе?", [{"action": "analyze", "period": "week"}]),
+    ("Закажи мне такси на 9 утра", [{"action": "wish", "text": "Заказать такси"}]),
 ]
 
 
@@ -278,6 +283,11 @@ class Turn:
     # A small model misreads long ids (2950 → 3950): tasks get short numbers for this turn, alias → event id
     refs: dict[int, int] = field(default_factory=dict)
     aliases: dict[int, int] = field(default_factory=dict)
+    # The hypothesis question of the previous answer, still unanswered (app.services.research.pending)
+    question: dict | None = None
+    # The user answered it, or asked for something Deyla cannot do: the app words the reply
+    answered: bool = False
+    wished: bool = False
 
     def ref(self, event_id: int) -> int:
         if event_id not in self.aliases:
@@ -900,11 +910,11 @@ async def create_reminder(turn: Turn, args: dict) -> dict:
 
 
 NO_TELEGRAM = (
-    "Напоминания приходят в Telegram-бот Dayla, а он у вас ещё не подключён. "
+    "Напоминания приходят в Telegram-бот Deyla, а он у вас ещё не подключён. "
     "Подключите его в разделе «Интеграции» и повторите просьбу — напоминание придёт вовремя."
 )
 NO_TELEGRAM_EN = (
-    "Reminders come from the Dayla Telegram bot, and it isn't connected yet. "
+    "Reminders come from the Deyla Telegram bot, and it isn't connected yet. "
     "Connect it in Integrations and ask again — the reminder will arrive on time."
 )
 REMINDER_VERB = re.compile(r"(?:поставь(?:те)?\s+)?(?:напомни(?:те)?|напоминай(?:те)?|напоминание)(?:\s+(?:мне|нам))?", re.I)
@@ -1099,6 +1109,21 @@ async def get_stats(turn: Turn, args: dict) -> dict:
     return {key: value for key, value in turn.stats.items() if key != "kind"}
 
 
+async def answer_question(turn: Turn, args: dict) -> dict:
+    if not turn.question:
+        return {"error": "Вопроса пользователю сейчас нет."}
+    answer = str(args.get("answer") or "").strip() or own_words(turn.text)
+    await research.record_answer(turn.session, turn.user, turn.question["id"], answer, "chat", research.current_channel.get())
+    turn.answered = True
+    return {"ok": True}
+
+
+async def log_wish(turn: Turn, args: dict) -> dict:
+    await research.log_wish(turn.session, turn.user, str(args.get("text") or ""), own_words(turn.text), research.current_channel.get())
+    turn.wished = True
+    return {"ok": True}
+
+
 FILTER_KEYS = tuple(FILTER["properties"])
 
 
@@ -1126,8 +1151,11 @@ OPERATIONS = {
     "analyze": analyze_plan,
     "breakdown": breakdown_task,
     "stats": get_stats,
+    "answer_question": answer_question,
+    "wish": log_wish,
 }
 NOT_ASKED = {
+    "answer_question": "Вопроса пользователю сейчас нет.",
     "delete": "Пользователь не просил ничего удалять.",
     "remind": "Пользователь не просил напомнить: дело в календаре — это create.",
     "reopen": "Пользователь не просил возвращать задачи в невыполненные.",
@@ -1190,7 +1218,7 @@ def profile_text(user: User) -> str:
     if user.name:
         lines.append(f"Имя: {user.name}")
     if profile.get("purpose"):
-        lines.append("Для чего использует Dayla: " + ", ".join(str(item) for item in profile["purpose"]))
+        lines.append("Для чего использует Deyla: " + ", ".join(str(item) for item in profile["purpose"]))
     spheres = [item for item in profile.get("spheres") or [] if isinstance(item, dict) and item.get("name")]
     if spheres:
         spheres.sort(key=lambda item: item.get("priority") if isinstance(item.get("priority"), int) else 99)
@@ -1271,18 +1299,15 @@ async def reminders_text(turn: Turn) -> str:
     ) or "(нет)"
 
 
-async def system_prompt(turn: Turn) -> str:
-    profile = turn.user.profile if isinstance(turn.user.profile, dict) else {}
-    tone = TONES.get(profile.get("toneOfVoice"), TONES["neutral"])
-    known = insights.habits_text(await insights.habits(turn.session, turn.user, turn.now))
+def system_prompt() -> str:
+    """The rules: the same in every request of every user, so the API serves them, and the function spec after them,
+    from its prompt cache. What depends on the user or the message is in context_prompt."""
     from services.gigachat import PERSONA, PERSONAL_ADVICE
 
-    telegram = "подключён" if turn.user.telegram_chat_id else "НЕ подключён (напоминания не дойдут — предложи подключить Telegram в разделе «Интеграции»)"
     return (
         PERSONA
         + "Ты ведёшь календарь пользователя и помогаешь ему планировать день: отвечаешь на вопросы о плане, добавляешь, переносишь, "
-        "изменяешь, удаляешь и отмечаешь задачи, ставишь напоминания, анализируешь загрузку и даёшь советы.\n"
-        f"Говори {tone} — так пользователь выбрал при знакомстве.\n\n"
+        "изменяешь, удаляешь и отмечаешь задачи, ставишь напоминания, анализируешь загрузку и даёшь советы.\n\n"
         "ПРАВИЛА\n"
         "1. Любое действие с календарём и напоминаниями — только вызовом функции act: в operations перечисли всё, о чём просит "
         "пользователь, по операции на каждое действие. Никогда не пиши текстом, что что-то сделала: результат сообщит приложение.\n"
@@ -1307,9 +1332,26 @@ async def system_prompt(turn: Turn) -> str:
         "до 5–6 предложений или строки «• …», без markdown-заголовков, таблиц и номеров задач.\n"
         "10. Теги ставь полем tags (в events у create или в change), а не символом # в названии. Бери тег из блока «Теги»; "
         "если пользователь называет новый тег — передай его, приложение создаст его само.\n"
-        "11. Ты умеешь писать пользователю в Telegram: напоминания приходят от бота Dayla. Файлы, которые пользователь прикладывает "
+        "11. Ты умеешь писать пользователю в Telegram: напоминания приходят от бота Deyla. Файлы, которые пользователь прикладывает "
         "к сообщению, ты читаешь (их текст — в сообщении после «📎»). «Пришли этот файл в 21:00» с приложенным файлом — remind: "
-        "бот пришлёт файл вместе с напоминанием. Никогда не говори, что у тебя нет доступа к файлам или к Telegram.\n\n"
+        "бот пришлёт файл вместе с напоминанием. Никогда не говори, что у тебя нет доступа к файлам или к Telegram.\n"
+        "12. Пользователь просит сделать то, чего Deyla не умеет (заказать такси или еду, оплатить, написать или позвонить "
+        "кому-то, синхронизировать с сервисом, которого нет в «Интеграциях»), — wish: text — что он хочет, коротко. Ничего не "
+        "обещай и не объясняй — приложение ответит само. Вопрос не о планах («кто написал «Войну и мир»?») — это не wish.\n"
+        "13. Если в контексте есть блок «ВОПРОС» и сообщение отвечает на него — answer_question: answer — ответ словами "
+        "пользователя, даже если ответ похож на пожелание (тогда не wish). Сообщение о другом — выполни его как обычно, "
+        "вопрос не упоминай."
+    )
+
+
+async def context_prompt(turn: Turn) -> str:
+    """The time, the user and their plan: a second system message, after the rules and the function spec."""
+    profile = turn.user.profile if isinstance(turn.user.profile, dict) else {}
+    tone = TONES.get(profile.get("toneOfVoice"), TONES["neutral"])
+    known = insights.habits_text(await insights.habits(turn.session, turn.user, turn.now))
+    telegram = "подключён" if turn.user.telegram_chat_id else "НЕ подключён (напоминания не дойдут — предложи подключить Telegram в разделе «Интеграции»)"
+    return (
+        f"Говори {tone} — так пользователь выбрал при знакомстве.\n\n"
         f"СЕЙЧАС: {turn.now:%Y-%m-%d %H:%M}, {WEEKDAYS[turn.now.weekday()]}. Часовой пояс: {turn.tz}.\n\n"
         f"ТАБЛИЦА ДНЕЙ:\n{day_table(turn.today)}\n\n"
         f"О ПОЛЬЗОВАТЕЛЕ (из знакомства):\n{profile_text(turn.user)}\n\n"
@@ -1365,14 +1407,38 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
     from services.gigachat import GigaChatClient
 
     turn = Turn(session=session, user=user, tz=tz, now=datetime.now(tz), text=text, attachment=attachment)
-    messages = [{"role": "system", "content": await system_prompt(turn)}, *await history_messages(turn), {"role": "user", "content": text[:8000]}]
+    # The plan first: its tasks get the short numbers 1, 2, 3…
+    context = await context_prompt(turn)
+    history = await history_messages(turn)
     client = GigaChatClient()
-    previous = next((message["content"] for message in reversed(messages[1:-1]) if message["role"] == "user"), "")
+    previous = next((message["content"] for message in reversed(history) if message["role"] == "user"), "")
     turn.allowed = offered(text, previous, attachment is not None)
+    turn.question = await research.pending(session, user)
+    if turn.question:
+        options = f" Варианты: {'; '.join(turn.question['options'])}." if turn.question.get("options") else ""
+        context += (
+            f"\n\nВОПРОС, который ты недавно задала пользователю (чтобы понять, куда развивать Deyla): «{turn.question['text']}».{options} "
+            "Если сообщение отвечает на него — вызови act с answer_question и ответом пользователя, а не wish и не текст."
+        )
+    else:
+        turn.allowed -= {"answer_question"}
     turn.free_time = chat.is_free_time_question(text) or (
         len(text) <= FOLLOW_UP_LIMIT and chat.is_free_time_question(previous) and not chat.FREE_TIME_ACTION.search(text)
     )
-    specs = functions(turn.today, turn.allowed)
+    if settings.uses_openai:
+        # The same spec in every request, so the API caches it with the rules; the actions this message may need
+        # are named in the context, and act() refuses the others
+        specs = functions(turn.today)
+        if turn.allowed != set(ACTIONS):
+            context += f"\n\nДЕЙСТВИЯ для этого сообщения: {', '.join(name for name in ACTIONS if name in turn.allowed)}."
+    else:
+        specs = functions(turn.today, turn.allowed)
+    messages = [
+        {"role": "system", "content": system_prompt()},
+        {"role": "system", "content": context},
+        *history,
+        {"role": "user", "content": text[:8000]},
+    ]
     answer = None
     corrected = False
     for _ in range(MAX_STEPS):
@@ -1414,6 +1480,11 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
             break
     if turn.blocked and not turn.changed:
         return {"kind": "answer", "text": turn.blocked}
+    if turn.wished:
+        turn.notes.append(research.wish_answer())
+    if (turn.wished or turn.answered) and not turn.changed and not turn.analysed and turn.listed is None and turn.stats is None:
+        await session.commit()
+        return {"kind": "answer", "text": research.wish_answer() if turn.wished else tr(research.THANKS, research.THANKS_EN)}
     if not turn.changed and not turn.analysed:
         reply = await by_rules(turn)
         if reply is not None:

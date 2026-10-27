@@ -92,9 +92,14 @@ async def tags_by_name(session: AsyncSession, user: User, names) -> tuple[list[i
     return ids, created
 
 
+def is_external(event: Event) -> bool:
+    """A meeting from another calendar, not the user's task: a Deyla task sent to Google is not one."""
+    return bool(event.imported) and event.source in EXTERNAL_SOURCES
+
+
 def is_fixed(event: Event) -> bool:
     """A task that must stay where it is: marked so, or a meeting synced from another calendar."""
-    return bool(event.is_fixed) or (not event.all_day and event.source in EXTERNAL_SOURCES)
+    return bool(event.is_fixed) or (not event.all_day and is_external(event))
 
 
 async def owned_tag_ids(session: AsyncSession, user: User, ids) -> list[int]:
@@ -135,6 +140,7 @@ def _copy(template: Event, moment: datetime, duration: timedelta) -> Event:
         recurrence_rule=template.recurrence_rule,
         series_id=template.series_id,
         source=template.source,
+        imported=template.imported,
         is_fixed=template.is_fixed,
         tag_ids=list(template.tag_ids or []),
         # A deadline belongs to one task; occurrences of a series do not share it
@@ -222,7 +228,7 @@ async def create_tasks(
         moments = occurrences(rule, begins, now + SERIES_HORIZON, limit=min(MAX_OCCURRENCES, budget)) if rule else [begins]
         group = [_copy(template, moment, ends - begins) for moment in moments or [begins]]
         if not push_google:
-            # Kept in Dayla only: the Google catch-up leaves them alone
+            # Kept in Deyla only: the Google catch-up leaves them alone
             for event in group:
                 event.sync_status = "skipped"
         session.add_all(group)
@@ -261,7 +267,7 @@ async def extend_series(session: AsyncSession, now: datetime, force: bool = Fals
         moments = following(latest, first_start, now + SERIES_HORIZON)
         copies = [_copy(latest, moment, latest.end_at - latest.start_at) for moment in moments]
         for copy in copies:
-            # A series is made in Dayla; its sent days say "google", the new ones are Dayla's until sent too
+            # A series is made in Deyla; its sent days say "google", the new ones are Deyla's until sent too
             if copy.source == "google":
                 copy.source = "local"
             copy.sync_status = "skipped" if latest.sync_status == "skipped" else "not_synced"
@@ -360,8 +366,8 @@ async def events_between(session: AsyncSession, user: User, start: datetime, end
 
 def is_done(event: Event, now: datetime) -> bool:
     """A task is done when marked so. A meeting synced from another calendar (Google, Apple…) cannot be marked
-    in Dayla, so it counts as done once its time is over; the user's own tasks need the mark."""
-    return event.completed_at is not None or (event.source in EXTERNAL_SOURCES and not event.all_day and event.end_at <= now)
+    in Deyla, so it counts as done once its time is over; the user's own tasks need the mark."""
+    return event.completed_at is not None or (is_external(event) and not event.all_day and event.end_at <= now)
 
 
 def is_overdue(event: Event, today: date, tz: ZoneInfo) -> bool:
@@ -370,7 +376,7 @@ def is_overdue(event: Event, today: date, tz: ZoneInfo) -> bool:
     return (
         event.completed_at is None
         and event.series_id is None
-        and event.source not in EXTERNAL_SOURCES
+        and not is_external(event)
         and (event.end_at - timedelta(microseconds=1)).astimezone(tz).date() < today
     )
 
@@ -432,7 +438,7 @@ async def streaks(session: AsyncSession, user: User, now: datetime) -> tuple[int
             counts = per_day.setdefault(day, [0, 0, 0])
             counts[0] += 1
             counts[1] += is_done(event, now)
-            counts[2] += event.source not in EXTERNAL_SOURCES
+            counts[2] += not is_external(event)
     current = best = run = 0
     current_open = True
     for offset in range(STREAK_DAYS):

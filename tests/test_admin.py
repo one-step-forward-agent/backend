@@ -30,7 +30,7 @@ async def test_only_admins_open_the_dashboard(client):
 async def test_tables_are_depersonalized(client, services):
     headers, email = await account(client, "admin", admin=True)
     assert (await client.get("/api/me", headers=headers)).json()["is_admin"] is True
-    # Created before Google is connected, the task stays Dayla's own; with Google it would go there too
+    # Created before Google is connected, the task stays Deyla's own; with Google it would go there too
     await client.post("/api/events", json={"title": "Купить хлеб", "start_at": "2030-01-01T10:00:00+03:00", "end_at": "2030-01-01T11:00:00+03:00"}, headers=headers)
     await oauth_connect(client, headers, "google")
 
@@ -55,7 +55,7 @@ async def test_tables_are_depersonalized(client, services):
     events = (await client.get("/api/admin/tables/events", headers=headers)).json()
     names = [column["name"] for column in events["columns"]]
     mine = {row[names.index("source")]: row[names.index("title")] for row in events["data"] if row[names.index("user_id")] == me}
-    # Titles are pseudonyms, Google's and Dayla's alike: the same title gives the same pseudonym
+    # Titles are pseudonyms, Google's and Deyla's alike: the same title gives the same pseudonym
     assert mine == {"google": pseudonym("Стендап в Google"), "local": pseudonym("Купить хлеб")}
     assert "Купить хлеб" not in str(events["data"]) and "Стендап" not in str(events["data"])
     assert (await client.get("/api/admin/tables/admin_notes", headers=headers)).status_code == 404

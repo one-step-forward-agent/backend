@@ -1,4 +1,4 @@
-"""User's notes of 2026-10-20: events deleted or changed in Google Calendar stayed in Dayla; the assistant answered
+"""User's notes of 2026-10-20: events deleted or changed in Google Calendar stayed in Deyla; the assistant answered
 in Russian on the English site; files sent to the chat were pasted into the input as text instead of being read
 by the server, the same way for the site and Telegram; Yandex Calendar blinked between "connected" and a server
 error; a reminder about a call should carry the call's link."""
@@ -68,7 +68,7 @@ async def test_a_change_google_has_not_taken_yet_is_not_deleted(client, user, se
     headers, _ = user
     items = calendar_returns(monkeypatch, google_integration.GoogleIntegration, [remote("g-1", "Планёрка")])
     await oauth_connect(client, headers, "google")
-    # Changed in Dayla, Google did not take it yet: the local version wins, even when Google lists it no more
+    # Changed in Deyla, Google did not take it yet: the local version wins, even when Google lists it no more
     async with session_factory() as session:
         await session.execute(update(Event).where(Event.external_id == "g-1").values(sync_status="pending"))
         await session.commit()
@@ -129,12 +129,12 @@ async def test_the_english_site_gets_english_template_replies(client, user):
 def test_the_english_site_tells_the_model_to_answer_in_english():
     from services.gigachat import in_site_language
 
-    messages = [{"role": "system", "content": "Ты — Dayla."}, {"role": "user", "content": "hi"}]
+    messages = [{"role": "system", "content": "Ты — Deyla."}, {"role": "user", "content": "hi"}]
     assert in_site_language(messages) == messages
     token = lang.current.set("en")
     try:
         system, user_message = in_site_language(messages)
-        assert system["content"].startswith("Ты — Dayla.") and "must be in natural English" in system["content"]
+        assert system["content"].startswith("Ты — Deyla.") and "must be in natural English" in system["content"]
         assert user_message == messages[1]
         # A prompt without a system message gets one
         assert in_site_language([{"role": "user", "content": "x"}])[0]["role"] == "system"

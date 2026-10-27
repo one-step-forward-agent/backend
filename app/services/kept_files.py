@@ -1,4 +1,4 @@
-"""Files Dayla keeps for a while, unlike chat attachments, which are read and deleted at once.
+"""Files Deyla keeps for a while, unlike chat attachments, which are read and deleted at once.
 
 A voice message is kept while the chat shows it: clearing the chat or pruning old messages deletes it.
 A file sent with a reminder ("пришли этот файл в 21:00") is kept until no unsent reminder needs it.

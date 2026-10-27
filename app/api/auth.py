@@ -162,13 +162,13 @@ def _check_email_code(email: str, token: str | None, code: str | None) -> None:
 def _code_letter(code: str) -> tuple[str, str, str]:
     minutes = int(EMAIL_CODE_LIFETIME.total_seconds() // 60)
     if lang.is_en():
-        subject = f"{code} — your Dayla sign-up code"
+        subject = f"{code} — your Deyla sign-up code"
         lead = "Your code to confirm the email:"
-        note = f"It works for {minutes} minutes. If you did not sign up for Dayla, ignore this letter."
+        note = f"It works for {minutes} minutes. If you did not sign up for Deyla, ignore this letter."
     else:
-        subject = f"{code} — код для регистрации в Dayla"
+        subject = f"{code} — код для регистрации в Deyla"
         lead = "Код подтверждения email:"
-        note = f"Он действует {minutes} минут. Если вы не регистрировались в Dayla, просто проигнорируйте это письмо."
+        note = f"Он действует {minutes} минут. Если вы не регистрировались в Deyla, просто проигнорируйте это письмо."
     html = (
         '<div style="font-family:Arial,sans-serif;font-size:15px;color:#111827">'
         f"<p>{lead}</p>"
@@ -497,7 +497,7 @@ class SignInRefused(Exception):
 
 
 def _callback_entry(state: str, access_cookie: str | None, title: str) -> dict | RedirectResponse:
-    """The state of a callback. Connecting links the provider only to the Dayla account logged in in this browser:
+    """The state of a callback. Connecting links the provider only to the Deyla account logged in in this browser:
     otherwise an attacker could send a victim their own authorization link and receive the victim's calendar."""
     entry = _state_data(state)
     if entry["mode"] != "connect":
@@ -510,7 +510,7 @@ def _callback_entry(state: str, access_cookie: str | None, title: str) -> dict |
         next_path = entry["return_to"] or "/app/integrations"
         return RedirectResponse(url=f"/login?next={quote(next_path, safe='/')}", status_code=303)
     if session_user_id != entry["user_id"]:
-        raise HTTPException(status_code=403, detail=f"Ссылка подключения {title} создана для другого аккаунта Dayla")
+        raise HTTPException(status_code=403, detail=f"Ссылка подключения {title} создана для другого аккаунта Deyla")
     return entry
 
 
@@ -520,7 +520,7 @@ async def _link_identity(session: AsyncSession, provider: str, subject: str | No
 
 
 async def _callback_user(session: AsyncSession, entry: dict, provider: str, subject: str | None, email: str | None, name: str | None) -> User:
-    """The Dayla user of a callback. Connecting: the logged-in user. Logging in or signing up: the user this provider
+    """The Deyla user of a callback. Connecting: the logged-in user. Logging in or signing up: the user this provider
     account signed in before, or whose email it is (a password account gets this way of signing in too), or a new
     account with the provider's email when the user accepted the terms. `email` is passed only when the provider
     has verified it: Google, Yandex, Notion and Atlassian confirm the address belongs to the account, as a password
@@ -528,7 +528,7 @@ async def _callback_user(session: AsyncSession, entry: dict, provider: str, subj
     if entry["mode"] == "connect":
         user = await session.get(User, entry["user_id"])
         if not user:
-            raise HTTPException(status_code=401, detail="Пользователь Dayla не найден")
+            raise HTTPException(status_code=401, detail="Пользователь Deyla не найден")
         # Connected once, the account also logs in
         await _link_identity(session, provider, subject, user.id)
         return user
@@ -564,7 +564,7 @@ async def _callback_user(session: AsyncSession, entry: dict, provider: str, subj
 async def _finish_callback(
     session: AsyncSession, entry: dict, user_id: int, provider: str, error: str | None = None, connected: bool = True
 ) -> RedirectResponse:
-    """The redirect back to the site; signing up or logging in also starts the Dayla session.
+    """The redirect back to the site; signing up or logging in also starts the Deyla session.
     `error`: the account is there, but the service was not connected — the page shows why.
     connected=False: only the account (Google sign-up), the page connects the services it was asked to."""
     return_to = entry["return_to"]
