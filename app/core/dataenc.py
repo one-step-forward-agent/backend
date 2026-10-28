@@ -168,10 +168,15 @@ class EncryptedJSON(TypeDecorator):
         return None if value is None else encrypt(json.dumps(value, ensure_ascii=False), self.context)
 
     def process_result_value(self, value: str | None, dialect) -> Any:
-        if value is None:
-            return None
-        text = decrypt(value, self.context)
-        try:
-            return json.loads(text)
-        except ValueError:
-            return None
+        return None if value is None else decrypt_json(value, self.context)
+
+
+def decrypt_json(token: str, context: str) -> Any:
+    """The JSON value in a column; a value sealed twice (ciphertext stored as a JSON string) is unwrapped."""
+    try:
+        value = json.loads(decrypt(token, context))
+        while is_encrypted(value):
+            value = json.loads(decrypt(value, context))
+        return value
+    except ValueError:
+        return None

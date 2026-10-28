@@ -1,5 +1,6 @@
 import base64
 import dataclasses
+import json
 import os
 
 from sqlalchemy import select, text
@@ -112,3 +113,26 @@ async def test_reminders_and_integration_details_are_ciphertext(client, user):
         assert (await session.get(Notification, reminder_id)).payload == {"text": "Выпить таблетки от давления"}
         stored = await session.scalar(select(Integration).where(Integration.user_id == me["id"], Integration.provider == "jira"))
         assert stored.config["email"] == "anna@corp.ru" and "anna@corp.ru" in stored.last_sync_error
+
+
+async def test_double_encrypted_integration_config_still_lists(client, user):
+    """0036 sealed a value that was already ciphertext once more; /api/integrations crashed on it."""
+    from app.models.models import Integration
+
+    headers, _ = user
+    me = (await client.get("/api/me", headers=headers)).json()
+    context = "integrations.config"
+    once = dataenc.encrypt(json.dumps({"email": "anna@corp.ru"}), context)
+    async with session_factory() as session:
+        session.add(Integration(user_id=me["id"], provider="jira", config={}))
+        await session.commit()
+        await session.execute(
+            text("UPDATE integrations SET config = :value WHERE user_id = :id AND provider = 'jira'"),
+            {"value": dataenc.encrypt(json.dumps(once), context), "id": me["id"]},
+        )
+        await session.commit()
+
+    response = await client.get("/api/integrations", headers=headers)
+    assert response.status_code == 200, response.text
+    jira = next(item for item in response.json() if item["connection"] and item["connection"]["provider"] == "jira")
+    assert jira["connection"]["config"]["email"] == "anna@corp.ru"

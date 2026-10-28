@@ -23,7 +23,7 @@ async def main() -> None:
             while True:
                 rows = (
                     await connection.execute(
-                        text(f"SELECT id, {column} FROM {table} WHERE id > :last AND {column} IS NOT NULL ORDER BY id LIMIT {BATCH}")  # nosec B608 - names come from the fixed COLUMNS list,
+                        text(f"SELECT id, {column} FROM {table} WHERE id > :last AND {column} IS NOT NULL ORDER BY id LIMIT {BATCH}"),  # nosec B608 - names come from the fixed COLUMNS list
                         {"last": last_id},
                     )
                 ).all()
@@ -33,7 +33,7 @@ async def main() -> None:
                     plain = decrypt(value, context)
                     if kind == "json":
                         plain = json.dumps(json.loads(plain), ensure_ascii=False)
-                    await connection.execute(text(f"UPDATE {table} SET {column} = :value WHERE id = :id")  # nosec B608 - names come from the fixed COLUMNS list, {"value": encrypt(plain, context), "id": row_id})
+                    await connection.execute(text(f"UPDATE {table} SET {column} = :value WHERE id = :id"), {"value": encrypt(plain, context), "id": row_id})  # nosec B608 - names come from the fixed COLUMNS list
                     changed += 1
                 last_id = rows[-1][0]
             print(f"{context}: {changed}")
