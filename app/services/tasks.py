@@ -365,9 +365,8 @@ async def events_between(session: AsyncSession, user: User, start: datetime, end
 
 
 def is_done(event: Event, now: datetime) -> bool:
-    """A task is done when marked so. A meeting synced from another calendar (Google, Apple…) cannot be marked
-    in Deyla, so it counts as done once its time is over; the user's own tasks need the mark."""
-    return event.completed_at is not None or (is_external(event) and not event.all_day and event.end_at <= now)
+    """A task is done only when marked so — a synced meeting too: one whose time passed unticked is not done."""
+    return event.completed_at is not None
 
 
 def is_overdue(event: Event, today: date, tz: ZoneInfo) -> bool:
@@ -425,8 +424,8 @@ async def streaks(session: AsyncSession, user: User, now: datetime) -> tuple[int
 
     A day counts when it had tasks and all of them are done. A day without tasks neither
     counts nor breaks the series; today counts once finished and never breaks it, since it is in progress.
-    A day of nothing but meetings from other calendars is a day without tasks: they pass by themselves,
-    and the series must not grow while the user does nothing."""
+    A day of nothing but meetings from other calendars is a day without tasks: the series must not grow
+    from them alone."""
     tz = now.tzinfo
     today = now.date()
     first = today - timedelta(days=STREAK_DAYS - 1)

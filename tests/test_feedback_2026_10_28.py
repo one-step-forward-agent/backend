@@ -97,3 +97,37 @@ async def test_one_after_another_and_the_rest_of_the_day_after_it(client, user, 
     # The day's own tasks one after another from 14:00: the timed one first, the untimed one after it
     assert times[("Созвон", call)] == ("14:00", "15:00")
     assert times[("Статья печать", article)] == ("15:00", "16:00")
+
+
+async def test_tasks_already_in_the_plan_move_instead_of_doubling(client, user, agent):
+    """"сделай, чтобы в сб в 11 был урок с Лизой, потом зал часа на два, потом остальные планы": the lesson and the gym
+    are already that day, partly synced from Google — they are changed, not added again, and the rest moves after the gym."""
+    from sqlalchemy import update
+
+    from app.core.database import session_factory
+    from app.models.models import Event
+
+    headers, _ = user
+    saturday = datetime.now(TZ).date() + timedelta(days=(5 - datetime.now(TZ).weekday()) % 7 or 7)
+    day, short = saturday.isoformat(), f"{saturday.day}.{saturday.month:02d}"
+    [lesson] = await add(client, headers, f"урок с Лизой {short} с 11:00 до 12:00")
+    [gym] = await add(client, headers, f"зал {short} с 17:00 до 18:30")
+    [sx6] = await add(client, headers, f"сх6 {short} с 10:30 до 11:45")
+    async with session_factory() as session:
+        await session.execute(update(Event).where(Event.id.in_([lesson, sx6])).values(source="google", imported=True))
+        await session.commit()
+    agent(
+        [
+            act(
+                op("create", events=[{"title": "Урок с Лизой", "date": day, "start_time": "11:00", "end_time": "12:00"}, {"title": "Зал", "date": day, "start_time": "12:00", "duration_minutes": 120}]),
+                op("change", filter={"date_from": day, "status": "open", "all": True}, new_time="14:00", one_by_one=True),
+            )
+        ]
+    )
+    reply = await say(client, headers, "сделай так чтобы у меня в сб с утра часов в 11:00 был урок с Лизой потом я хочу сразу сходить в зал часа на два а потом доделать оставшиеся планы")
+    assert reply["kind"] == "proposal"
+    assert all(event.get("event_id") for event in reply["events"]), "nothing new is added"
+    times = {event["event_id"]: (event["time"], event["end_time"]) for event in reply["events"]}
+    assert times[gym] == ("12:00", "14:00")
+    assert times[sx6] == ("14:00", "15:15")
+    assert lesson not in times

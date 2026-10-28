@@ -644,7 +644,7 @@ async def create_events(turn: Turn, args: dict) -> dict:
         return {"error": "Передай events — список задач."}
     if turn.delete:
         return {"error": "В этом ответе уже предложено удаление. Добавление предложи следующим сообщением."}
-    added, problems = [], []
+    added, moved, problems = [], [], []
     whole = None
     if len(raw) == 1 and not turn.items:
         _, rest = chat.take_deadline(turn.text, turn.now)
@@ -654,12 +654,22 @@ async def create_events(turn: Turn, args: dict) -> dict:
         item, problem = new_item(value, turn, whole) if isinstance(value, dict) else (None, "неверный формат")
         if item and any(not existing.get("event_id") and all(existing.get(key) == item.get(key) for key in ("title", "date", "time")) for existing in turn.items):
             continue
+        twin = await existing_twin(turn, item) if item else None
+        if twin:
+            # "в сб в 11 урок с Лизой, потом зал": these tasks are already that day — they move, not double
+            if item["time"]:
+                change = {"date": date.fromisoformat(item["date"]), "time": parse_clock(item["time"]), "end_time": parse_clock(item.get("end_time")), "untimed": False}
+                changed, _ = chat.change_item(twin, change, turn.tz)
+                if changed:
+                    turn.items = [existing for existing in turn.items if existing.get("event_id") != twin.id] + [changed]
+            moved.append({"title": twin.title, "date": item["date"], "time": item["time"] or "без времени"})
+            continue
         if item:
             turn.items.append(item)
             added.append({"title": item["title"], "date": item["date"], "time": item["time"] or "без времени", "repeat": dates.describe_rrule(item.get("rrule"))})
         else:
             problems.append(problem)
-    if not added:
+    if not added and not moved:
         return {"error": "Ничего не добавлено: " + "; ".join(problems)}
     links = reminders.links_in(turn.text)
     new = [item for item in turn.items if not item.get("event_id")]
@@ -667,9 +677,40 @@ async def create_events(turn: Turn, args: dict) -> dict:
         # "созвон завтра в 15 https://meet…": the link is kept with the task, so its reminder carries it
         new[0]["description"] = "\n".join(part for part in (new[0].get("description"), *links) if part)
     result = {"status": "Черновик показан пользователю: он проверит и нажмёт «Сохранить». Ещё ничего не сохранено.", "items": added}
+    if moved:
+        result["already_in_plan"] = moved
     if problems:
         result["skipped"] = problems
     return result
+
+
+async def existing_twin(turn: Turn, item: dict) -> Event | None:
+    """The open task of the item's day with the same name, when it is the only one: "сделай, чтобы в сб в 11 был урок
+    с Лизой" is about the lesson already planned. "Добавь …" and repetitions are always new tasks."""
+    if item.get("rrule") or chat.ADD_REQUEST.match(turn.text):
+        return None
+    keywords = chat.search_keywords(item["title"])
+    if not keywords:
+        return None
+    day = date.fromisoformat(item["date"])
+    events = await tasks.events_between(turn.session, turn.user, datetime.combine(day, time.min, turn.tz), datetime.combine(day + timedelta(days=1), time.min, turn.tz))
+    drafted = {existing.get("event_id") for existing in turn.items}
+    found = [
+        event
+        for event in events
+        if event.completed_at is None
+        and event.id not in drafted
+        and event.start_at.astimezone(turn.tz).date() == day
+        and all(stem in event.title.lower().replace("ё", "е") for stem in keywords)
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def named_in_text(turn: Turn, event: Event) -> bool:
+    """The user named this task in the message: "после урока с Лизой — зал, потом остальное" keeps the lesson."""
+    keywords = chat.search_keywords(event.title)
+    text = turn.text.lower().replace("ё", "е")
+    return bool(keywords) and all(stem in text for stem in keywords)
 
 
 async def update_event(turn: Turn, args: dict) -> dict:
@@ -811,12 +852,19 @@ CHAIN_MINUTES = 60
 
 def one_by_one(turn: Turn, events: list[Event], clock: time) -> dict:
     """"Остальные дела после зала": the day's tasks one after another from `clock`, each for its own length (an hour
-    without one), timed ones first in their order; tasks that cannot move and the ones already in the draft stay."""
+    without one), timed ones first in their order. Tasks marked as fixed, the ones already in the draft and the ones
+    the user named in the message stay. Meetings synced from another calendar move too: the user asked for the rest."""
     drafted = {item.get("event_id") for item in turn.items if item.get("event_id")}
     titles = {item["title"].lower() for item in turn.items if not item.get("event_id")}
-    movable = [event for event in events if not tasks.is_fixed(event) and event.id not in drafted and event.title.lower() not in titles]
+    movable = [
+        event
+        for event in events
+        if not event.is_fixed and event.id not in drafted and event.title.lower() not in titles and not named_in_text(turn, event)
+    ]
     if not movable:
         return {"error": "Нет задач, которые можно поставить подряд."}
+    if any(tasks.is_fixed(event) for event in movable):
+        turn.notes.append(tr("Среди задач есть встречи из другого календаря — проверьте, что их можно перенести.", "Some of the tasks are meetings from another calendar — check they can be moved."))
     day = min(event.start_at for event in movable).astimezone(turn.tz).date()
     cursor = datetime.combine(day, clock)
     changed, kept = [], []
@@ -1432,7 +1480,8 @@ def system_prompt() -> str:
         "(«ВАРИАНТЫ: Перенеси на завтра в 10:00 | Оставь как есть»). Приложение покажет их кнопками. Вместо вопроса «когда?» "
         "предложи конкретное свободное время из плана.\n"
         "15. Дела подряд («в 11 урок, потом сразу зал часа на два») — считай время сама: начало следующего = конец предыдущего, "
-        "и у каждого дела ряда передай duration_minutes или end_time (не названа — до начала следующего). «Остальные дела», «оставшиеся планы», «всё остальное» — это уже существующие задачи "
+        "и у каждого дела ряда передай duration_minutes или end_time (не названа — до начала следующего). Дело ряда, которое "
+        "уже есть в плане того дня («урок с Лизой» при [id N] … Урок с Лизой), — change этой задачи, а не create. «Остальные дела», «оставшиеся планы», «всё остальное» — это уже существующие задачи "
         "того дня, а не новая задача: change с filter {date_from: день, status: open, all: true}, new_time — конец последнего "
         "нового дела, и one_by_one: true.\n"
         "16. Вопрос о конкретной задаче («у меня завтра стартап», «что с отчётом?», «когда встреча с Анной?») — find "

@@ -286,7 +286,7 @@ async def test_overdue_is_every_unmarked_one_off_task_of_the_user(client, user):
                 {"title": "Зарядка", "date": yesterday.isoformat(), "time": None, "rrule": "FREQ=DAILY"},
             ],
         )
-        # A meeting from Google cannot be ticked in Deyla: it counts as done once over
+        # A meeting from Google is not done just because its time passed: only a tick counts
         await tasks.create_tasks(session, user_row, [{"title": "Планёрка", "date": yesterday.isoformat(), "time": "12:00"}], source="google", push_google=False)
         await session.execute(update(Event).where(Event.user_id == user_row.id, Event.source == "google").values(imported=True))
         await session.commit()
@@ -295,7 +295,7 @@ async def test_overdue_is_every_unmarked_one_off_task_of_the_user(client, user):
     assert sorted(data["overdue"]) == ["Встреча вчера", "Купить молоко"]
     stats = (await client.get("/api/stats", headers=headers)).json()
     day = next(entry for entry in stats["days"] if entry["date"] == yesterday.isoformat())
-    assert (day["total"], day["done"]) == (4, 1)
+    assert (day["total"], day["done"]) == (4, 0)
     items = (await client.get("/api/recommendations", headers=headers)).json()["items"]
     assert any("Купить молоко" in item["text"] for item in items)
 
