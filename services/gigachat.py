@@ -42,7 +42,7 @@ PERSONAL_ADVICE = (
     "поставить на любой день», «задачи, которые нельзя переносить». "
 )
 # Requests whose text the user reads; the rest only extract fields the app parses in Russian
-USER_FACING = {"agent", "chat_reply", "process_message", "analysis", "breakdown", "recommendations", "plan_recommendations"}
+USER_FACING = {"agent", "suggest_replies", "chat_reply", "process_message", "analysis", "breakdown", "recommendations", "plan_recommendations"}
 ENGLISH = (
     "LANGUAGE: the user's site is in English. Everything the user reads — answers, questions, advice, "
     "recommendation titles and texts, step titles — must be in natural English; this overrides any instruction "
@@ -131,6 +131,19 @@ def parse_message_response(content: str) -> dict:
     intent = result.get("intent")
     result["intent"] = intent if intent in ("create", "change", "delete", "complete", "analyze", "breakdown", "other") else None
     return result
+
+
+def parse_replies(content: str) -> list[str]:
+    """The model's JSON array of ready answers; a broken one gives none."""
+    cleaned = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    start = cleaned.find("[")
+    if start == -1:
+        return []
+    try:
+        items, _ = json.JSONDecoder().raw_decode(cleaned, start)
+    except json.JSONDecodeError:
+        return []
+    return [str(item).strip() for item in items if isinstance(item, str | int) and str(item).strip()] if isinstance(items, list) else []
 
 
 def parse_search_filters_response(content: str) -> dict:
@@ -417,6 +430,24 @@ class GigaChatClient:
         result = await self._complete(payload, "extract_search_filters")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
+    async def suggest_replies(self, message: str, question: str, calendar: str = "", timezone: str = "Europe/Moscow") -> list[str]:
+        """2–4 ready answers to the assistant's question, shown as buttons: the user taps one instead of typing."""
+        now = datetime.now(ZoneInfo(timezone))
+        prompt = (
+            "Ассистент по планированию задал пользователю вопрос. Предложи 2–4 готовых ответа, которые пользователь нажмёт "
+            "кнопкой вместо того, чтобы печатать. Каждый ответ — от лица пользователя, до 40 знаков, сразу командой, "
+            "которую ассистент поймёт без контекста: с названием задачи из расписания, днём и временем "
+            "(«Перенеси созвон с Олей на завтра в 10:00», «Удали «Купить хлеб» на пятницу»). Последний вариант может быть "
+            "отказом («Ничего не менять»). Верни только JSON-массив строк без markdown.\n\n"
+            f"Сейчас {now:%d.%m.%Y %H:%M}.\n"
+            f"Расписание пользователя:\n{calendar or '(нет данных)'}\n\n"
+            f"Сообщение пользователя: {message[:1500]}\n"
+            f"Вопрос ассистента: {question[:1500]}"
+        )
+        payload = {"model": settings.llm_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 200}
+        result = await self._complete(payload, "suggest_replies", timeout=20)
+        return parse_replies(result["choices"][0]["message"]["content"])
+
     async def chat_reply(
         self, text: str, timezone: str = "Europe/Moscow", context: str = "", name: str | None = None, calendar: str = "", habits: str = ""
     ) -> str:
@@ -431,7 +462,10 @@ class GigaChatClient:
             "Не используй markdown, заголовки и таблицы. Не выдумывай события и факты о расписании пользователя. "
             "Если последнее твоё сообщение в диалоге — «Рекомендация Deyla», пользователь пришёл обсудить её: "
             "объясни её и предложи конкретные шаги по его расписанию. "
-            "Если пользователь хочет что-то запланировать, но не указал дату или время, коротко уточни, когда это сделать. "
+            "Если пользователь хочет что-то запланировать, но не указал дату или время, не переспрашивай — сразу предложи "
+            "конкретное свободное время по его расписанию. "
+            "Если ты о чём-то спрашиваешь или что-то предлагаешь, последней строкой напиши «ВАРИАНТЫ: … | … | …» — 2–4 готовых "
+            "ответа пользователя до 40 знаков, от его лица и сразу командой («Добавь зал завтра в 19:00 | Не надо»): они станут кнопками. "
             "Ты знаешь, как пользователь обычно выполняет задачи (блок «Что известно о пользователе»): опирайся на это, когда советуешь, — "
             "сколько он обычно успевает, когда продуктивнее, что откладывает. "
             "Если пользователю нужно подготовиться к чему-то большому (экзамен, проект, переезд), предложи разбить это на шаги: "
@@ -500,11 +534,13 @@ class GigaChatClient:
             + PERSONAL_ADVICE
             + f"Пользователь просит: «{request[:500]}». Проанализируй его план по фактам ниже, {tone}: "
             "сравни загрузку с тем, сколько он обычно успевает (habits), назови перегруженные и свободные дни, близкие дедлайны, "
-            "задачи, которые откладываются, и дай 2–4 конкретных совета: какую задачу на какой день или время поставить и почему "
+            "задачи, которые откладываются, и дай 2–3 конкретных совета: какую задачу на какой день или время поставить и почему "
             "именно так для этого пользователя. Если в фактах есть moves — это переносы, которые приложение предложит "
             "подтвердить: упомяни их как предложение, а не как сделанное. Если задача давно откладывается, предложи разбить её "
-            "на шаги — для этого пользователь может написать «разбей <задачу> на шаги». "
-            "Обращайся к пользователю на «вы». Пиши обычным текстом без markdown, до 900 символов, короткими абзацами или строками «• …». "
+            "на шаги. Не проси пользователя ничего писать или уточнять: последней строкой напиши «ВАРИАНТЫ: … | … | …» — "
+            "2–4 готовых команды до 40 знаков от его лица («Разбей «Отчёт» на шаги», «Перенеси «Урок» на завтра в 10:00»), "
+            "они станут кнопками. Обращайся к пользователю на «вы». Пиши обычным текстом без markdown, до 600 символов без "
+            "строки ВАРИАНТЫ, короткими строками «• …», без вступлений. "
             "Не выдумывай задач, которых нет в фактах. Если в фактах есть profile — учитывай рабочий график.\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False, default=str)}"
         )

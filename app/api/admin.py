@@ -33,6 +33,7 @@ HIDDEN_COLUMNS = {
     "users": {"password_hash", "telegram_link_code", "email_hash"},
     "integrations": {"credentials_encrypted"},
     "refresh_tokens": {"jti"},
+    "blog_views": {"key"},
 }
 # Shown as pseudonyms: everything stored encrypted, and the plain ids that point at a person or their accounts
 PERSONAL = {(table, column) for table, column, _kind in ENCRYPTED_COLUMNS} | {

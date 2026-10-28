@@ -226,6 +226,7 @@ STOP_WORDS = {
     "все", "всё", "всех", "list", "about", "расскажи", "расскажите", "подскажи", "скажи", "покажите", "посмотри",
     "про", "обо", "свободен", "свободна", "занят", "занята", "планирую", "запланировал", "запланировала", "моих", "моя",
     "там", "тут", "это", "этим", "этой", "чем", "насчет", "насчёт", "как", "идет", "идёт", "дела", "делами",
+    "вчера", "позавчера", "делал", "делала", "делали", "сделал", "сделала", "сделали", "успел", "успела", "успели",
 }
 _stemmer = snowballstemmer.stemmer("russian")
 
@@ -1910,6 +1911,53 @@ def claims_action(answer: str | None) -> bool:
     return bool(CALENDAR_WORDS.search(answer)) or len(answer) <= CLAIM_ONLY_LIMIT
 
 
+# The assistant ends a question or an offer with the user's ready answers: "ВАРИАНТЫ: Да, перенеси | Оставь как есть"
+REPLIES_LINE = re.compile(r"(?:^|\n)[ \t*_]*(?:варианты(?:\s+ответа)?|options|replies)[ \t*_]*:[ \t*_]*(?P<items>.*)\Z", re.I | re.S)
+MAX_REPLIES = 4
+MAX_REPLY_CHARS = 60
+
+
+def with_replies(reply: dict) -> dict:
+    """The answer options a reply's text ends with become its `replies`, shown as buttons that send them; the line
+    itself is cut off the text."""
+    for key in ("text", "answer"):
+        value = reply.get(key)
+        if not isinstance(value, str) or not (match := REPLIES_LINE.search(value)):
+            continue
+        items = (item.strip(" \t«»\"'•*_-–—") for item in re.split(r"\s*(?:\||;|\n)\s*", match.group("items")))
+        replies = list(dict.fromkeys(item for item in items if 0 < len(item) <= MAX_REPLY_CHARS))[:MAX_REPLIES]
+        text = value[: match.start()].rstrip()
+        reply = {**reply, key: text or (None if key == "answer" else value)}
+        if replies and (text or key == "answer"):
+            reply["replies"] = replies
+        break
+    return reply
+
+
+# A reply that asks the user something: "…?", "уточните", "напишите, на какой день"
+ASKS_USER = re.compile(r"\?\s*$|уточни|напиш|написать|укажите|скажите|please (?:specify|tell|write)|which one|you can write", re.I)
+ASKING_KINDS = ("answer", "not_found", "edit_error")
+
+
+async def with_buttons(session: AsyncSession, user: User, text: str, reply: dict, tz: ZoneInfo) -> dict:
+    """A reply that asks the user something always comes with ready answers: if neither the model nor the app gave
+    any, the model writes them for this question, so the user taps instead of typing."""
+    if reply.get("replies") or reply.get("kind") not in ASKING_KINDS or not settings.llm_enabled:
+        return reply
+    question = str(reply.get("text") or "")
+    if not ASKS_USER.search(question):
+        return reply
+    from services.gigachat import GigaChatClient
+
+    try:
+        replies = await GigaChatClient().suggest_replies(text, question, await calendar_context(session, user, tz), str(tz))
+    except Exception:
+        logger.exception("Ready answers for a question failed")
+        return reply
+    replies = list(dict.fromkeys(item for item in replies if 0 < len(item) <= MAX_REPLY_CHARS))[:MAX_REPLIES]
+    return {**reply, "replies": replies} if len(replies) >= 2 else reply
+
+
 def honest(answer: str | None) -> str | None:
     """The model may not report changes it cannot make; such a reply is replaced with the truth."""
     if claims_action(answer):
@@ -1958,7 +2006,9 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
         await session.rollback()
         reply = {"kind": "answer", "text": tr(MODEL_FAILED_ANSWER, MODEL_FAILED_ANSWER_EN)}
         failed = True
+    reply = with_replies(reply)
     if not failed:
+        reply = await with_buttons(session, user, text, reply, tz)
         reply = await research.attach(session, user, reply)
     await remember(session, user.id, "user", text, shown)
     message = await remember(session, user.id, "assistant", summarize(reply), reply)

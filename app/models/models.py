@@ -450,3 +450,46 @@ class FeatureWish(Base):
     message: Mapped[str | None] = mapped_column(Text)
     channel: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class BlogPost(Base):
+    """A post of the site's blog (deyla.tech/blog): written and published on the dashboard (app.api.blog). The body is
+    a list of blocks the site renders: heading, paragraph, image, quote, callout, divider."""
+
+    __tablename__ = "blog_posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(120), unique=True)
+    # "draft" or "published"
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default="draft")
+    title: Mapped[str] = mapped_column(Text)
+    excerpt: Mapped[str] = mapped_column(Text, default="", server_default="")
+    cover_image: Mapped[str | None] = mapped_column(Text)
+    cover_alt: Mapped[str | None] = mapped_column(Text)
+    tags: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
+    author: Mapped[str | None] = mapped_column(Text)
+    # {"title", "description", "ogImage", "canonical"}
+    seo: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    blocks: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BlogView(Base):
+    """One opening of a published post. The reader is a random id their browser keeps, hashed here: unique readers are
+    counted without knowing who they are. Reading time and scroll depth come later from the same page (`key`)."""
+
+    __tablename__ = "blog_views"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    post_id: Mapped[int] = mapped_column(ForeignKey("blog_posts.id", ondelete="CASCADE"), index=True)
+    visitor: Mapped[str] = mapped_column(String(64), index=True)
+    # Where the reader came from: the referring site's host ("t.me", "google.com") or "direct"
+    source: Mapped[str] = mapped_column(String(120), default="direct", server_default="direct")
+    # The page's secret for its own engagement updates
+    key: Mapped[str] = mapped_column(String(64))
+    read_seconds: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # How far the reader scrolled through the article, 0–100
+    scroll: Mapped[int] = mapped_column(SmallInteger, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

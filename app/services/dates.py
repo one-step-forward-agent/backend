@@ -312,6 +312,10 @@ def _range_part(text: str, today: date) -> date | None:
         return today + timedelta(days=1)
     if re.fullmatch(r"сегодня", low):
         return today
+    if re.fullmatch(r"позавчера", low):
+        return today - timedelta(days=2)
+    if re.fullmatch(r"вчера", low):
+        return today - timedelta(days=1)
     found, _ = _weekday_date(low, today)
     return found
 
@@ -398,6 +402,11 @@ def parse(text: str, now: datetime) -> Parsed:
             found, span = today + timedelta(days=1), match.span()
         elif match := re.search(r"\b(?:на\s+)?сегодня\b", low):
             found, span = today, match.span()
+        # "что было вчера?": a past day, asked about; create refuses a past date, so no task lands there
+        elif match := re.search(r"\b(?:за\s+)?позавчера\b", low):
+            found, span = today - timedelta(days=2), match.span()
+        elif match := re.search(r"\b(?:за\s+)?вчера\b", low):
+            found, span = today - timedelta(days=1), match.span()
         elif match := re.search(rf"\bчерез\s+(?:({NUMBER})\s+)?(дн\w*|день|сут\w*|недел\w*|месяц\w*|год\w*|лет)\b", low):
             amount, unit = _number(match.group(1) or "1"), match.group(2)
             if unit.startswith(("дн", "день", "сут")):

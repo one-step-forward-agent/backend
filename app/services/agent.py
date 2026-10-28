@@ -119,6 +119,7 @@ ACTIONS = {
     "stats": "статистика выполнения",
     "answer_question": "сообщение — ответ на вопрос из блока «ВОПРОС»: answer",
     "wish": "просьба о том, чего Deyla не умеет: text",
+    "ask": "уточнить у пользователя, когда догадаться нельзя: question и options — 2–4 готовых ответа, они станут кнопками",
 }
 
 OPERATION = {
@@ -131,12 +132,19 @@ OPERATION = {
         "shift_days": {"type": "integer", "description": "Для change: сдвиг на N дней: 1 — на день позже, -1 — на день раньше"},
         "shift_minutes": {"type": "integer", "description": "Для change: сдвиг в минутах: 60 — на час позже, -30 — на полчаса раньше"},
         "new_time": {"type": "string", "description": "Для change: новое время начала HH:MM"},
+        "one_by_one": {"type": "boolean", "description": "Для change с new_time и несколькими задачами: true — поставить их подряд, одну за другой, с new_time («остальные дела после зала»)"},
         "new_end_time": {"type": "string", "description": "Для change: новое время окончания HH:MM; только оно — продлить или сократить"},
         "new_title": {"type": "string", "description": "Для change: новое название"},
         "untimed": {"type": "boolean", "description": "Для change: true — убрать время, задача на весь день"},
         "tags": {"type": "array", "items": {"type": "string"}, "description": "Для change: поставить задачам эти теги, без #"},
         "text": {"type": "string", "description": "Для remind: о чём напомнить, коротко: «Помыть посуду». Для wish: что хочет пользователь, коротко: «Заказать такси»"},
         "answer": {"type": "string", "description": "Для answer_question: ответ пользователя его словами, коротко"},
+        "question": {"type": "string", "description": "Для ask: короткий вопрос пользователю"},
+        "options": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Для ask: 2–4 готовых ответа пользователя до 40 знаков, от его лица и сразу командой: «Созвон с Олей в 15:00», «Перенеси на завтра в 10:00»",
+        },
         "in_minutes": {"type": "integer", "description": "Для remind: через сколько минут от текущего момента"},
         "at": {"type": "string", "description": "Для remind: когда (первый раз): слова пользователя («завтра в 9:00», «в 18:30») или YYYY-MM-DDTHH:MM"},
         "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekly", "monthly"], "description": "Для remind: повтор — каждый день, по будням, каждую неделю, каждый месяц"},
@@ -161,7 +169,15 @@ EXAMPLES = [
     ("напомни через 2 часа выключить духовку", [{"action": "remind", "text": "Выключить духовку", "in_minutes": 120}]),
     ("напоминай каждый день в 9:00 пить витамины", [{"action": "remind", "text": "Пить витамины", "at": "в 9:00", "repeat": "daily"}]),
     ("Как мне всё успеть на этой неделе?", [{"action": "analyze", "period": "week"}]),
+    (
+        "в пятницу в 11 урок, потом сразу зал часа на два, а потом остальные дела",
+        [
+            {"action": "create", "events": [{"title": "Урок", "date": "в пятницу", "start_time": "11:00", "duration_minutes": 60}, {"title": "Зал", "date": "в пятницу", "start_time": "12:00", "duration_minutes": 120}]},
+            {"action": "change", "filter": {"date_from": "в пятницу", "status": "open", "all": True}, "new_time": "14:00", "one_by_one": True},
+        ],
+    ),
     ("Закажи мне такси на 9 утра", [{"action": "wish", "text": "Заказать такси"}]),
+    ("у меня завтра стартап", [{"action": "find", "filter": {"date_from": "завтра", "query": "стартап"}}]),
 ]
 
 
@@ -211,7 +227,7 @@ def offered(text: str, history: str, attached: bool = False) -> set[str]:
         names -= {"delete"}
     if re.search(r"напоминани", text, re.I) and not re.search(r"\bнапомни", text, re.I):
         # "какие у меня напоминания?", "отмени напоминание про посуду": about reminders, not tasks
-        names = {"reminders", "cancel_reminder", "remind"}
+        names = {"reminders", "cancel_reminder", "remind", "ask"}
     return names
 
 
@@ -288,6 +304,10 @@ class Turn:
     # The user answered it, or asked for something Deyla cannot do: the app words the reply
     answered: bool = False
     wished: bool = False
+    # ask: the question and its answers as buttons
+    asked: dict | None = None
+    # find was about tasks named in the message: one found is shown with all its details
+    named: bool = False
 
     def ref(self, event_id: int) -> int:
         if event_id not in self.aliases:
@@ -530,10 +550,19 @@ async def get_events(turn: Turn, args: dict) -> dict:
     events, problem = await pick(turn, args)
     if problem:
         return {"error": problem}
+    # "у меня завтра стартап": the model names the task in query; one found is shown with all its details
+    turn.named = bool(query.strip())
     if query.strip() and not (args.get("date_from") or args.get("date_to")):
         # The nearest upcoming first: "когда встреча с Анной?" is about the next one
         events.sort(key=lambda event: (event.end_at < turn.now, abs((event.start_at - turn.now).total_seconds())))
     turn.shown = events[:MAX_FOUND]
+    if not events and turn.named:
+        # "что мне делать с отчётом?" and there is no such task: the model answers, with buttons, not a fixed line
+        return {
+            "count": 0,
+            "error": "Задач с такими словами в календаре нет. Ответь пользователю сам: коротко помоги по сути вопроса и "
+            "предложи кнопками действия (ask или строка ВАРИАНТЫ) — например, добавить такую задачу на свободное время.",
+        }
     first, last = parse_day(args.get("date_from"), turn), parse_day(args.get("date_to"), turn)
     if first or last:
         turn.shown_range = (first or last, last or first)
@@ -750,6 +779,8 @@ async def change_events(turn: Turn, op: dict) -> dict:
         change = {}
     else:
         return {"error": "Не указано, что изменить: to_date, shift_days, shift_minutes, new_time, untimed или tags."}
+    if clock and not target and op.get("one_by_one") is True:
+        return one_by_one(turn, events, clock)
     changed, kept = [], []
     for event in events[: chat.MAX_DRAFT_ITEMS]:
         item, reason = chat.change_item(event, change, turn.tz) if change else ({**chat.event_item(event, turn.tz)}, None)
@@ -766,6 +797,46 @@ async def change_events(turn: Turn, op: dict) -> dict:
         return {"error": "Ничего не изменилось: " + "; ".join(kept[:5])}
     if any(event.is_fixed for event in events):
         turn.notes.append(tr("Среди задач есть отмеченные как неперемещаемые — проверьте изменения.", "Some of the tasks are marked as fixed — check the changes."))
+    return {
+        "status": "Изменения показаны пользователю черновиком: он подтвердит. Ещё ничего не изменено.",
+        "changed": changed[:30],
+        "count": len(changed),
+        **({"not_changed": kept[:10]} if kept else {}),
+    }
+
+
+# A task put in a row without its own length takes an hour
+CHAIN_MINUTES = 60
+
+
+def one_by_one(turn: Turn, events: list[Event], clock: time) -> dict:
+    """"Остальные дела после зала": the day's tasks one after another from `clock`, each for its own length (an hour
+    without one), timed ones first in their order; tasks that cannot move and the ones already in the draft stay."""
+    drafted = {item.get("event_id") for item in turn.items if item.get("event_id")}
+    titles = {item["title"].lower() for item in turn.items if not item.get("event_id")}
+    movable = [event for event in events if not tasks.is_fixed(event) and event.id not in drafted and event.title.lower() not in titles]
+    if not movable:
+        return {"error": "Нет задач, которые можно поставить подряд."}
+    day = min(event.start_at for event in movable).astimezone(turn.tz).date()
+    cursor = datetime.combine(day, clock)
+    changed, kept = [], []
+    for event in sorted(movable, key=lambda event: (event.all_day, event.start_at))[: chat.MAX_DRAFT_ITEMS]:
+        if event.start_at.astimezone(turn.tz).date() != day:
+            continue
+        length = timedelta(minutes=CHAIN_MINUTES) if event.all_day else min(event.end_at - event.start_at, timedelta(hours=12))
+        end = cursor + length
+        if end.date() != day:
+            kept.append(f"{event.title}: не помещается до конца дня")
+            continue
+        item, reason = chat.change_item(event, {"time": cursor.time(), "end_time": end.time(), "untimed": False}, turn.tz)
+        if item:
+            turn.items = [existing for existing in turn.items if existing.get("event_id") != event.id] + [item]
+            changed.append(f"{event.title} {cursor:%H:%M}–{end:%H:%M}")
+            cursor = end
+        else:
+            kept.append(f"{event.title}: {reason}")
+    if not changed:
+        return {"error": "Ничего не изменилось: " + "; ".join(kept[:5])}
     return {
         "status": "Изменения показаны пользователю черновиком: он подтвердит. Ещё ничего не изменено.",
         "changed": changed[:30],
@@ -1118,6 +1189,16 @@ async def answer_question(turn: Turn, args: dict) -> dict:
     return {"ok": True}
 
 
+async def ask_user(turn: Turn, args: dict) -> dict:
+    question = str(args.get("question") or "").strip()
+    options = args.get("options") if isinstance(args.get("options"), list) else []
+    options = list(dict.fromkeys(str(item).strip() for item in options if str(item).strip() and len(str(item).strip()) <= chat.MAX_REPLY_CHARS))[: chat.MAX_REPLIES]
+    if not question or len(options) < 2:
+        return {"error": "Передай question и 2–4 options — готовые ответы пользователя."}
+    turn.asked = {"text": question, "replies": options}
+    return {"ok": True, "status": "Вопрос с кнопками показан пользователю."}
+
+
 async def log_wish(turn: Turn, args: dict) -> dict:
     await research.log_wish(turn.session, turn.user, str(args.get("text") or ""), own_words(turn.text), research.current_channel.get())
     turn.wished = True
@@ -1153,6 +1234,7 @@ OPERATIONS = {
     "stats": get_stats,
     "answer_question": answer_question,
     "wish": log_wish,
+    "ask": ask_user,
 }
 NOT_ASKED = {
     "answer_question": "Вопроса пользователю сейчас нет.",
@@ -1327,9 +1409,13 @@ def system_prompt() -> str:
         + PERSONAL_ADVICE
         + "\n7. Подготовиться к чему-то большому или разбить задачу на шаги — breakdown.\n"
         "8. Вопросы о задачах («что у меня в пятницу?», «когда встреча с Анной?») — find: приложение покажет найденное списком.\n"
-        "9. Без act отвечай текстом, только когда непонятно, о каких задачах речь (спроси, перечислив подходящие с днём и временем), "
-        "или когда сообщение не о планах: коротко и дружелюбно, мягко верни разговор к планированию. Ответ — по-русски, на «вы», "
-        "до 5–6 предложений или строки «• …», без markdown-заголовков, таблиц и номеров задач.\n"
+        "9. Не переспрашивай то, о чём можно догадаться: выбери самое вероятное и сразу вызови act — пользователь всё равно "
+        "проверит черновик и поправит его. Нет дня — сегодня, нет времени — без времени, подходят несколько задач — "
+        "ближайшая по плану. Если догадаться нельзя совсем — ask: короткий вопрос и 2–4 options, готовые ответы, которые "
+        "пользователь нажмёт кнопкой (например, подходящие задачи с днём и временем). Никогда не задавай вопрос простым "
+        "текстом — пользователь не должен ничего печатать в ответ. Без act отвечай текстом, только когда сообщение не о планах: "
+        "коротко и дружелюбно, мягко верни разговор к планированию. Ответ — по-русски, на «вы», до 5–6 предложений или строки "
+        "«• …», без markdown-заголовков, таблиц и номеров задач.\n"
         "10. Теги ставь полем tags (в events у create или в change), а не символом # в названии. Бери тег из блока «Теги»; "
         "если пользователь называет новый тег — передай его, приложение создаст его само.\n"
         "11. Ты умеешь писать пользователю в Telegram: напоминания приходят от бота Deyla. Файлы, которые пользователь прикладывает "
@@ -1340,7 +1426,18 @@ def system_prompt() -> str:
         "обещай и не объясняй — приложение ответит само. Вопрос не о планах («кто написал «Войну и мир»?») — это не wish.\n"
         "13. Если в контексте есть блок «ВОПРОС» и сообщение отвечает на него — answer_question: answer — ответ словами "
         "пользователя, даже если ответ похож на пожелание (тогда не wish). Сообщение о другом — выполни его как обычно, "
-        "вопрос не упоминай."
+        "вопрос не упоминай.\n"
+        "14. Если в ответе текстом ты всё же что-то предлагаешь, последней строкой напиши "
+        "«ВАРИАНТЫ: … | … | …» — 2–4 готовых ответа пользователя до 40 знаков, от его лица и сразу командой "
+        "(«ВАРИАНТЫ: Перенеси на завтра в 10:00 | Оставь как есть»). Приложение покажет их кнопками. Вместо вопроса «когда?» "
+        "предложи конкретное свободное время из плана.\n"
+        "15. Дела подряд («в 11 урок, потом сразу зал часа на два») — считай время сама: начало следующего = конец предыдущего, "
+        "и у каждого дела ряда передай duration_minutes или end_time (не названа — до начала следующего). «Остальные дела», «оставшиеся планы», «всё остальное» — это уже существующие задачи "
+        "того дня, а не новая задача: change с filter {date_from: день, status: open, all: true}, new_time — конец последнего "
+        "нового дела, и one_by_one: true.\n"
+        "16. Вопрос о конкретной задаче («у меня завтра стартап», «что с отчётом?», «когда встреча с Анной?») — find "
+        "с query — словами из её названия: приложение покажет задачу со всеми подробностями. Без query — только вопрос о "
+        "дне или периоде целиком («что у меня завтра?»)."
     )
 
 
@@ -1480,6 +1577,10 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
             break
     if turn.blocked and not turn.changed:
         return {"kind": "answer", "text": turn.blocked}
+    if turn.asked and not turn.changed and not turn.analysed and turn.listed is None and turn.stats is None and not turn.shown:
+        # Only a question: it is the answer, with its buttons
+        await session.commit()
+        return {"kind": "answer", "text": turn.asked["text"], "replies": turn.asked["replies"]}
     if turn.wished:
         turn.notes.append(research.wish_answer())
     if (turn.wished or turn.answered) and not turn.changed and not turn.analysed and turn.listed is None and turn.stats is None:
@@ -1492,11 +1593,48 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
     if answer and not turn.changed:
         answer = chat.honest(answer)
     reply = await finish(turn, answer)
+    if turn.asked and reply["kind"] != "nothing":
+        # Something was done and something is asked: the buttons go with the result
+        reply = {**reply, "replies": turn.asked["replies"]}
+        key = "text" if reply.get("kind") in ("answer", "not_found", "completed", "reminder", "cancelled") else "answer"
+        reply[key] = "\n\n".join(part for part in (reply.get(key), turn.asked["text"]) if part)
     if reply["kind"] == "nothing":
         # The model wrote nothing (a message about something else, an answer its filter dropped): the chat still answers
         logger.info("Agent gave no answer; the chat model talks instead")
         return await chat.small_talk(session, user, text, tz)
     return reply
+
+
+async def event_details(turn: Turn, event: Event) -> str:
+    """One task in full: day and time, place, description, deadline, repetition, reminder, tags, state."""
+    start, end = event.start_at.astimezone(turn.tz), event.end_at.astimezone(turn.tz)
+    last = tasks.end_day(event, turn.tz)
+    when = day_label(start.date(), turn.today)
+    if last > start.date():
+        when += f" — {day_label(last, turn.today)}"
+    when += tr(", без времени", ", no time") if event.all_day else f", {start:%H:%M}–{end:%H:%M}"
+    lines = [f"**{event.title}** — {when}"]
+    if event.location:
+        lines.append(tr(f"📍 Место: {event.location}", f"📍 Place: {event.location}"))
+    if event.description:
+        lines.append(tr(f"📝 Описание: {event.description.strip()[:1500]}", f"📝 Description: {event.description.strip()[:1500]}"))
+    if event.deadline_at:
+        lines.append(tr(f"⏳ Срок: {event.deadline_at.astimezone(turn.tz):%d.%m %H:%M}", f"⏳ Deadline: {event.deadline_at.astimezone(turn.tz):%d.%m %H:%M}"))
+    if repeat := dates.describe_rrule(event.recurrence_rule):
+        lines.append(tr(f"🔁 Повтор: {repeat}", f"🔁 Repeats: {repeat}"))
+    if event.reminder_minutes:
+        lines.append(tr(f"🔔 Напомню за {event.reminder_minutes} мин", f"🔔 Reminder {event.reminder_minutes} min before"))
+    if event.tag_ids:
+        names = list(await turn.session.scalars(select(Tag.name).where(Tag.user_id == turn.user.id, Tag.id.in_(event.tag_ids))))
+        if names:
+            lines.append(tr("🏷 Теги: ", "🏷 Tags: ") + ", ".join(f"#{name}" for name in names))
+    if tasks.is_fixed(event):
+        lines.append(tr("📌 Нельзя переносить", "📌 Can't be moved"))
+    if event.completed_at:
+        lines.append(tr("✅ Выполнено", "✅ Done"))
+    elif tasks.is_overdue(event, turn.today, turn.tz):
+        lines.append(tr("⚠️ Просрочено", "⚠️ Overdue"))
+    return "\n".join(lines)
 
 
 async def by_rules(turn: Turn) -> dict | None:
@@ -1567,6 +1705,9 @@ async def finish(turn: Turn, answer: str | None) -> dict:
     if turn.shown is not None and set(turn.tools) <= {"find"}:
         if not turn.shown:
             return {"kind": "answer", "text": answer or tr(f"{turn.shown_title or 'Здесь'} — задач не нашла.", f"{turn.shown_title or 'Here'} — no tasks found.")}
+        if turn.named and len(turn.shown) == 1:
+            # "что у меня со стартапом завтра?": that task with everything known about it
+            answer = await event_details(turn, turn.shown[0])
         return {
             "kind": "agenda",
             "title": turn.shown_title or tr("Найденные события", "Found events"),

@@ -317,7 +317,7 @@ def test_look_alike_actions_are_offered_only_when_asked():
     plain = offered("завтра в 15:00 созвон с командой", "")
     assert "create" in plain and "remind" not in plain and "delete" not in plain and "reopen" not in plain
     assert {"remind", "create"} <= offered("напомни помыть посуду через 10 минут", "")
-    assert offered("какие у меня напоминания?", "") == {"reminders", "cancel_reminder", "remind"}
+    assert offered("какие у меня напоминания?", "") == {"reminders", "cancel_reminder", "remind", "ask"}
     assert "delete" in offered("удали встречу с Олей", "")
     assert "reopen" in offered("верни отчёт в невыполненные", "")
     # A follow-up keeps the actions of the request it continues
