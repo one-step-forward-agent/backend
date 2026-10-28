@@ -238,7 +238,7 @@ async def test_streak_skips_empty_days(client, user):
 
 
 async def test_passed_meetings_are_not_all_done(client, user):
-    """A day of meetings synced from Google passes by itself: no «all done», no streak, while the user's task is not ticked."""
+    """Meetings synced from Google are not done by themselves: no «all done», no streak, until everything is ticked."""
     headers, chat_id = user
     async with session_factory() as session:
         row = await user_row(session, chat_id)
@@ -248,7 +248,8 @@ async def test_passed_meetings_are_not_all_done(client, user):
             start = datetime.combine(now.date() - timedelta(days=offset), time(10), TZ)
             session.add(Event(calendar_id=calendar.id, user_id=row.id, title=f"Встреча {offset}", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google", imported=True))
         start = now - timedelta(hours=2)
-        session.add(Event(calendar_id=calendar.id, user_id=row.id, title="Планёрка", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google", imported=True))
+        meeting = Event(calendar_id=calendar.id, user_id=row.id, title="Планёрка", start_at=start, end_at=start + timedelta(hours=1), timezone="Europe/Moscow", source="google", imported=True)
+        session.add(meeting)
         await session.commit()
         assert await tasks.streaks(session, row, now) == (0, 0)
         text, _ = await insights.evening(session, row, now)
@@ -259,9 +260,15 @@ async def test_passed_meetings_are_not_all_done(client, user):
         session.add(task)
         await session.commit()
         text, _ = await insights.evening(session, row, now)
-        assert "Выполнено 1 из 2" in text and "Все задачи дня выполнены" not in text
+        assert "Выполнено 0 из 2" in text and "Все задачи дня выполнены" not in text
 
         task.completed_at = now
+        await session.commit()
+        text, _ = await insights.evening(session, row, now)
+        assert "Выполнено 1 из 2" in text and "Все задачи дня выполнены" not in text
+        assert await tasks.streaks(session, row, now) == (0, 0)
+
+        meeting.completed_at = now
         await session.commit()
         text, _ = await insights.evening(session, row, now)
         assert "Все задачи дня выполнены" in text
