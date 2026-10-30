@@ -456,9 +456,13 @@ async def pick(turn: Turn, args: dict, default_day: date | None = None, status: 
     elif query.strip() or not args.get("all"):
         conditions += [Event.start_at < turn.now + chat.SEARCH_AHEAD, Event.end_at > turn.now - chat.SEARCH_PAST]
     events = list(await turn.session.scalars(events_query(conditions)))
-    keywords = chat.search_keywords(query)
-    if keywords:
-        events = chat.match_keywords(events, keywords)
+    if query.strip():
+        # A named task narrows the period down; a name that matches nothing is never "every task of the day"
+        events = chat.match_query(events, query)
+        if not events:
+            return [], f"Задач по словам «{query.strip()[:60]}» не нашлось: проверь названия в блоке «План» и передай ids этих задач."
+    else:
+        events = by_named_words(turn, events)
     return await narrowed_down(turn, events, args, status), None
 
 
@@ -512,9 +516,43 @@ def named_keywords(turn: Turn) -> list[str]:
     return chat.search_keywords(" ".join(words))
 
 
+# Words of an English request that do not name a task (dates.py and request_words read Russian)
+NOT_NAME_EN = {
+    "delete", "remove", "erase", "clear", "cancel", "move", "shift", "reschedule", "postpone", "change", "rename", "mark", "done",
+    "complete", "finish", "for", "from", "today", "tomorrow", "tonight", "task", "tasks", "event", "events", "please", "the", "this",
+    "these", "that", "those", "them", "it", "later", "earlier", "hour", "hours", "minutes", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "saturday", "sunday", "week", "next", "me", "can", "you",
+}
+ALL_SAID = re.compile(chat.ALL_WORDS.pattern + r"|\b(?:all|everything|every)\b", re.I)
+
+
+def named_words(turn: Turn) -> str:
+    """The words the user named tasks with, short ones included ("удали Л* на сегодня" → "л"); empty for "перенеси их",
+    "перенеси всё на завтра" and requests that name no task."""
+    if chat.CONTEXT_TARGET.search(turn.text) or ALL_SAID.search(turn.text):
+        return ""
+    words = [word for word in chat.request_words(turn.text, turn.now) if not word.startswith(NOT_NAME_WORDS) and word not in NOT_NAME_EN]
+    said = " ".join(words)
+    return said if any(chat.query_terms(said)) else ""
+
+
+def by_named_words(turn: Turn, events: list[Event]) -> list[Event]:
+    """Of the tasks a filter found, the ones the user named, when only some of them match their words:
+    "удали Л* на сегодня" read by the model as "everything today" deletes «Л ОтС» and «Л ОС», not the whole day."""
+    said = named_words(turn)
+    if not said or len(events) < 2:
+        return events
+    matched = chat.match_query(events, said)
+    if matched and len(matched) < len(events):
+        logger.info("Agent's filter took more tasks than the user named; kept the named ones")
+        return matched
+    return events
+
+
 async def grounded(turn: Turn, chosen: list[Event]) -> list[Event]:
     """The tasks the model chose, checked against the words of the message: a small model picks a neighbour in the list.
     When none of the chosen tasks has the named words but other tasks do, those are taken instead."""
+    chosen = by_named_words(turn, chosen)
     keywords = named_keywords(turn)
     if not keywords or chat.match_keywords(chosen, keywords):
         return chosen
@@ -548,7 +586,7 @@ async def get_events(turn: Turn, args: dict) -> dict:
     if not (args.get("date_from") or args.get("date_to") or query.strip() or args.get("status") in ("done", "overdue") or args.get("tags")):
         args = {**args, "date_from": turn.today.isoformat(), "date_to": (turn.today + timedelta(days=PLAN_DAYS - 1)).isoformat()}
     events, problem = await pick(turn, args)
-    if problem:
+    if problem and not query.strip():
         return {"error": problem}
     # "у меня завтра стартап": the model names the task in query; one found is shown with all its details
     turn.named = bool(query.strip())
@@ -570,6 +608,34 @@ async def get_events(turn: Turn, args: dict) -> dict:
     return {"count": len(events), "events": [event_brief(event, turn) for event in events[:MAX_FOUND]], "truncated": len(events) > MAX_FOUND}
 
 
+# "сделать отчёт до 15", "до 15:00", "не позже 15", "before 3pm": a deadline by that hour, not a task starting at it.
+# A date ("до 15 ноября", "до 15-го") and a range ("с 10 до 12") are not
+DEADLINE_CLOCK = re.compile(
+    r"(?:\bдо|\bне\s+позже|\bне\s+позднее|\bbefore|\bby|\buntil|\bno\s+later\s+than)\s+(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?"
+    r"(?![0-9.:]|\s*(?:-?го\b|-?е\b|числа|январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|декабр"
+    r"|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|st\b|nd\b|rd\b|th\b))",
+    re.I,
+)
+MORNING_SAID = re.compile(r"утр|ночи|\b(?:am|a\.m\.|ам|а\.м\.)(?!\w)", re.I)
+RANGE_START = re.compile(r"(?:\bс|\bfrom)\s+\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)?\s*$", re.I)
+
+
+def due_by(text: str) -> time | None:
+    """The hour a task is due by, when the message names one ("до 15" → 15:00)."""
+    for match in DEADLINE_CLOCK.finditer(text):
+        if RANGE_START.search(text[: match.start()]):
+            continue
+        hour, minute = int(match.group(1)), int(match.group(2) or 0)
+        meridiem = (match.group(3) or "").lower().replace(".", "")
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        if hour <= 23 and minute <= 59:
+            return time(hour, minute)
+    return None
+
+
 def new_item(raw: dict, turn: Turn, whole: dates.Parsed | None = None) -> tuple[dict | None, str | None]:
     """A draft item from the model's arguments. With one task in the message, `whole` is the message parsed here:
     its day and time win over the model's calendar arithmetic."""
@@ -588,8 +654,23 @@ def new_item(raw: dict, turn: Turn, whole: dates.Parsed | None = None) -> tuple[
         # A repetition said in the message starts on the day the message names, or on its first day from now:
         # the model's own day for "раз в две недели по чт" is often a week off
         day = whole.date or (None if whole.rrule else day)
-        if whole.time:
+        model_afternoon = (
+            start and whole.time and whole.time.hour < 12 and (start.hour, start.minute) == (whole.time.hour + 12, whole.time.minute)
+            and not MORNING_SAID.search(turn.text)
+        )
+        if whole.time and not model_afternoon:
             start, end = whole.time, whole.end_time or (end if end and end != whole.time else None)
+        # Otherwise a bare "в 5" read by the model as 17:00 from the context ("завтра в 5 Игорь") keeps the model's time:
+        # the words had no "утра" or "am" that would make it 05:00
+    due = due_by(turn.text)
+    if due and start == due:
+        # "сделать отчёт до 15" is due by 15:00: it does not start then. Without a time of its own it is a task without time
+        start = end = None
+    if due and end == due and start:
+        # "в 10 до 15": the end of a range, not a deadline
+        due = None
+    if due and not (isinstance(raw.get("deadline"), str) and raw["deadline"].strip()):
+        raw = {**raw, "deadline": f"{(day or turn.today).isoformat()}T{due:%H:%M}"}
     if day and day < turn.today:
         return None, f"«{title}»: дата {day.isoformat()} уже прошла"
     rule = None
@@ -1445,9 +1526,15 @@ def system_prompt() -> str:
         "status (open — невыполненные, done — выполненные, overdue — просроченные), timed, время дня (time_from, time_to), tags, "
         "all=true, когда пользователь говорит «все», «всё». «Перенеси всё на завтра» — filter {date_from: «сегодня», all: true} и to_date "
         "«завтра». ids — только короткие номера из квадратных скобок [id N] в блоке «План» или в прошлых ответах, не выдумывай их.\n"
+        "Когда пользователь называет конкретные задачи (даже сокращённо: «ОтС и ОС», «Л*», «лабы»), найди их в блоке «План» и передай "
+        "их ids — ровно те задачи, которые он назвал, и никакие другие. «Л*» — задачи, название которых начинается с «Л». "
+        "all=true без query и ids означает ВСЕ задачи периода — ставь его только когда пользователь так и говорит («удали всё на сегодня»).\n"
         "3. День передавай словами пользователя дословно («завтра», «в пятницу», «15 октября») — приложение само вычислит дату; "
         "YYYY-MM-DD — когда день берёшь из плана. Время — HH:MM. Не выдумывай время: если пользователь его не назвал, "
-        "не передавай start_time — это задача без времени.\n"
+        "не передавай start_time — это задача без времени. «Сделать до 15», «до 15:00», «не позже 15», «before 3pm» — это срок: "
+        "передай deadline, а не start_time; если ставишь время, дело должно закончиться к сроку, а не начаться в него. "
+        "«5 p.m.», «5pm», «в 5 вечера» — 17:00. Час без «утра» от 1 до 7 («завтра в 5 Игорь», «в 3 созвон») — это день или вечер "
+        "(17:00, 15:00), если по смыслу дело не утреннее.\n"
         "4. «Напомни через N минут / в 18:00 / завтра в 9 <что-то>» без слов о встрече или деле в календаре — это remind. "
         "Если пользователь планирует дело и просит напомнить заранее («встреча завтра в 15, напомни за 30 минут») — create "
         "с reminder_minutes.\n"

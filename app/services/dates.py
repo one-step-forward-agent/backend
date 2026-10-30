@@ -139,7 +139,20 @@ def _safe_date(year: int, month: int, day: int) -> date | None:
         return None
 
 
+# A part of the day after the hour: "в 5 вечера", "в 5 p.m.", "5pm" (also typed with Cyrillic "р.м.")
+PERIODS = r"(утра|дня|вечера|ночи|[aа]\.?\s?[mм]\.?(?![\w])|[pр]\.?\s?[mм]\.?(?![\w])|ам\b|пм\b)"
+
+
+def _period(period: str | None) -> str | None:
+    """am / pm in any spelling read as утра / вечера."""
+    if not period:
+        return period
+    letters = re.sub(r"[\s.]", "", period).replace("а", "a").replace("р", "p").replace("м", "m")
+    return {"am": "утра", "pm": "вечера", "пm": "вечера"}.get(letters, period)
+
+
 def _hour(hour: int, period: str | None) -> int:
+    period = _period(period)
     if period == "утра" and hour == 12:
         return 0
     if period in ("дня", "вечера") and hour < 12:
@@ -156,14 +169,14 @@ def _clock(hour: int, minute: int = 0) -> time | None:
 def parse_time(text: str) -> tuple[time | None, time | None, list[tuple[int, int]]]:
     """Start time, end time and the matched spans of a phrase such as "с 10 до 12:30"."""
     low = text.lower()
-    period = r"(?:\s*(утра|дня|вечера|ночи))?"
+    period = rf"(?:\s*{PERIODS})?"
     patterns = (
         rf"\bс\s+(\d{{1,2}})(?:[:.](\d{{2}}))?\s*(?:часов\s+)?{period}\s*(?:до|по)\s+(\d{{1,2}})(?!\d)(?:[:.](\d{{2}}))?(?!\d)(?!\s*{NOT_HOUR}){period}",
         rf"\b(\d{{1,2}}):(\d{{2}}){period}\s*(?:-|–|—|до)\s*(\d{{1,2}}):(\d{{2}})\b{period}",
     )
     for pattern in patterns:
         if match := re.search(pattern, low):
-            first, second = match.group(3), match.group(6)
+            first, second = _period(match.group(3)), _period(match.group(6))
             start = _clock(_hour(int(match.group(1)), first or (None if second in (None, "утра") else second)), int(match.group(2) or 0))
             end = _clock(_hour(int(match.group(4)), second), int(match.group(5) or 0))
             if start and end and end < start and start.hour < 12 and not second and end.hour + 12 > start.hour:
@@ -181,7 +194,7 @@ def parse_time(text: str) -> tuple[time | None, time | None, list[tuple[int, int
     if match := re.search(rf"\bв\s+половин[еу]\s+({'|'.join(HALF_PAST)})(?:\s+(утра|дня|вечера|ночи))?", low):
         hour = _hour(HALF_PAST[match.group(1)] - 1, match.group(2))
         return _clock(hour, 30), None, [match.span()]
-    if match := re.search(r"(?:\b(?:в|к|на)\s+)?\b(\d{1,2}):(\d{2})\b(?:\s+(утра|дня|вечера|ночи))?", low):
+    if match := re.search(rf"(?:\b(?:в|к|на)\s+)?\b(\d{{1,2}}):(\d{{2}})\b(?:\s*{PERIODS})?", low):
         return _clock(_hour(int(match.group(1)), match.group(3)), int(match.group(2))), None, [match.span()]
     if match := re.search(r"\b(?:в|к|на)\s+(\d{1,2})\.(\d{2})\b(?!\.\d)", low):
         return _clock(int(match.group(1)), int(match.group(2))), None, [match.span()]
@@ -197,7 +210,7 @@ def parse_time(text: str) -> tuple[time | None, time | None, list[tuple[int, int
     if match := re.search(r"(?<![\d.:/])(\d{1,2})\.(\d{2})(?![\d.:/])", low):
         if match.group(2) == "00" or int(match.group(2)) > 12:
             return _clock(int(match.group(1)), int(match.group(2))), None, [match.span()]
-    hour_pattern = rf"\b(?:в|к)\s+(\d{{1,2}})(?:\s*(?:час(?:а|ов)?|ч)\b)?(?:\s+(утра|дня|вечера|ночи))?(?!\s*{NOT_HOUR})(?![\w.:/-])"
+    hour_pattern = rf"\b(?:в|к|at)\s+(\d{{1,2}})(?:\s*(?:час(?:а|ов)?|ч)\b)?(?:\s*{PERIODS})?(?!\s*{NOT_HOUR})(?![\w.:/-])"
     if match := re.search(hour_pattern, low):
         return _clock(_hour(int(match.group(1)), match.group(2)), 0), None, [match.span()]
     return None, None, []

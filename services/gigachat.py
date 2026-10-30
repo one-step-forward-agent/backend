@@ -42,7 +42,7 @@ PERSONAL_ADVICE = (
     "поставить на любой день», «задачи, которые нельзя переносить». "
 )
 # Requests whose text the user reads; the rest only extract fields the app parses in Russian
-USER_FACING = {"agent", "suggest_replies", "chat_reply", "process_message", "analysis", "breakdown", "recommendations", "plan_recommendations"}
+USER_FACING = {"agent", "explain_recommendation", "suggest_replies", "chat_reply", "process_message", "analysis", "breakdown", "recommendations", "plan_recommendations"}
 ENGLISH = (
     "LANGUAGE: the user's site is in English. Everything the user reads — answers, questions, advice, "
     "recommendation titles and texts, step titles — must be in natural English; this overrides any instruction "
@@ -447,6 +447,25 @@ class GigaChatClient:
         payload = {"model": settings.llm_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 200}
         result = await self._complete(payload, "suggest_replies", timeout=20)
         return parse_replies(result["choices"][0]["message"]["content"])
+
+    async def explain_recommendation(self, title: str, text: str, calendar: str = "", timezone: str = "Europe/Moscow") -> str:
+        """The recommendation the user tapped, explained in detail: why it matters and the steps, by their schedule."""
+        now = datetime.now(ZoneInfo(timezone))
+        prompt = (
+            PERSONA
+            + NO_ACTION_CLAIMS
+            + PERSONAL_ADVICE
+            + "Пользователь открыл твою рекомендацию, чтобы прочитать её подробно. Распиши её: одним-двумя предложениями — "
+            "почему это важно именно сейчас, затем нумерованный список из 2–5 конкретных шагов по его расписанию "
+            "(задачи в кавычках, дни, время). Пиши в markdown: короткие абзацы, нумерованный список, **жирным** — только "
+            "ключевые задачи и время. Без заголовков и таблиц, до 900 символов. Не повторяй заголовок рекомендации.\n\n"
+            f"Сейчас {now:%d.%m.%Y %H:%M}.\n"
+            f"Расписание пользователя:\n{calendar or '(нет данных)'}\n\n"
+            f"Рекомендация: {title[:120]}. {text[:600]}"
+        )
+        payload = {"model": settings.llm_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 700}
+        result = await self._complete(payload, "explain_recommendation", timeout=30)
+        return result["choices"][0]["message"]["content"].strip()[:1500]
 
     async def chat_reply(
         self, text: str, timezone: str = "Europe/Moscow", context: str = "", name: str | None = None, calendar: str = "", habits: str = ""

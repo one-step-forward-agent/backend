@@ -552,3 +552,42 @@ async def test_tasks_with_a_tag_outside_the_progress_are_not_counted(client, use
     turned = await client.patch(f"/api/tags/{walk['id']}", json={"counts_progress": True}, headers=headers)
     assert turned.json()["counts_progress"] is True
     assert (await client.get("/api/stats", headers=headers)).json()["today"]["total"] == 2
+
+
+async def test_short_task_names_delete_only_those_tasks(client, user, agent):
+    """"удали Л* на сегодня" read by the model as "everything today", and "ОтС и ОС" as a query: only the named lessons."""
+    headers, _ = user
+    for text in ("стартап сегодня в 23:00", "1. Л ОтС сегодня в 23:10", "2. Л ОС сегодня в 23:20", "спросить Кучина про 2 лабы сегодня в 23:30"):
+        await add(client, headers, text)
+    agent([act(op("delete", filter={"date_from": "сегодня", "all": True}))])
+    reply = await say(client, headers, "удали Л* на сегодня")
+    assert reply["kind"] == "delete_proposal" and reply["count"] == 2, reply
+    assert sorted(event["title"] for event in reply["events"]) == ["1. Л ОтС", "2. Л ОС"]
+
+    agent([act(op("delete", filter={"date_from": "сегодня", "query": "ОтС и ОС"}))])
+    reply = await say(client, headers, "удали ОтС и ОС на сегодня")
+    assert reply["kind"] == "delete_proposal" and reply["count"] == 2, reply
+
+    # A name that matches nothing is never "every task of the day"
+    agent([act(op("delete", filter={"date_from": "сегодня", "query": "Ж"})), "Не нашла такой задачи."])
+    reply = await say(client, headers, "удали Ж на сегодня")
+    assert reply["kind"] != "delete_proposal"
+
+
+async def test_task_due_by_an_hour_does_not_start_then(client, user, agent):
+    headers, _ = user
+    agent([act(op("create", events=[{"title": "Сделать отчёт", "date": "завтра", "start_time": "15:00"}]))])
+    reply = await say(client, headers, "завтра сделать отчёт до 15")
+    [event] = reply["events"]
+    assert event["time"] is None and event["deadline"].startswith(f"{(datetime.now(TZ) + timedelta(days=1)).date().isoformat()}T15:00")
+
+
+async def test_pm_and_a_bare_afternoon_hour(client, user, agent):
+    headers, _ = user
+    agent([act(op("create", events=[{"title": "Игорь", "date": "завтра", "start_time": "05:00"}]))])
+    reply = await say(client, headers, "завтра в 5 p.m. Игорь")
+    assert reply["events"][0]["time"] == "17:00"
+    # "в 5" with no "утра": the model's 17:00 is kept over the bare hour
+    agent([act(op("create", events=[{"title": "Игорь", "date": "завтра", "start_time": "17:00"}]))])
+    reply = await say(client, headers, "завтра в 5 Игорь")
+    assert reply["events"][0]["time"] == "17:00"

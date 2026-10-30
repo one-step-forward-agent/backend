@@ -310,8 +310,8 @@ async def clear_history(session: AsyncSession, user: User) -> int:
 
 
 async def remember_topic(session: AsyncSession, user: User, title: str, text: str) -> dict:
-    """Start a conversation about a recommendation: it becomes the assistant's last message,
-    so both the chat and the model see what the user wants to discuss."""
+    """Start a conversation about a recommendation: it becomes the assistant's last message, explained in detail
+    (`details`, markdown), so both the chat and the model see what the user wants to discuss."""
     reply = {"kind": "topic", "title": title.strip()[:120], "text": text.strip()[:600]}
     last = await session.scalar(
         select(ConversationMessage)
@@ -319,10 +319,29 @@ async def remember_topic(session: AsyncSession, user: User, title: str, text: st
         .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
         .limit(1)
     )
-    if not (last and last.reply == reply):
-        await remember(session, user.id, "assistant", summarize(reply), reply)
-        await session.commit()
+    # The same recommendation opened twice is not explained again
+    if last and last.reply and last.reply.get("kind") == "topic" and (last.reply.get("title"), last.reply.get("text")) == (reply["title"], reply["text"]):
+        return last.reply
+    details = await explain_topic(session, user, reply["title"], reply["text"])
+    if details:
+        reply["details"] = details
+    await remember(session, user.id, "assistant", summarize(reply), reply)
+    await session.commit()
     return reply
+
+
+async def explain_topic(session: AsyncSession, user: User, title: str, text: str) -> str | None:
+    """The model's detailed explanation of a recommendation; without the model the short text stays alone."""
+    if not settings.llm_enabled:
+        return None
+    from services.gigachat import GigaChatClient
+
+    tz = tasks.local_tz(user)
+    try:
+        return await GigaChatClient().explain_recommendation(title, text, await calendar_context(session, user, tz), str(tz)) or None
+    except Exception:
+        logger.exception("Explaining a recommendation failed")
+        return None
 
 
 async def calendar_context(session: AsyncSession, user: User, tz: ZoneInfo) -> str:
@@ -413,6 +432,63 @@ def match_keywords(events: list[Event], keywords: list[str]) -> list[Event]:
     if best * 2 < len(keywords) or best == 0:
         return []
     return [event for score, event in scores if score == best]
+
+
+# "ОтС и ОС", "отчёт, созвон", "Л* or OS": several tasks named in one query
+QUERY_ALTERNATIVES = re.compile(r"\s*(?:[,;/&+]|\bи\b|\bили\b|\band\b|\bor\b)\s*", re.I)
+# Short words that never name a task on their own
+SHORT_STOP_WORDS = {"я", "ты", "мы", "вы", "он", "их", "им", "её", "ее", "же", "бы", "ли", "уж", "i", "me", "it", "и", "в", "во", "на", "с", "со", "к", "ко", "о", "об", "по", "у", "за", "до", "от", "из", "а", "но", "не", "мне", "мой", "все", "всё", "a", "an", "at", "in", "on", "to", "of", "my", "by", "the", "all"}
+
+
+def query_terms(text: str) -> tuple[list[str], list[str]]:
+    """Words of a task's name: stems of the long ones, matched anywhere as before, and short words, matched as whole
+    words ("ОС" is the task «2. Л ОС (52-35)», not "вопрос"). "Л*" stays with its star: a title that starts with Л."""
+    stems, short = [], []
+    for word in re.findall(r"[а-яёa-z0-9]+\*?", text.lower().replace("ё", "е")):
+        bare = word.rstrip("*")
+        if word.endswith("*") or len(bare) < 3:
+            if bare and bare not in SHORT_STOP_WORDS and word not in short:
+                short.append(word)
+        elif bare not in STOP_WORDS and not bare.isdigit():
+            stem = _stemmer.stemWord(bare)
+            stem = stem if len(stem) >= 3 else bare
+            if stem not in stems:
+                stems.append(stem)
+    return stems[:5], short[:5]
+
+
+def short_pattern(word: str) -> re.Pattern:
+    """"ос" — the whole word; "л*" — the start of the title, after a number like "1." ("1. Л ОтС")."""
+    if word.endswith("*"):
+        return re.compile(rf"^[\s\d.)\-–—#№]*{re.escape(word.rstrip('*'))}")
+    return re.compile(rf"(?<![а-яёa-z0-9]){re.escape(word)}(?![а-яёa-z0-9])")
+
+
+def match_query(events: list[Event], query: str, loose: bool = True) -> list[Event]:
+    """Tasks named by a query, short names included. The whole query first; when no task has all its words,
+    each part of "ОтС и ОС" is looked up on its own and the tasks of every part are taken.
+    A query of no usable words matches nothing — never every task of the period. `loose`: when no task has every
+    long word, those with most of them count (see match_keywords)."""
+
+    def matches(part: str) -> list[Event]:
+        stems, prefixes = query_terms(part)
+        if not stems and not prefixes:
+            return []
+        patterns = [short_pattern(word) for word in prefixes]
+        # A star is about the title alone; whole words may be in the description or place too
+        found = [event for event in events if all(pattern.search((event.title or "").lower().replace("ё", "е") if pattern.pattern.startswith("^") else searchable(event)) for pattern in patterns)]
+        if not stems:
+            return found
+        return match_keywords(found, stems) if loose else [event for event in found if all(stem in searchable(event) for stem in stems)]
+
+    found = matches(query)
+    if found:
+        return found
+    parts = [part for part in QUERY_ALTERNATIVES.split(query) if part.strip()]
+    if len(parts) < 2:
+        return []
+    chosen = {event.id for part in parts for event in matches(part)}
+    return [event for event in events if event.id in chosen]
 
 
 def short_day(day: date) -> str:
@@ -1845,7 +1921,7 @@ def summarize(reply: dict) -> str:
     if kind == "updated":
         return "Изменила: " + "; ".join(f"{event['title']} ({event['start']})" for event in reply["events"])
     if kind == "topic":
-        return f"Рекомендация Deyla — {reply['title']}: {reply['text']}"
+        return f"Рекомендация Deyla — {reply['title']}: {reply.get('details') or reply['text']}"
     if kind == "delete_proposal":
         return f"Предложила удалить {reply['count']} задач: {reply['title']}" + (f". {reply['answer']}" if reply.get("answer") else "")
     if kind == "completed":
@@ -2241,7 +2317,9 @@ async def select_events(session: AsyncSession, user: User, text: str, tz: ZoneIn
         text = CONTEXT_TARGET.sub(" ", text)
     filters = local_filters(text, tz) or {"date_from": None, "date_to": None, "time_from": None, "time_to": None, "keywords": []}
     words = request_words(text, now)
-    keywords = search_keywords(" ".join(words))
+    named = " ".join(words)
+    # Short names count too: "удали Л* на сегодня" is about «Л ОтС» and «Л ОС», not every task of the day
+    keywords = search_keywords(named) or query_terms(named)[1]
     # "все встречи с Олей", "удали созвоны" — every matching task, not only the nearest one
     everything = bool(ALL_WORDS.search(text)) or (bool(keywords) and plural_head(words))
     # Without words "отметь всё выполненным" is about today, never about every task ever
@@ -2258,7 +2336,7 @@ async def select_events(session: AsyncSession, user: User, text: str, tz: ZoneIn
         return [], None
     events = list(await session.scalars(select(Event).where(*conditions).order_by(Event.start_at).limit(MAX_DELETE)))
     if keywords:
-        events = [event for event in events if all(stem in searchable(event) for stem in keywords)]
+        events = [event for event in events if all(stem in searchable(event) for stem in keywords)] if search_keywords(named) else match_query(events, " ".join(keywords))
         if not everything and not date_from and events:
             events.sort(key=lambda event: (event.completed_at is not None, event.end_at < now, abs((event.start_at - now).total_seconds())))
             events = events[:1]
