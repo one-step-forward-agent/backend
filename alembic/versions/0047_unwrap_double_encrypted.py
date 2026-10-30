@@ -18,8 +18,10 @@ BATCH = 500
 
 def upgrade():
     bind = op.get_bind()
+    # The registry lists today's columns: tables made by later migrations (teams, …) do not exist yet here
+    existing = set(sa.inspect(bind).get_table_names())
     for table, column, kind in ENCRYPTED_COLUMNS:
-        if kind != "json":
+        if kind != "json" or table not in existing:
             continue
         context = f"{table}.{column}"
         last_id = 0

@@ -143,6 +143,7 @@ def _copy(template: Event, moment: datetime, duration: timedelta) -> Event:
         imported=template.imported,
         is_fixed=template.is_fixed,
         tag_ids=list(template.tag_ids or []),
+        color=template.color,
         # A deadline belongs to one task; occurrences of a series do not share it
         deadline_at=None if template.recurrence_rule else template.deadline_at,
     )
@@ -349,6 +350,10 @@ async def set_completed(session: AsyncSession, user: User, event_id: int, comple
         return None
     event.completed_at = datetime.now(timezone.utc) if completed else None
     await session.commit()
+    from app.services import teams
+
+    # A team's task ticked in the performer's own calendar is done in the team too
+    await teams.event_completed(session, event)
     await session.refresh(event)
     return event
 
@@ -494,6 +499,7 @@ def task_view(event: Event, tz: ZoneInfo) -> dict:
         "deadline": event.deadline_at.astimezone(tz).isoformat() if event.deadline_at else None,
         "fixed": is_fixed(event),
         "tag_ids": list(event.tag_ids or []),
+        "color": event.color,
     }
 
 

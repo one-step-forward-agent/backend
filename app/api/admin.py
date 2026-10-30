@@ -24,7 +24,8 @@ from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import Base, get_session
 from app.core.dataenc import ENCRYPTED_COLUMNS, EncryptedJSON
-from app.models.models import AdminNote, ResearchAnswer, ResearchQuestion, User
+from app.models.models import AdminNote, Notification, ResearchAnswer, ResearchQuestion, User
+from app.services import reminders
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -249,6 +250,87 @@ async def save_note(payload: NoteSave, user: User = Depends(get_admin), session:
     note.locked_at = None
     await session.commit()
     return await _note_view(session, note, user)
+
+
+# ---------- a Telegram message to every user (app.services.reminders.queue_broadcast) ----------
+
+# Telegram's limit is 4096 characters; what escaping adds has to fit too
+BROADCAST_MAX = 3500
+BROADCAST_HISTORY = 20
+
+
+class BroadcastSend(BaseModel):
+    text: str = Field(min_length=1, max_length=BROADCAST_MAX)
+    # For users whose site is in English; empty: they get the Russian text
+    text_en: str | None = Field(default=None, max_length=BROADCAST_MAX)
+    # Only to the admin's own Telegram, to see how it looks
+    test: bool = False
+
+
+@router.get("/broadcasts")
+async def broadcasts(user: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
+    """Who a broadcast would reach now, and the latest broadcasts with how many got them."""
+    languages = (
+        await session.execute(
+            select(User.language, func.count()).where(User.telegram_chat_id.is_not(None), User.is_active.is_(True)).group_by(User.language)
+        )
+    ).all()
+    recipients = {"ru": 0, "en": 0}
+    for language, count in languages:
+        recipients["en" if language == "en" else "ru"] += count
+
+    batch = func.split_part(Notification.dedupe_key, ":", 2)
+    rows = (
+        await session.execute(
+            select(batch, Notification.status, func.count(), func.min(Notification.created_at), func.min(Notification.id))
+            .where(Notification.kind == reminders.BROADCAST_KIND, Notification.dedupe_key.like("broadcast:%"))
+            .group_by(batch, Notification.status)
+        )
+    ).all()
+    found: dict[str, dict] = {}
+    for key, state, count, created_at, first_id in rows:
+        item = found.setdefault(key, {"batch": key, "created_at": created_at, "first_id": first_id, "statuses": {}})
+        item["statuses"][state] = count
+        item["created_at"] = min(item["created_at"], created_at)
+        item["first_id"] = min(item["first_id"], first_id)
+    latest = sorted(found.values(), key=lambda item: item["created_at"], reverse=True)[:BROADCAST_HISTORY]
+    # The texts and the author are in every copy's payload: one copy per broadcast is enough
+    samples = {
+        notification.id: notification.payload or {}
+        for notification in (await session.scalars(select(Notification).where(Notification.id.in_([item["first_id"] for item in latest])))).all()
+    }
+    authors = {item.get("by") for item in samples.values()} - {None}
+    people = {person.id: person.name or person.email for person in (await session.scalars(select(User).where(User.id.in_(authors)))).all()} if authors else {}
+    history = []
+    for item in latest:
+        sample = samples.get(item.pop("first_id"), {})
+        statuses = item.pop("statuses")
+        history.append(
+            {
+                **item,
+                "text": sample.get("text"),
+                "text_en": sample.get("text_en"),
+                "by": people.get(sample.get("by")),
+                "total": sum(statuses.values()),
+                "sent": statuses.get("sent", 0),
+                "queued": statuses.get("pending", 0) + statuses.get("sending", 0),
+                "failed": statuses.get("failed", 0) + statuses.get("expired", 0),
+            }
+        )
+    return {"recipients": recipients, "me_linked": user.telegram_chat_id is not None, "history": history}
+
+
+@router.post("/broadcasts", status_code=status.HTTP_201_CREATED)
+async def send_broadcast(payload: BroadcastSend, user: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Напишите текст рассылки")
+    if payload.test and not user.telegram_chat_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ваш аккаунт не привязан к Telegram — привяжите бота в настройках, чтобы получить тест")
+    result = await reminders.queue_broadcast(session, user, text, (payload.text_en or "").strip() or None, only_admin=payload.test)
+    if not result["recipients"]:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Нет пользователей с привязанным Telegram")
+    return result
 
 
 # ---------- hypotheses asked in the chat (app.services.research) ----------

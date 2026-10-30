@@ -34,6 +34,10 @@ CUSTOM_KIND = "custom"
 CUSTOM_GRACE = timedelta(hours=12)
 MAX_CUSTOM_AHEAD = timedelta(days=366)
 MAX_PENDING_CUSTOM = 100
+# A message from the team to every user with Telegram (the admin dashboard)
+BROADCAST_KIND = "broadcast"
+# A broadcast still worth sending this long after its time (quiet hours, the bot was down)
+BROADCAST_LIFETIME = timedelta(days=2)
 # A repeating reminder ("каждый день в 9", "по будням", "каждые 2 часа"): after each one the next is queued
 REPEATS = ("daily", "weekdays", "weekly", "monthly")
 MIN_REPEAT_MINUTES = 15
@@ -324,6 +328,11 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
     now = datetime.now(timezone.utc)
     await tasks.extend_series(session, now)
     await generate_due(session, now)
+    from app.services import friends, teams
+
+    # Execution control of friends' and teams' tasks: the start question and the "has not started" news
+    await friends.queue_due(session, now)
+    await teams.queue_due(session, now)
     await session.execute(
         update(Notification)
         .where(Notification.status == NotificationStatus.SENDING, Notification.claimed_at < now - CLAIM_TIMEOUT)
@@ -334,7 +343,8 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
         .join(User, User.id == Notification.user_id)
         .outerjoin(ReminderSettings, ReminderSettings.user_id == User.id)
         .where(Notification.status == NotificationStatus.PENDING, Notification.scheduled_for <= now)
-        .order_by(Notification.scheduled_for, Notification.id)
+        # A broadcast to thousands of users goes after the reminders, never in front of them
+        .order_by(Notification.kind == BROADCAST_KIND, Notification.scheduled_for, Notification.id)
         .limit(limit * 4)
         .with_for_update(skip_locked=True, of=Notification)
     )
@@ -358,7 +368,8 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
             continue
         local_time = now.astimezone(ZoneInfo(user_timezone(user))).time()
         # A test and a reminder the user asked for at a set time are sent even in quiet hours
-        if notification.kind not in ("test", CUSTOM_KIND) and reminder_settings and reminder_settings.quiet_hours_enabled and in_quiet_hours(reminder_settings, local_time):
+        # A friend's task starting: the friend agreed to that time, like a reminder they set
+        if notification.kind not in ("test", CUSTOM_KIND, "friend_start") and reminder_settings and reminder_settings.quiet_hours_enabled and in_quiet_hours(reminder_settings, local_time):
             continue
         notification.status = NotificationStatus.SENDING
         notification.claimed_at = now
@@ -423,6 +434,52 @@ async def queue_test(session: AsyncSession, user: User) -> Notification:
     session.add(notification)
     await session.commit()
     return notification
+
+
+def quiet_until(reminder_settings: ReminderSettings | None, tz: ZoneInfo, now: datetime) -> datetime:
+    """Now, or the end of the user's quiet hours when it is night for them."""
+    if not reminder_settings or not reminder_settings.quiet_hours_enabled:
+        return now
+    local = now.astimezone(tz)
+    if not in_quiet_hours(reminder_settings, local.time()):
+        return now
+    end = datetime.combine(local.date(), reminder_settings.quiet_hours_end, tz)
+    return end if end > local else end + timedelta(days=1)
+
+
+async def queue_broadcast(session: AsyncSession, admin: User, text_ru: str, text_en: str | None, only_admin: bool = False) -> dict:
+    """A message from the team to everyone with Telegram linked (only_admin: just to the admin, to see how it looks).
+    Each gets it in their site's language, not at night, and through the bot's usual queue — after the reminders."""
+    query = (
+        select(User, ReminderSettings)
+        .outerjoin(ReminderSettings, ReminderSettings.user_id == User.id)
+        .where(User.telegram_chat_id.is_not(None), User.is_active.is_(True))
+    )
+    if only_admin:
+        query = query.where(User.id == admin.id)
+    recipients = (await session.execute(query)).all()
+    batch = secrets.token_hex(6)
+    now = datetime.now(timezone.utc)
+    # Sent as plain text: the bot speaks HTML, and a stray "<" must not break the message
+    texts = {"ru": html.escape(text_ru, quote=False), "en": html.escape(text_en or text_ru, quote=False)}
+    payload = {"batch": batch, "by": admin.id, "text": text_ru, "text_en": text_en}
+    for user, reminder_settings in recipients:
+        scheduled = quiet_until(reminder_settings, ZoneInfo(user_timezone(user)), now)
+        session.add(
+            Notification(
+                user_id=user.id,
+                kind=BROADCAST_KIND,
+                dedupe_key=f"{'broadcast-test' if only_admin else 'broadcast'}:{batch}:{user.id}",
+                text=texts["en" if user.language == "en" else "ru"],
+                payload=payload,
+                scheduled_for=scheduled,
+                expires_at=scheduled + BROADCAST_LIFETIME,
+                status=NotificationStatus.PENDING,
+                attempts=0,
+            )
+        )
+    await session.commit()
+    return {"batch": batch, "recipients": len(recipients)}
 
 
 def issue_link_code(user: User) -> str:

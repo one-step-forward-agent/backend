@@ -289,10 +289,14 @@ async def history(session: AsyncSession, user: User, limit: int = HISTORY_LIMIT)
             .limit(limit)
         )
     )
-    return [
+    from app.services import friends, teams
+
+    items = [
         {"id": row.id, "role": row.role, "text": row.content, "reply": row.reply, "rating": row.rating, "created_at": row.created_at.isoformat()}
         for row in reversed(rows)
     ]
+    # A friend's task answered in Telegram shows answered here too
+    return await teams.refresh(session, user, await friends.refresh(session, user, items))
 
 
 async def clear_history(session: AsyncSession, user: User) -> int:
@@ -2178,6 +2182,21 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, atta
     name = command(text)
     if name:
         return await run_command(session, user, name)
+    if attachment is None:
+        from app.services import friends, teams
+
+        # "В команде @Разработка поручи Ивану …": the team's assistant answers
+        mentioned = await teams.by_mention(session, user, text)
+        if mentioned is not None:
+            return mentioned
+
+        # "Добавь Маше купить хлеб": only when the name is one of the user's friends; anything else goes on as before
+        try:
+            delegated = await friends.delegate_by_rules(session, user, text, tz)
+        except friends.FriendError as error:
+            delegated = {"kind": "answer", "text": str(error)}
+        if delegated is not None:
+            return delegated
     if attachment is not None:
         from app.services import agent as file_rules
 

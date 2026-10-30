@@ -76,6 +76,8 @@ class User(Base):
     calendar_feed_token: Mapped[str | None] = mapped_column(String(64), unique=True)
     # Points, levels and badges (app.services.rewards): off hides them on the site and in the evening summary
     rewards_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # Tasks given to friends are checked by default: at their start the friend is asked whether they have begun
+    friend_check_default: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     # Onboarding answers: purpose, spheres, goals, tone of voice, work days and hours
     profile: Mapped[dict] = mapped_column(EncryptedJSON("users.profile"), default=dict, server_default="{}")
     # Calendars the assistant also adds new tasks to ("google", "yandex", ...), the last choice; NULL: never chosen
@@ -156,6 +158,8 @@ class Event(Base):
     # A task that cannot be moved (a meeting, an exam): suggestions plan around it
     is_fixed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     tag_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list, server_default="{}")
+    # The colour the user chose for the task in the calendar (the tag palette); NULL: the usual one
+    color: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     calendar: Mapped[Calendar] = relationship(back_populates="events")
@@ -286,6 +290,193 @@ class Notification(Base):
     # A custom reminder's own text, the tasks a check-in offers to move
     payload: Mapped[dict | None] = mapped_column(EncryptedJSON("notifications.payload"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FriendStatus(StrEnum):
+    # The owner asked the friend and waits
+    REQUESTED = "requested"
+    # The friend asked the owner, who has not answered yet
+    INCOMING = "incoming"
+    ACCEPTED = "accepted"
+
+
+class Friendship(Base):
+    """One side of a friendship (app.services.friends): each of the two users has a row with their own name for the
+    other, whether they take the other's tasks without asking, and a pause on the other's tasks."""
+
+    __tablename__ = "friendships"
+    __table_args__ = (UniqueConstraint("user_id", "friend_id", name="uq_friendships_pair"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    friend_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default=FriendStatus.REQUESTED)
+    # How the owner calls the friend in the chat ("Маша"); empty: the friend's own name
+    nickname: Mapped[str | None] = mapped_column(EncryptedText("friendships.nickname"))
+    # The owner takes the friend's tasks without being asked
+    auto_accept: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # "Не присылать 10 минут": the friend's new tasks are refused until then
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FriendTaskStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+class CheckState(StrEnum):
+    # The task has started: the friend was asked whether they have begun
+    ASKED = "asked"
+    STARTED = "started"
+    # No answer in FRIEND_START_WAIT: the sender was told
+    MISSED = "missed"
+
+
+class FriendTask(Base):
+    """A task a user gave a friend in the chat ("добавь Маше купить хлеб"). Accepted, it goes to the friend's
+    calendar, and when shared ("нам с Машей в кино") to the sender's too."""
+
+    __tablename__ = "friend_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    performer_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(EncryptedText("friend_tasks.title"))
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    all_day: Mapped[bool] = mapped_column(Boolean, default=False)
+    shared: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    status: Mapped[str] = mapped_column(String(20), default=FriendTaskStatus.PENDING, index=True)
+    # Execution control: at the start the friend is asked whether they have begun, the sender hears the answer
+    check_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    check_state: Mapped[str | None] = mapped_column(String(20))
+    asked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    performer_event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
+    sender_event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Team(Base):
+    """A team (app.services.teams): its members, projects and tasks, and its own assistant. `tag` names it in the
+    personal chat: "в команде @Разработка поручи Ивану …"."""
+
+    __tablename__ = "teams"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(Text)
+    # The name after "@", unique among all teams (case-insensitive, kept lowercase in tag_key)
+    tag: Mapped[str] = mapped_column(String(40))
+    tag_key: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    # "required": the performer accepts or rejects a task; "auto": it is theirs at once
+    task_confirm: Mapped[str] = mapped_column(String(20), default="required", server_default="required")
+    # Execution control for new tasks by default: the performer is asked at the start, the creator hears the answer
+    check_default: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TeamMember(Base):
+    __tablename__ = "team_members"
+    __table_args__ = (
+        UniqueConstraint("team_id", "user_id", name="uq_team_members_user"),
+        UniqueConstraint("team_id", "name_key", name="uq_team_members_name"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # The name the member chose when joining, unique within the team (name_key: its lowercase form)
+    name: Mapped[str] = mapped_column(Text)
+    name_key: Mapped[str] = mapped_column(String(100))
+    # "admin" manages the team, its members and invitations; "member" works in it
+    role: Mapped[str] = mapped_column(String(20), default="member", server_default="member")
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TeamInvite(Base):
+    """A link for one person: it works once and for 24 hours."""
+
+    __tablename__ = "team_invites"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True)
+    # Whom it is meant for, as the admin wrote it ("Иван из маркетинга"): a note, not a check
+    note: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    # "active" or "archived"
+    status: Mapped[str] = mapped_column(String(20), default="active", server_default="active")
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TeamTaskStatus(StrEnum):
+    TODO = "todo"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+
+
+class TeamTask(Base):
+    """A task of a team: given in the team's chat, the personal chat ("в команде @Разработка поручи Ивану …") or on
+    the team's page. Accepted, it goes to the performer's calendar too."""
+
+    __tablename__ = "team_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), index=True)
+    title: Mapped[str] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    assignee_id: Mapped[int | None] = mapped_column(ForeignKey("team_members.id", ondelete="SET NULL"), index=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # When the work starts ("в пятницу в 10"): execution control asks then; no start, no question
+    start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(20), default=TeamTaskStatus.TODO, server_default="todo", index=True)
+    # "pending" while the performer has not answered; "accepted", "rejected"; NULL: nobody is assigned
+    confirm: Mapped[str | None] = mapped_column(String(20))
+    check_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    check_state: Mapped[str | None] = mapped_column(String(20))
+    asked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The copy in the performer's calendar
+    event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class TeamMessage(Base):
+    """One message of a member's conversation with the team's assistant (each member talks to it on their own)."""
+
+    __tablename__ = "team_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(EncryptedText("team_messages.content"))
+    reply: Mapped[dict | None] = mapped_column(EncryptedJSON("team_messages.reply"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
 class RefreshToken(Base):

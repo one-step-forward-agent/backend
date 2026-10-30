@@ -317,3 +317,49 @@ async def checkin_action(notification_id: int, payload: BotCheckinRequest, sessi
     notification.payload = {**data, "event_ids": []}
     await session.commit()
     return {"moved": moved, "target_label": data.get("target_label")}
+
+
+@router.post("/chat/{chat_id}/friend-tasks/{task_id}/{action}")
+async def friend_task_action(
+    chat_id: int,
+    task_id: int,
+    action: Literal["accept", "reject", "block", "start", "cancel", "check_on", "check_off"],
+    session: AsyncSession = Depends(get_session),
+):
+    """A button under a friend's task in Telegram: the card comes back as it is now."""
+    from app.services import friends
+
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await friends.act(session, user, task_id, action)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from None
+    except friends.FriendError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@router.post("/chat/{chat_id}/friends/{friend_id}/{decision}")
+async def friend_invite_answer(chat_id: int, friend_id: int, decision: Literal["accept", "decline"], session: AsyncSession = Depends(get_session)):
+    from app.services import friends
+
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await friends.answer_invite(session, user, friend_id, decision == "accept")
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from None
+
+
+@router.post("/chat/{chat_id}/team-tasks/{task_id}/{action}")
+async def team_task_action(
+    chat_id: int, task_id: int, action: Literal["accept", "reject", "start", "done", "check_on", "check_off"], session: AsyncSession = Depends(get_session)
+):
+    """A button under a team's task in Telegram: the card comes back as it is now."""
+    from app.services import teams
+
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await teams.act(session, user, task_id, action)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from None
+    except teams.TeamError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None

@@ -62,6 +62,10 @@ ENCRYPTED_COLUMNS = (
     ("notifications", "error", "text"),
     ("integrations", "config", "json"),
     ("integrations", "last_sync_error", "text"),
+    ("friendships", "nickname", "text"),
+    ("friend_tasks", "title", "text"),
+    ("team_messages", "content", "text"),
+    ("team_messages", "reply", "json"),
 )
 UNREADABLE = "[не удалось расшифровать]"
 

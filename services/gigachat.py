@@ -512,6 +512,27 @@ class GigaChatClient:
         result = await self._complete(payload, "chat_reply")
         return result["choices"][0]["message"]["content"].strip()
 
+    async def team_reply(self, text: str, team: str, timezone: str = "Europe/Moscow") -> str:
+        """The team's assistant on a question its rules do not cover: from the team's members, projects and tasks."""
+        now = datetime.now(ZoneInfo(timezone))
+        system = (
+            PERSONA
+            + NO_ACTION_CLAIMS
+            + "Сейчас ты ассистент команды: помогаешь руководителю и участникам с общими проектами и задачами. "
+            "Отвечай только по данным команды ниже, не выдумывай задач и сроков. Коротко: до 6 предложений или список. "
+            "Поставить задачу можно фразой «Поставь <имя> задачу <что> к <сроку>»; если пользователь хочет что-то поменять, "
+            "подскажи такую команду. Отвечай на языке пользователя. "
+            f"Сейчас {now:%d.%m.%Y %H:%M}, часовой пояс {timezone}."
+        )
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": f"Данные команды:\n{team}\n\nВопрос:\n{text[:4000]}"}],
+            "temperature": 0.3,
+            "max_tokens": 600,
+        }
+        result = await self._complete(payload, "team_reply")
+        return result["choices"][0]["message"]["content"].strip()
+
     async def extract_change(self, text: str, timezone: str = "Europe/Moscow", context: str = "") -> dict:
         """What the user wants to change in an existing task; dates stay phrases, resolved by app.services.dates."""
         now = datetime.now(ZoneInfo(timezone))

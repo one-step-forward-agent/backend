@@ -164,6 +164,10 @@ class EventLinkRead(BaseModel):
     url: str | None = None
 
 
+# A task's own colour in the calendar: the tag palette; none: the calendar's usual colour (or its tag's)
+TASK_COLORS = ("indigo", "blue", "green", "amber", "red", "pink", "violet", "slate")
+
+
 class EventCreate(BaseModel):
     calendar_id: int | None = None
     title: str = Field(min_length=1, max_length=300)
@@ -179,6 +183,7 @@ class EventCreate(BaseModel):
     deadline_at: datetime | None = None
     is_fixed: bool = False
     tag_ids: list[int] = Field(default_factory=list, max_length=20)
+    color: Literal[TASK_COLORS] | None = None
 
     @field_validator("priority", mode="after")
     @classmethod
@@ -199,6 +204,8 @@ class EventUpdate(BaseModel):
     deadline_at: datetime | None = None
     is_fixed: bool | None = None
     tag_ids: list[int] | None = Field(default=None, max_length=20)
+    # null takes the colour off
+    color: Literal[TASK_COLORS] | None = None
     # A new repeat from this occurrence on ("" or null: no longer repeats); left out: the repeat stays
     recurrence_rule: str | None = Field(default=None, max_length=300)
 
