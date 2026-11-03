@@ -7,12 +7,19 @@ already done and stops offering actions after MAX_ACTIONS. Every step is a model
 user's token budget (usage.blocked_for) and limited per minute and per hour.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Literal
+from urllib.parse import urlencode
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +28,7 @@ from app.core import ratelimit
 from app.core.config import settings
 from app.core.database import get_session
 from app.models.models import User
+from app.schemas import TokenResponse
 from app.services import usage
 from services.gigachat import GigaChatClient
 
@@ -241,3 +249,70 @@ async def step(payload: DesktopStepRequest, user: User = Depends(get_current_use
         )
     content = (answer.get("content") or "").strip() or "Не получилось понять задачу — опишите её иначе."
     return DesktopStepResponse(content=content[:4000], actions_left=left)
+
+
+# ---------- signing the app in through the browser ----------
+# Works for every account, Google and Yandex ones too (they have no password). The app listens on 127.0.0.1, opens
+# the site's /app/desktop-login page; the signed-in user presses «Разрешить», the site gets a one-time code from
+# /api/desktop/authorize and sends the browser to the app. The app exchanges the code at /auth/desktop/token with
+# the verifier only it knows (PKCE, S256): a code seen by anyone else is of no use to them.
+
+DESKTOP_CODE = "desktop_code"
+CODE_LIFETIME = timedelta(minutes=2)
+_used_codes: dict[str, float] = {}
+
+
+class DesktopAuthorize(BaseModel):
+    challenge: str = Field(pattern=r"^[A-Za-z0-9_-]{43,128}$")
+    port: int = Field(ge=1024, le=65535)
+    state: str = Field(pattern=r"^[A-Za-z0-9_-]{8,64}$")
+
+
+class DesktopToken(BaseModel):
+    code: str = Field(max_length=2000)
+    verifier: str = Field(pattern=r"^[A-Za-z0-9_-]{43,128}$")
+
+
+def _challenge_of(verifier: str) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+
+@router.post("/authorize")
+async def authorize(payload: DesktopAuthorize, user: User = Depends(get_current_user)) -> dict:
+    """«Разрешить» on the site: where the browser goes next — the app on this computer, with a one-time code."""
+    now = datetime.now(timezone.utc)
+    code = jwt.encode(
+        {"sub": str(user.id), "type": DESKTOP_CODE, "jti": uuid4().hex, "ch": payload.challenge, "iat": now, "exp": now + CODE_LIFETIME},
+        settings.secret_key,
+        algorithm=settings.jwt_algorithm,
+    )
+    # Only the loopback address: the code never goes to another site
+    return {"redirect": f"http://127.0.0.1:{payload.port}/callback?{urlencode({'code': code, 'state': payload.state})}"}
+
+
+auth_router = APIRouter(prefix="/auth/desktop", tags=["desktop"])
+
+
+@auth_router.post("/token", response_model=TokenResponse)
+async def desktop_token(payload: DesktopToken, request: Request, session: AsyncSession = Depends(get_session)):
+    """The app's own session for the code it received, once."""
+    from app.api.auth import _token_response
+
+    ratelimit.hit(f"desktop-token:{ratelimit.client_ip(request)}", 20, 600)
+    invalid = HTTPException(status_code=401, detail="Ссылка для входа устарела — нажмите «Войти через браузер» ещё раз")
+    try:
+        claims = jwt.decode(payload.code, settings.secret_key, algorithms=[settings.jwt_algorithm], options={"require": ["sub", "exp", "type", "jti", "ch"]})
+    except jwt.InvalidTokenError:
+        raise invalid from None
+    if claims.get("type") != DESKTOP_CODE or not hmac.compare_digest(str(claims["ch"]), _challenge_of(payload.verifier)):
+        raise invalid
+    now = time.time()
+    for jti in [jti for jti, until in _used_codes.items() if until < now]:
+        del _used_codes[jti]
+    if claims["jti"] in _used_codes:
+        raise invalid
+    _used_codes[claims["jti"]] = float(claims["exp"])
+    user = await session.get(User, int(claims["sub"]))
+    if not user or not user.is_active:
+        raise invalid
+    return await _token_response(session, user.id, cookies=False)

@@ -96,6 +96,7 @@ if settings.cors_origins:
 
 app.include_router(router)
 app.include_router(desktop.router)
+app.include_router(desktop.auth_router)
 app.include_router(google_router)
 app.include_router(yandex_router)
 app.include_router(apple_router)

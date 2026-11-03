@@ -124,3 +124,59 @@ async def test_turned_off_and_anonymous(client, user, openai_api, monkeypatch):
     monkeypatch.setattr(desktop, "settings", dataclasses.replace(desktop.settings, desktop_agent=False))
     assert (await client.post("/api/desktop/step", json={"messages": [{"role": "user", "content": "x"}]}, headers=headers)).status_code == 503
     assert (await client.get("/api/desktop/actions", headers=headers)).json()["max_actions"] == desktop.MAX_ACTIONS
+
+
+# ---------- signing the app in through the browser (accounts without a password: Google, Yandex) ----------
+
+import base64
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlsplit
+
+import jwt as pyjwt
+
+
+def pkce() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(48)
+    return verifier, base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+
+async def test_the_site_hands_the_app_a_one_time_code(client, user):
+    headers, _ = user
+    verifier, challenge = pkce()
+    allowed = await client.post("/api/desktop/authorize", json={"challenge": challenge, "port": 53123, "state": "state-123456"}, headers=headers)
+    assert allowed.status_code == 200, allowed.text
+    target = urlsplit(allowed.json()["redirect"])
+    assert (target.scheme, target.hostname, target.port, target.path) == ("http", "127.0.0.1", 53123, "/callback")
+    query = parse_qs(target.query)
+    assert query["state"] == ["state-123456"]
+    code = query["code"][0]
+
+    client.cookies.clear()
+    # Without the app's verifier the code is useless
+    assert (await client.post("/auth/desktop/token", json={"code": code, "verifier": pkce()[0]})).status_code == 401
+    tokens = await client.post("/auth/desktop/token", json={"code": code, "verifier": verifier})
+    assert tokens.status_code == 200, tokens.text
+    me = await client.get("/api/me", headers={"Authorization": f"Bearer {tokens.json()['access_token']}"})
+    assert me.status_code == 200
+    assert (await client.post("/auth/refresh", json={"refresh_token": tokens.json()["refresh_token"]})).status_code == 200
+    # Once only, and the code is not a session itself
+    assert (await client.post("/auth/desktop/token", json={"code": code, "verifier": verifier})).status_code == 401
+    assert (await client.get("/api/me", headers={"Authorization": f"Bearer {code}"})).status_code == 401
+
+
+async def test_an_old_or_anonymous_request_gets_nothing(client, user):
+    from app.core.config import settings
+
+    verifier, challenge = pkce()
+    client.cookies.clear()
+    assert (await client.post("/api/desktop/authorize", json={"challenge": challenge, "port": 53123, "state": "state-123456"})).status_code == 401
+    old = pyjwt.encode(
+        {"sub": "1", "type": "desktop_code", "jti": "x", "ch": challenge, "iat": datetime.now(timezone.utc) - timedelta(minutes=5), "exp": datetime.now(timezone.utc) - timedelta(minutes=3)},
+        settings.secret_key, algorithm=settings.jwt_algorithm,
+    )
+    assert (await client.post("/auth/desktop/token", json={"code": old, "verifier": verifier})).status_code == 401
+    headers, _ = user
+    for bad in ({"challenge": challenge, "port": 80, "state": "state-123456"}, {"challenge": "short", "port": 53123, "state": "state-123456"}):
+        assert (await client.post("/api/desktop/authorize", json=bad, headers=headers)).status_code == 422
