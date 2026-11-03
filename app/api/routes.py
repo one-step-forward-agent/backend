@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import secrets
 import shutil
 import subprocess
@@ -56,6 +57,7 @@ from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets
 
 router = APIRouter(prefix="/api")
+logger = logging.getLogger(__name__)
 
 # Per-user limits on paid/heavy work (GigaChat requests, speech recognition, document parsing)
 ASSISTANT_LIMIT, ASSISTANT_WINDOW = 60, 60 * 60
@@ -79,7 +81,7 @@ async def limit_assistant(session: AsyncSession, user: User, text: str | None = 
     if wait:
         raise HTTPException(
             status_code=429,
-            detail=f"Лимит ассистента исчерпан — он снова ответит через {wait_text(wait)}. «Сегодня», «Завтра» и «Статистика» работают и сейчас.",
+            detail=f"Лимит ассистента исчерпан, и это сообщение он не обработал. Отправьте его снова через {wait_text(wait)}. «Сегодня», «Завтра» и «Статистика» работают и сейчас.",
             headers={"Retry-After": str(wait)},
         )
     ratelimit.hit(f"assistant-burst:{user.id}", ASSISTANT_BURST, ASSISTANT_BURST_WINDOW, "Слишком часто — подождите минуту")
@@ -148,7 +150,11 @@ async def delete_current_user(user: User = Depends(get_current_user), session: A
     in the Google account too. The rows go by the database's ON DELETE CASCADE."""
     google = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == "google"))
     if google:
-        await revoke_google_access(integration_secrets(google))
+        # Revoking is a courtesy to the Google account: unreadable credentials must not keep the account alive
+        try:
+            await revoke_google_access(integration_secrets(google))
+        except Exception:
+            logger.exception("Could not revoke Google access while deleting user %s", user.id)
     event_ids = list(await session.scalars(select(Event.id).where(Event.user_id == user.id)))
     user_id = user.id
     await session.execute(delete(User).where(User.id == user.id))
@@ -307,6 +313,11 @@ async def move_events(payload: MoveRequest, user: User = Depends(get_current_use
 @router.get("/stats")
 async def stats(days: int = 7, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await tasks.daily_stats(session, user, min(max(days, 1), 90))
+
+
+@router.get("/stats/activity")
+async def stats_activity(tag_id: int | None = None, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return await tasks.activity(session, user, tag_id)
 
 
 @router.get("/rewards")

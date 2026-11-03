@@ -424,6 +424,43 @@ async def daily_stats(session: AsyncSession, user: User, days: int = 7) -> dict:
     }
 
 
+ACTIVITY_DAYS = 53 * 7
+
+
+async def activity(session: AsyncSession, user: User, tag_id: int | None = None) -> dict:
+    """Ticked tasks per day over the last 53 weeks, by the day they were ticked: the grid on the profile.
+    Without a tag, as the progress counts them (tags marked «не считать в прогрессе» left out); `tags`: the year's
+    count of each tag, so the page offers only the tags with something to show."""
+    tz = local_tz(user)
+    today = datetime.now(tz).date()
+    first = today - timedelta(days=ACTIVITY_DAYS - 1)
+    rows = (
+        await session.execute(
+            select(Event.completed_at, Event.tag_ids).where(
+                Event.user_id == user.id, Event.completed_at >= datetime.combine(first, time.min, tz)
+            )
+        )
+    ).all()
+    skipped = set(await session.scalars(select(Tag.id).where(Tag.user_id == user.id, Tag.counts_progress.is_(False))))
+    per_day: dict[date, int] = {}
+    per_tag: dict[int, int] = {}
+    for completed_at, tag_ids in rows:
+        tags = set(tag_ids or [])
+        for tag in tags:
+            per_tag[tag] = per_tag.get(tag, 0) + 1
+        if (tag_id is not None and tag_id not in tags) or (tag_id is None and skipped & tags):
+            continue
+        day = completed_at.astimezone(tz).date()
+        if first <= day <= today:
+            per_day[day] = per_day.get(day, 0) + 1
+    series = [{"date": (first + timedelta(days=offset)).isoformat(), "done": per_day.get(first + timedelta(days=offset), 0)} for offset in range(ACTIVITY_DAYS)]
+    return {
+        "days": series,
+        "total": sum(entry["done"] for entry in series),
+        "tags": [{"id": tag, "done": count} for tag, count in sorted(per_tag.items(), key=lambda item: -item[1])],
+    }
+
+
 async def streaks(session: AsyncSession, user: User, now: datetime) -> tuple[int, int]:
     """The current and the best series of completed days.
 
