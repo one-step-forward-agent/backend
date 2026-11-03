@@ -63,7 +63,10 @@ async def test_step_returns_the_chosen_action(client, user, openai_api):
     assert body["confirm"] is False
     request = received[0]
     assert request["model"] == "test-agent-model"
-    assert {tool["function"]["name"] for tool in request["tools"]} >= {"open_url", "write_text_file", "find_files"}
+    assert {tool["function"]["name"] for tool in request["tools"]} >= {"open_url", "write_text_file", "find_files", "currency_rates", "read_web_page", "write_spreadsheet"}
+    # The rules tell the model to finish the task itself instead of asking for data or for a folder
+    rules = request["messages"][0]["content"]
+    assert "currency_rates" in rules and "Desktop" in rules and "не проси" in rules
     assert all("confirm" not in tool["function"] for tool in request["tools"])
     async with session_factory() as session:
         purposes = (await session.scalars(select(LlmUsage.purpose).order_by(LlmUsage.id.desc()).limit(1))).all()

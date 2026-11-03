@@ -39,7 +39,8 @@ router = APIRouter(prefix="/api/desktop", tags=["desktop"])
 # Actions in one task, then the model must answer with words
 MAX_ACTIONS = 12
 MAX_MESSAGES = 2 * MAX_ACTIONS + 8
-MAX_MESSAGE_CHARS = 6000
+# Pasted text and table rows can be long; the token budget limits the rest
+MAX_MESSAGE_CHARS = 12000
 STEPS_PER_MINUTE = 20
 STEPS_PER_HOUR = 300
 
@@ -128,12 +129,48 @@ ACTIONS: list[dict] = [
         "description": "Узнать дату и время, версию Windows, свободное место на дисках и заряд батареи.",
         "parameters": {"type": "object", "properties": {}},
     },
+    {
+        "name": "currency_rates",
+        "description": "Официальные курсы валют ЦБ РФ к рублю на сегодня (или на дату): сколько рублей за единицу валюты.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "codes": {"type": "array", "items": {"type": "string"}, "description": "Коды валют (USD, EUR, CNY…); пусто — все валюты ЦБ"},
+                "date": {"type": "string", "description": "YYYY-MM-DD; по умолчанию сегодня"},
+            },
+        },
+    },
+    {
+        "name": "read_web_page",
+        "description": "Прочитать текст веб-страницы по адресу http(s) (без картинок и скриптов, до ~4500 знаков). Для поиска: https://duckduckgo.com/html/?q=…",
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    },
+    {
+        "name": "write_spreadsheet",
+        "description": "Создать таблицу Excel (.xlsx) или .csv в папке пользователя из строк: первая строка — заголовки. Перезаписывать нельзя. Пользователь подтверждает.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Например «Desktop/Курсы валют.xlsx»"},
+                "rows": {"type": "array", "items": {"type": "array", "items": {}}, "description": "Строки таблицы; числа передавай числами"},
+                "sheet": {"type": "string", "description": "Название листа"},
+            },
+            "required": ["path", "rows"],
+        },
+        "confirm": True,
+    },
 ]
 ACTION_NAMES = {action["name"] for action in ACTIONS}
 
 RULES = (
     "Ты — Дейла, помощник на компьютере пользователя с Windows. Ты выполняешь простые задачи только через функции: "
-    "открыть сайт или программу, найти, прочитать, создать или переместить файл в папках пользователя, буфер обмена, таймер. "
+    "открыть сайт или программу, найти, прочитать, создать или переместить файл в папках пользователя, создать таблицу Excel, "
+    "узнать курсы валют, прочитать веб-страницу, буфер обмена, таймер. "
+    "Доводи задачу до конца сама: нужные данные добывай функциями (currency_rates, read_web_page, read_text_file), а не проси "
+    "пользователя их прислать. Не переспрашивай то, что можно решить разумно: не сказано, куда сохранить, — Desktop; "
+    "имя файла придумай по смыслу; не сказано, какие валюты, — основные (USD, EUR, CNY, GBP, JPY, CHF, TRY, KZT, BYN, AED). "
+    "Спрашивай, только если без ответа задачу не сделать совсем. "
+    "Файлы, которые пользователь приложил к сообщению, перечислены в нём как «Приложен файл: <путь>» — их можно читать read_text_file. "
     "Делай одно действие за шаг и смотри на его результат. Не выдумывай результат: если функция вернула ошибку, скажи об этом. "
     "Удалять файлы, запускать команды, скрипты и программы не из списка, менять настройки системы, входить в аккаунты, "
     "вводить пароли и платить ты не можешь — вежливо откажись и предложи, что пользователь сделает сам. "
