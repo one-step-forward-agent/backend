@@ -71,6 +71,8 @@ class Settings:
     # The chat assistant is an agent that calls the app's functions (app/services/agent.py);
     # off: the older rule-based routing in app/services/chat.py answers alone
     assistant_agent: bool = _bool("ASSISTANT_AGENT", True)
+    # The Windows desktop agent (app/api/desktop.py, desktop_agent/); off: /api/desktop/step answers 503
+    desktop_agent: bool = _bool("DESKTOP_AGENT", True)
     gigachat_agent_model: str = os.getenv("GIGACHAT_AGENT_MODEL") or os.getenv("GIGACHAT_MODEL", "GigaChat")
     # Which service answers every model request: "gigachat" or "openai" (any OpenAI-compatible API at BASE_URL)
     llm_provider: str = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()

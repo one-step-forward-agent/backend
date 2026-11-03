@@ -135,6 +135,55 @@ CALENDAR_WORDS = re.compile(
     re.I,
 )
 CLAIM_ONLY_LIMIT = 80
+# Requests that are clearly not about plans: the assistant declines them without asking the model
+# (programming, homework, recipes, translations, essays). Only the start of a short message is looked at, so
+# "запланируй время написать код" or "напомни приготовить блины" stay ordinary planning requests.
+OUT_OF_SCOPE = re.compile(
+    r"^\s*(?:пожалуйста[,\s]+|плиз[,\s]+|а\s+)?(?:"
+    r"(?:напиши|написать|сделай|исправь|оптимизируй|объясни|отладь|допиши)\s+(?:мне\s+)?(?:код|программу|скрипт|функцию|класс|sql|регулярк\w*|алгоритм)"
+    r"|как\s+(?:написать|сделать)\s+(?:на\s+)?(?:python|питоне|java|c\+\+|javascript|js)\b"
+    r"|реши(?:ть)?\s+(?:мне\s+)?(?:задачу|задачку|уравнение|пример|контрольную|домашк\w*|дз)\b(?!.*\b(?:в\s+календар|в\s+план|задачи?\s+на))"
+    r"|(?:дай|напиши|подскажи|скинь|расскажи)\s+(?:мне\s+)?рецепт"
+    r"|рецепт\s"
+    r"|как\s+(?:при)?готовить\s"
+    r"|переведи\s"
+    r"|напиши\s+(?:мне\s+)?(?:сочинение|эссе|реферат|стих\w*|рассказ|пост|статью|доклад|курсовую)"
+    r"|(?:write|fix|debug)\s+(?:me\s+)?(?:a\s+|the\s+)?(?:code|program|script|function)"
+    r"|(?:give\s+me\s+)?(?:a\s+)?recipe\s+for\s"
+    r"|solve\s+(?:this|the|my)\s"
+    r")",
+    re.IGNORECASE,
+)
+CODE_LIKE = re.compile(r"```|^\s*(?:def |class |#include|import |from \S+ import |public static|function\s*\(|SELECT .+ FROM )", re.MULTILINE)
+OUT_OF_SCOPE_ANSWER = (
+    "С этим я не помогаю — я помощница по планированию: задачи, встречи, напоминания и загрузка недели. "
+    "Могу выделить на это время в календаре — напишите, например, «запланируй это на субботу в 11:00»."
+)
+OUT_OF_SCOPE_ANSWER_EN = (
+    "I can't help with that — I'm a planning assistant: tasks, meetings, reminders and your week's workload. "
+    "I can set aside time for it in your calendar — try “schedule it for Saturday at 11:00”."
+)
+
+
+# A day, a time or the calendar named: "напиши пост в 18:00" is a task to plan, not a request to write it
+PLANNING_HINT = re.compile(
+    r"\b(?:сегодня|завтра|послезавтра|понедельник\w*|вторник\w*|сред[уаы]|четверг\w*|пятниц\w*|суббот\w*|воскресень\w*|"
+    r"календар\w*|напомни|запланируй|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|calendar|remind|schedule)\b"
+    r"|\b(?:в|к|до|через|at)\s+\d{1,2}\b",
+    re.IGNORECASE,
+)
+
+
+def out_of_scope(text: str) -> bool:
+    """A request the assistant must decline: code, homework, recipes, translations, essays."""
+    text = (text or "").strip()
+    if not text or text.startswith("📎"):
+        return False
+    if CODE_LIKE.search(text):
+        return True
+    return bool(OUT_OF_SCOPE.match(text)) and not PLANNING_HINT.search(text)
+
+
 OFF_TOPIC_ANSWER = (
     "Я лучше всего помогаю с планами: добавить задачу, перенести встречу, напомнить о деле или разобрать загрузку недели. "
     "Напишите, например, «созвон с Олей завтра в 15:00» или «что у меня на завтра?»."
@@ -289,13 +338,14 @@ async def history(session: AsyncSession, user: User, limit: int = HISTORY_LIMIT)
             .limit(limit)
         )
     )
-    from app.services import friends, teams
+    from app.services import friends, send_drafts, teams
 
     items = [
         {"id": row.id, "role": row.role, "text": row.content, "reply": row.reply, "rating": row.rating, "created_at": row.created_at.isoformat()}
         for row in reversed(rows)
     ]
     # A friend's task answered in Telegram shows answered here too
+    items = await send_drafts.refresh(session, user, items)
     return await teams.refresh(session, user, await friends.refresh(session, user, items))
 
 
@@ -2078,7 +2128,13 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     await prune_history(session, user.id)
     failed = False
     try:
-        reply = await route(session, user, text, tz, attachment)
+        wish = None if attachment else await research.resolve_wish(session, user, caption)
+        if wish is not None:
+            reply = wish
+        elif not attachment and out_of_scope(caption):
+            reply = {"kind": "answer", "text": tr(OUT_OF_SCOPE_ANSWER, OUT_OF_SCOPE_ANSWER_EN)}
+        else:
+            reply = await route(session, user, text, tz, attachment)
     except AssistantUnavailable:
         if not settings.llm_enabled:
             raise

@@ -358,6 +358,8 @@ class FriendTask(Base):
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     performer_event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
     sender_event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
+    # "Напомни Маше завтра в 9 позвонить врачу": accepted at once, in the friend's calendar with a reminder at that time
+    is_reminder: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -524,6 +526,22 @@ class AssistantDraft(Base):
     # calendars is NULL in drafts made before the choice
     targets: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
     calendars: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class SendDraft(Base):
+    """Something the chat would send to another person — a task or a reminder for a friend, a task for a team member —
+    waiting for the user's «Отправить» (app.services.send_drafts). `result` is the card shown once it was sent."""
+
+    __tablename__ = "send_drafts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    payload: Mapped[dict] = mapped_column(EncryptedJSON("send_drafts.payload"))
+    status: Mapped[str] = mapped_column(String(20), default="open", server_default="open")
+    result: Mapped[dict | None] = mapped_column(EncryptedJSON("send_drafts.result"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

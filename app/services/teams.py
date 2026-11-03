@@ -923,8 +923,10 @@ async def assign_by_words(session: AsyncSession, user: User, team: Team, people:
     for moment in (request["deadline"], request["start"]):
         if moment and moment < now - timedelta(minutes=1):
             return {"kind": "answer", "text": tr("Это время уже прошло — укажите другой срок.", "This time has already passed — give another date.")}
-    task = await create_task(session, user, team, title, assignee, request["deadline"], request["start"], project_id, check=request["check"])
-    return await card_for(session, task, user, "created")
+    from app.services import send_drafts
+
+    # Nothing goes to the member before «Отправить» under the draft
+    return await send_drafts.team_task(session, user, team, assignee, title, request["deadline"], request["start"], project_id, request["check"])
 
 
 async def reassign_by_words(session: AsyncSession, user: User, team: Team, people: list[TeamMember], title: str, rest: str) -> dict:
@@ -1133,7 +1135,9 @@ async def history(session: AsyncSession, user: User, team_id: int) -> list[dict]
         )
     )
     items = [{"id": row.id, "role": row.role, "text": row.content, "reply": row.reply, "created_at": row.created_at.isoformat()} for row in reversed(rows)]
-    return await refresh(session, user, items)
+    from app.services import send_drafts
+
+    return await refresh(session, user, await send_drafts.refresh(session, user, items))
 
 
 # ---------- the personal chat: "в команде @Разработка поручи Ивану …" ----------

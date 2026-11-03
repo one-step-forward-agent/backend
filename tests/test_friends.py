@@ -45,10 +45,20 @@ async def befriend(client, one: dict, other: dict) -> None:
     assert accepted.status_code == 200, accepted.text
 
 
-async def say(client, who: dict, text: str) -> dict:
-    response = await client.post("/api/assistant/chat", json={"text": text}, headers=who["headers"])
+async def send_draft(client, who: dict, reply: dict) -> dict:
+    """«Отправить» under a draft of a task or reminder for someone else; any other reply is returned as it is."""
+    if reply.get("kind") != "send_draft":
+        return reply
+    response = await client.post(f"/api/send-drafts/{reply['draft_id']}/send", headers=who["headers"])
     assert response.status_code == 200, response.text
     return response.json()
+
+
+async def say(client, who: dict, text: str, send: bool = True) -> dict:
+    """A chat message; a draft for a friend is sent at once unless send=False (see test_send_drafts.py)."""
+    response = await client.post("/api/assistant/chat", json={"text": text}, headers=who["headers"])
+    assert response.status_code == 200, response.text
+    return await send_draft(client, who, response.json()) if send else response.json()
 
 
 async def cards(client, who: dict) -> list[dict]:
@@ -118,7 +128,7 @@ async def test_a_task_is_accepted_and_goes_to_the_friends_calendar_only(client):
     assert reply["kind"] == "friend_task" and reply["role"] == "sender" and reply["title"] == "Купить хлеб"
     assert reply["status"] == "pending" and reply["actions"] == ["cancel", "check_off"] and "18:00" in reply["when"]
     [request] = [card for card in await cards(client, oleg) if card["kind"] == "friend_task"]
-    assert request["actions"] == ["accept", "reject", "block"] and request["role"] == "performer"
+    assert request["actions"] == ["accept", "reject"] and request["role"] == "performer"
     note = (await queued(oleg["id"]))[-1]
     assert note.kind == "friend" and "<b>Купить хлеб</b>" in note.text
 
@@ -143,19 +153,17 @@ async def test_only_friends_get_tasks_and_others_stay_ordinary(client):
     assert reply["kind"] != "friend_task"
 
 
-async def test_rejecting_with_a_pause_refuses_new_tasks_for_10_minutes(client):
+async def test_there_is_no_pause_button_and_an_old_one_only_declines(client):
     masha, oleg = await person(client, "Маша"), await person(client, "Олег")
     await befriend(client, masha, oleg)
     reply = await say(client, masha, "попроси Олега позвонить бабушке завтра в 12")
+    # «Не присылать 10 минут» is gone; the button of an older Telegram message declines without a pause
     blocked = await client.post(f"/api/friend-tasks/{reply['task_id']}/block", headers=oleg["headers"])
     assert blocked.status_code == 200 and blocked.json()["status"] == "rejected"
-    assert (await cards(client, masha))[-1]["event"] == "blocked"
-    refused = await say(client, masha, "Добавь Олегу вынести мусор завтра")
-    assert refused["kind"] == "answer" and "мин" in refused["text"]
-    listed = (await client.get("/api/friends", headers=oleg["headers"])).json()["friends"]
-    assert listed[0]["blocked_until"]
-    await client.patch(f"/api/friends/{masha['id']}", json={"unblock": True}, headers=oleg["headers"])
+    assert (await cards(client, masha))[-1]["event"] == "rejected"
     assert (await say(client, masha, "Добавь Олегу вынести мусор завтра"))["kind"] == "friend_task"
+    listed = (await client.get("/api/friends", headers=oleg["headers"])).json()["friends"]
+    assert listed[0]["blocked_until"] is None
 
 
 async def test_auto_accept_and_shared_tasks_go_to_both_calendars(client):

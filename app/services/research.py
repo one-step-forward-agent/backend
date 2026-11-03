@@ -151,6 +151,67 @@ def wish_answer() -> str:
     return tr(WISH_ANSWER, WISH_ANSWER_EN)
 
 
+# ---------- a wish is sent only when the user chooses to ----------
+# The assistant offers to pass on what it cannot do; the wish reaches feature_wishes only after «Отправить пожелание».
+
+WISH_SEND = ("Отправить пожелание", "Send the wish")
+WISH_SKIP = ("Не надо", "No, thanks")
+WISH_SENT = ("Спасибо, передала ваше пожелание команде Deyla.", "Thank you, I've passed your wish on to the Deyla team.")
+WISH_SKIPPED = ("Хорошо, не отправляю.", "Okay, I won't send it.")
+# The offer can be answered within this many latest messages of the chat
+WISH_OFFER_MESSAGES = 4
+
+
+def wish_offer_text(wish: str) -> str:
+    return tr(
+        f"Этого я пока не умею. Отправить команде Deyla пожелание «{wish}»? Так мы поймём, что добавить.",
+        f"I can't do that yet. Send the Deyla team the wish “{wish}”? It helps us decide what to add.",
+    )
+
+
+def wish_offer(wish: str, message: str, channel: str) -> dict:
+    """What a reply carries so that «Отправить пожелание» under it logs the wish."""
+    wish = (wish or "").strip()[:MAX_WISH] or (message or "").strip()[:MAX_WISH]
+    return {"text": wish, "message": (message or "").strip()[:MAX_ANSWER], "channel": channel}
+
+
+def wish_buttons() -> list[str]:
+    return [tr(*WISH_SEND), tr(*WISH_SKIP)]
+
+
+def _choice(text: str) -> bool | None:
+    """True for «Отправить пожелание», False for «Не надо», None for any other message."""
+    said = " ".join((text or "").lower().split()).rstrip(".!")
+    if said in {option.lower() for option in WISH_SEND}:
+        return True
+    if said in {option.lower() for option in WISH_SKIP}:
+        return False
+    return None
+
+
+async def resolve_wish(session: AsyncSession, user: User, text: str) -> dict | None:
+    """The answer to a wish offer among the latest messages, or None when the message is not one. The caller commits."""
+    choice = _choice(text)
+    if choice is None:
+        return None
+    rows = await session.scalars(
+        select(ConversationMessage)
+        .where(ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant", ConversationMessage.hidden_at.is_(None))
+        .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+        .limit(WISH_OFFER_MESSAGES)
+    )
+    for message in rows:
+        offer = (message.reply or {}).get("wish")
+        if not isinstance(offer, dict) or offer.get("done"):
+            continue
+        if choice:
+            await log_wish(session, user, offer.get("text", ""), offer.get("message", ""), offer.get("channel") or current_channel.get())
+        # Answered once: the buttons go away and the wish cannot be sent twice
+        message.reply = {**message.reply, "wish": {**offer, "done": "sent" if choice else "skipped"}, "replies": []}
+        return {"kind": "answer", "text": tr(*(WISH_SENT if choice else WISH_SKIPPED))}
+    return None
+
+
 # ---------- the admin dashboard ----------
 
 

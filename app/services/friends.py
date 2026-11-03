@@ -1,8 +1,10 @@
 """Friends and the tasks they give each other in the assistant chat.
 
 "Добавь Маше купить хлеб завтра в 18" (or "add Masha to buy bread"): the friend gets the task in their chat and in
-Telegram, and accepts it, rejects it, or rejects it and pauses the sender's tasks for 10 minutes. A friend can take
-the sender's tasks without being asked (auto_accept, set on their side). "Нам с Машей в кино в субботу в 19" is
+Telegram, and accepts or rejects it. A friend can take the sender's tasks without being asked (auto_accept, set on
+their side). Nothing is sent before the sender presses «Отправить» under the draft (app.services.send_drafts).
+"Напомни Маше завтра в 9 позвонить врачу" is a reminder: the friend hears of it at once, has it in the calendar and
+gets the reminder at that time. "Нам с Машей в кино в субботу в 19" is
 shared: accepted, it goes to both calendars; a task for the friend alone goes to the friend's calendar only.
 
 Execution control: when an accepted task with a time starts, the friend is asked whether they have begun; the sender
@@ -42,8 +44,8 @@ from app.services.ru import relative_day, time_range
 
 # The friend has this long to say they have begun before the sender is told they have not
 FRIEND_START_WAIT = timedelta(minutes=10)
-# "Не присылать 10 минут"
-BLOCK_FOR = timedelta(minutes=10)
+# A reminder for a friend is in their calendar as a short task at the reminder's time
+REMINDER_LENGTH = timedelta(minutes=15)
 # A start missed by more than this (the bot was down) is not asked about any more
 ASK_LATE = timedelta(hours=1)
 MAX_FRIENDS = 100
@@ -309,6 +311,7 @@ HEADLINES = {
         "⛔ **{friend}** declined the task and paused new ones for 10 minutes",
     ),
     ("sender", "started"): ("▶️ **{friend}** начинает задачу", "▶️ **{friend}** has started the task"),
+    ("sender", "reminder_sent"): ("🔔 Поставила напоминание. Получатель: **{friend}**", "🔔 Reminder set for **{friend}**"),
     ("sender", "missed"): (
         "⏰ **{friend}** не подтверждает начало: прошло 10 минут",
         "⏰ **{friend}** hasn't confirmed starting: 10 minutes have passed",
@@ -317,6 +320,11 @@ HEADLINES = {
     ("performer", "request"): ("📨 **{friend}** просит вас сделать задачу", "📨 **{friend}** asks you to do a task"),
     ("performer", "request_shared"): ("📨 **{friend}** предлагает сделать вместе", "📨 **{friend}** suggests doing it together"),
     ("performer", "auto"): ("📥 **{friend}** добавляет вам задачу — принята автоматически", "📥 **{friend}** added a task for you — accepted automatically"),
+    ("performer", "reminder"): (
+        "🔔 **{friend}** ставит вам напоминание — оно в вашем календаре, напомню в это время",
+        "🔔 **{friend}** set you a reminder — it's in your calendar, I'll remind you at that time",
+    ),
+    ("performer", "reminder_cancelled"): ("🔕 **{friend}** отменяет напоминание", "🔕 **{friend}** cancelled the reminder"),
     ("performer", "ask"): ("⏱ Пора начинать. **{friend}** ждёт подтверждения — уже начали?", "⏱ Time to start. **{friend}** is waiting for confirmation — have you started?"),
 }
 
@@ -329,8 +337,14 @@ STATUS_LINES = {
     ("performer", FriendTaskStatus.REJECTED): ("Вы отклонили", "You declined"),
     ("performer", FriendTaskStatus.CANCELLED): ("Отправитель отменил задачу", "The sender cancelled the task"),
 }
+REMINDER_STATUS = {
+    ("sender", FriendTaskStatus.ACCEPTED): ("Напоминание поставлено", "Reminder set"),
+    ("sender", FriendTaskStatus.CANCELLED): ("Напоминание отменено", "Reminder cancelled"),
+    ("performer", FriendTaskStatus.ACCEPTED): ("В вашем календаре", "In your calendar"),
+    ("performer", FriendTaskStatus.CANCELLED): ("Отменено", "Cancelled"),
+}
 # Cards that stay live: their status and buttons follow the task; the others only tell what happened
-LIVE_EVENTS = {"sent", "sent_shared", "auto", "request", "request_shared", "ask"}
+LIVE_EVENTS = {"sent", "sent_shared", "auto", "request", "request_shared", "ask", "reminder_sent", "reminder"}
 
 
 def can_toggle_check(task: FriendTask, now: datetime) -> bool:
@@ -345,10 +359,13 @@ def can_toggle_check(task: FriendTask, now: datetime) -> bool:
 def actions(task: FriendTask, role: str, event: str, now: datetime) -> list[str]:
     if event not in LIVE_EVENTS:
         return []
+    if task.is_reminder:
+        # The sender can take back a reminder that has not come yet; the friend has nothing to answer
+        return ["cancel"] if role == "sender" and task.status == FriendTaskStatus.ACCEPTED and task.start_at > now else []
     if role == "performer":
         if event == "ask":
             return ["start"] if task.check_state in (CheckState.ASKED, CheckState.MISSED) else []
-        return ["accept", "reject", "block"] if task.status == FriendTaskStatus.PENDING else []
+        return ["accept", "reject"] if task.status == FriendTaskStatus.PENDING else []
     found = ["cancel"] if task.status == FriendTaskStatus.PENDING else []
     if can_toggle_check(task, now):
         found.append("check_off" if task.check_enabled else "check_on")
@@ -366,10 +383,10 @@ def task_card(task: FriendTask, viewer: User, friend: str, event: str, tz: ZoneI
     if task.shared:
         lines.append(tr("👥 Совместная — будет в календарях у обоих", "👥 Shared — goes to both calendars"))
     if event in LIVE_EVENTS and event != "ask":
-        status = STATUS_LINES.get((role, task.status))
+        status = (REMINDER_STATUS if task.is_reminder else STATUS_LINES).get((role, task.status))
         if status:
             lines.append(f"_{tr(*status)}_")
-        if role == "sender" and not task.all_day and task.status in (FriendTaskStatus.PENDING, FriendTaskStatus.ACCEPTED):
+        if role == "sender" and not task.all_day and not task.is_reminder and task.status in (FriendTaskStatus.PENDING, FriendTaskStatus.ACCEPTED):
             lines.append(tr("👁 Контроль начала: ", "👁 Start check: ") + (tr("включён", "on") if task.check_enabled else tr("выключен", "off")))
     if role == "sender" and event in ("sent", "sent_shared", "auto") and task.all_day and task.check_enabled:
         lines.append(tr("Контроль начала работает для задач со временем.", "The start check works for tasks with a time."))
@@ -389,6 +406,7 @@ def task_card(task: FriendTask, viewer: User, friend: str, event: str, tz: ZoneI
         "status": task.status,
         "check": task.check_enabled,
         "check_state": task.check_state,
+        "reminder": task.is_reminder,
         "actions": actions(task, role, event, now),
         "text": "\n".join(lines),
     }
@@ -467,6 +485,7 @@ async def post(session: AsyncSession, recipient: User, build, key: str, kind: st
 RU_VERB = r"добавь|добавьте|поручи|поручите|попроси|попросите|назначь|назначьте|дай|дайте|поставь|поставьте|отправь|отправьте|передай|передайте|запланируй|запланируйте|запиши|запишите|создай|создайте|скинь"
 EN_VERB = r"add|ask|assign|give|send|tell|plan|schedule|put"
 LEAD = re.compile(rf"^\s*(?:(?:пожалуйста|please|deyla|дейла)[\s,]+)?(?:{RU_VERB}|{EN_VERB})\b[\s,:]*", re.I)
+REMIND_LEAD = re.compile(r"^\s*(?:(?:пожалуйста|please|deyla|дейла)[\s,]+)?(?:напомни|напомните|remind)\b[\s,:]*", re.I)
 # "задачу для Маши", "a task for Masha"
 TASK_WORDS = re.compile(r"^(?:(?:новую|новое|общую|совместную|a|an|new|shared|joint)\s+)?(?:задачу|задание|дело|встречу|task|to-?do|job)?\s*(?:для|for)?\s+", re.I)
 # What may stand between the name and the task: "Маше: купить", "Маше, чтобы купила", "Masha to buy"
@@ -537,9 +556,18 @@ def find_named(words: list[str], friends: list[tuple[Friendship, User]]) -> tupl
 def parse_request(text: str, friends: list[tuple[Friendship, User]]) -> dict | None:
     """{"friends": [...], "words": the task, "shared": bool, "check": True/False/None}, or None when the message does not
     give a friend a task."""
-    lead = LEAD.match(text)
+    reminder = REMIND_LEAD.match(text)
+    lead = reminder or LEAD.match(text)
     if not lead or not friends:
         return None
+    if reminder:
+        # "Напомни Маше завтра в 9 позвонить врачу", "напомни Маше, чтобы позвонила": a friend named right after the verb
+        rest = text[lead.end() :].strip()
+        named, used = find_named(rest.split(), friends)
+        if not named:
+            return None
+        after = rest.split(None, used)[used] if len(rest.split()) > used else ""
+        return {"friends": named, "words": CONNECTOR.sub("", after, count=1).strip(), "shared": False, "check": False, "reminder": True}
     rest = text[lead.end() :]
     check = None
     if CHECK_OFF.search(rest):
@@ -580,7 +608,7 @@ async def delegate_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
     """The chat's "добавь Маше …": a reply, or None when the message is not about a friend."""
     from app.services import chat
 
-    if len(text) > chat.LOCAL_TEXT_LIMIT or "\n" in text.strip() or not LEAD.match(text) or chat.is_question(text):
+    if len(text) > chat.LOCAL_TEXT_LIMIT or "\n" in text.strip() or not (LEAD.match(text) or REMIND_LEAD.match(text)) or chat.is_question(text):
         return None
     friends = await accepted(session, user)
     request = parse_request(text, friends)
@@ -604,7 +632,19 @@ async def delegate_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
     start, end, all_day = bounds(item, tz)
     if (end if all_day else start) <= now:
         return {"kind": "answer", "text": tr("Это время уже прошло — напишите другой день или время.", "This time has already passed — say another day or time.")}
-    return await delegate(session, user, friend, item["title"], start, end, all_day, request["shared"], request["check"])
+    from app.services import send_drafts
+
+    if request.get("reminder"):
+        if all_day:
+            return {
+                "kind": "answer",
+                "text": tr(
+                    f"Во сколько напомнить {name}? Например: «Напомни {name} завтра в 9:00 {item['title'].lower()}».",
+                    f"What time should I remind {name}? For example: “Remind {name} tomorrow at 9 am to {item['title'].lower()}”.",
+                ),
+            }
+        return await send_drafts.friend_reminder(session, user, friend, name, item["title"], start)
+    return await send_drafts.friend_task(session, user, friend, name, item["title"], start, end, all_day, request["shared"], request["check"])
 
 
 async def delegate(
@@ -657,6 +697,54 @@ async def delegate(
     return task_card(task, sender, name, event, sender_tz)
 
 
+async def remind(session: AsyncSession, sender: User, performer: User, title: str, start: datetime) -> dict:
+    """"Напомни Маше завтра в 9 позвонить врачу", sent: in the friend's calendar with a reminder at that time,
+    and the friend hears of it now. Returns the sender's card."""
+    mine, theirs = await pair(session, sender.id, performer.id)
+    if not mine or not theirs or mine.status != FriendStatus.ACCEPTED or theirs.status != FriendStatus.ACCEPTED:
+        raise FriendError(tr("Вы ещё не друзья", "You are not friends yet"))
+    if start <= datetime.now(timezone.utc):
+        raise FriendError(tr("Это время уже прошло — напишите другое", "This time has already passed — say another one"))
+    task = FriendTask(
+        sender_id=sender.id,
+        performer_id=performer.id,
+        title=title[:300],
+        start_at=start.astimezone(timezone.utc),
+        end_at=(start + REMINDER_LENGTH).astimezone(timezone.utc),
+        all_day=False,
+        shared=False,
+        status=FriendTaskStatus.PENDING,
+        check_enabled=False,
+        is_reminder=True,
+    )
+    session.add(task)
+    await session.flush()
+    await accept(session, task, sender, performer)
+    sender_tz, performer_tz = tasks.local_tz(sender), tasks.local_tz(performer)
+    await post(session, performer, lambda: task_card(task, performer, display_name(theirs, sender), "reminder", performer_tz, sender_tz), f"{task.id}:reminder")
+    await session.flush()
+    card = task_card(task, sender, display_name(mine, performer), "reminder_sent", sender_tz)
+    if not performer.telegram_chat_id:
+        card["text"] += "\n" + tr(
+            "Telegram у друга не подключён — напоминание будет в календаре и в чате на сайте.",
+            "Your friend hasn't connected Telegram — the reminder will be in their calendar and site chat.",
+        )
+    return card
+
+
+async def cancel_reminder(session: AsyncSession, task: FriendTask) -> None:
+    """The sender takes a reminder back: it leaves the friend's calendar, so it does not come."""
+    from app.models.models import Event
+
+    task.status = FriendTaskStatus.CANCELLED
+    task.responded_at = datetime.now(timezone.utc)
+    if task.performer_event_id:
+        event = await session.get(Event, task.performer_event_id)
+        if event:
+            await session.delete(event)
+        task.performer_event_id = None
+
+
 async def accept(session: AsyncSession, task: FriendTask, sender: User, performer: User) -> None:
     """Into the performer's calendar, and the sender's too when shared."""
     sender_tz = tasks.local_tz(sender)
@@ -670,7 +758,10 @@ async def accept(session: AsyncSession, task: FriendTask, sender: User, performe
         end = task.end_at.astimezone(sender_tz if task.all_day else tz)
         last = (end - timedelta(microseconds=1)).date() if task.all_day else end.date()
         with lang.using(owner.language):
-            note = tr("Вместе с: ", "Together with: ") if task.shared else tr("Задача от друга: ", "A task from a friend: ")
+            if task.is_reminder:
+                note = tr("Напоминание от друга: ", "A reminder from a friend: ")
+            else:
+                note = tr("Вместе с: ", "Together with: ") if task.shared else tr("Задача от друга: ", "A task from a friend: ")
             description = note + display_name(row, other)
         item = {
             "title": task.title,
@@ -679,6 +770,8 @@ async def accept(session: AsyncSession, task: FriendTask, sender: User, performe
             "end_time": None if task.all_day else f"{end:%H:%M}",
             "end_date": last.isoformat() if last > start.date() else None,
             "description": description,
+            # A reminder comes exactly at its time, whatever the friend's usual lead times
+            **({"reminder_minutes": 0} if task.is_reminder else {}),
         }
         created, _ = await tasks.create_tasks(session, owner, [item], source="local")
         if created:
@@ -721,10 +814,8 @@ async def act(session: AsyncSession, user: User, task_id: int, action: str) -> d
         else:
             task.status = FriendTaskStatus.REJECTED
             task.responded_at = now
+            # "block" is a button of older Telegram messages: now a plain «Отклонить»
             event = "rejected"
-            if action == "block" and performer_row:
-                performer_row.blocked_until = now + BLOCK_FOR
-                event = "blocked"
         await post(session, sender, lambda: task_card(task, sender, to_sender, event, sender_tz), f"{task.id}:{event}")
         await session.commit()
         return task_card(task, performer, to_performer, "request_shared" if task.shared else "request", performer_tz, sender_tz)
@@ -739,6 +830,13 @@ async def act(session: AsyncSession, user: User, task_id: int, action: str) -> d
         await session.commit()
         return task_card(task, performer, to_performer, "ask", performer_tz, sender_tz)
 
+    if action == "cancel" and task.is_reminder:
+        if task.status != FriendTaskStatus.ACCEPTED or task.start_at <= now:
+            raise FriendError(tr("Напоминание уже нельзя отменить", "The reminder can't be cancelled now"))
+        await cancel_reminder(session, task)
+        await post(session, performer, lambda: task_card(task, performer, to_performer, "reminder_cancelled", performer_tz, sender_tz), f"{task.id}:reminder_cancelled")
+        await session.commit()
+        return task_card(task, sender, to_sender, "reminder_sent", sender_tz)
     if action == "cancel":
         if task.status != FriendTaskStatus.PENDING:
             raise FriendError(already(task))

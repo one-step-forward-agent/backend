@@ -303,7 +303,8 @@ class Turn:
     question: dict | None = None
     # The user answered it, or asked for something Deyla cannot do: the app words the reply
     answered: bool = False
-    wished: bool = False
+    # A wish the user may choose to send (research.wish_offer); nothing is logged until they do
+    wished: dict | None = None
     # ask: the question and its answers as buttons
     asked: dict | None = None
     # find was about tasks named in the message: one found is shown with all its details
@@ -1329,9 +1330,8 @@ async def ask_user(turn: Turn, args: dict) -> dict:
 
 
 async def log_wish(turn: Turn, args: dict) -> dict:
-    await research.log_wish(turn.session, turn.user, str(args.get("text") or ""), own_words(turn.text), research.current_channel.get())
-    turn.wished = True
-    return {"ok": True}
+    turn.wished = research.wish_offer(str(args.get("text") or ""), own_words(turn.text), research.current_channel.get())
+    return {"ok": True, "status": "Пользователю предложено отправить пожелание кнопкой."}
 
 
 FILTER_KEYS = tuple(FILTER["properties"])
@@ -1549,7 +1549,9 @@ def system_prompt() -> str:
         "ближайшая по плану. Если догадаться нельзя совсем — ask: короткий вопрос и 2–4 options, готовые ответы, которые "
         "пользователь нажмёт кнопкой (например, подходящие задачи с днём и временем). Никогда не задавай вопрос простым "
         "текстом — пользователь не должен ничего печатать в ответ. Без act отвечай текстом, только когда сообщение не о планах: "
-        "коротко и дружелюбно, мягко верни разговор к планированию. Ответ — по-русски, на «вы», до 5–6 предложений или строки "
+        "приветствие или пара слов о дне — коротко и дружелюбно; просьба о другом (код, задача по математике, рецепт, текст, "
+        "перевод, справка) — одной фразой скажи, что с этим не помогаешь, и предложи выделить на это время в календаре. "
+        "Само решение, рецепт или код не пиши, даже частично. Ответ — по-русски, на «вы», до 5–6 предложений или строки "
         "«• …», без markdown-заголовков, таблиц и номеров задач.\n"
         "10. Теги ставь полем tags (в events у create или в change), а не символом # в названии. Бери тег из блока «Теги»; "
         "если пользователь называет новый тег — передай его, приложение создаст его само.\n"
@@ -1558,7 +1560,8 @@ def system_prompt() -> str:
         "бот пришлёт файл вместе с напоминанием. Никогда не говори, что у тебя нет доступа к файлам или к Telegram.\n"
         "12. Пользователь просит сделать то, чего Deyla не умеет (заказать такси или еду, оплатить, написать или позвонить "
         "кому-то, синхронизировать с сервисом, которого нет в «Интеграциях»), — wish: text — что он хочет, коротко. Ничего не "
-        "обещай и не объясняй — приложение ответит само. Вопрос не о планах («кто написал «Войну и мир»?») — это не wish.\n"
+        "обещай и не объясняй — приложение ответит само. Вопрос или просьба не о планах («кто написал «Войну и мир»?», «дай рецепт блинов», «реши задачу на Python») — "
+        "это не wish: откажись по правилу 9.\n"
         "13. Если в контексте есть блок «ВОПРОС» и сообщение отвечает на него — answer_question: answer — ответ словами "
         "пользователя, даже если ответ похож на пожелание (тогда не wish). Сообщение о другом — выполни его как обычно, "
         "вопрос не упоминай.\n"
@@ -1718,10 +1721,12 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
         await session.commit()
         return {"kind": "answer", "text": turn.asked["text"], "replies": turn.asked["replies"]}
     if turn.wished:
-        turn.notes.append(research.wish_answer())
+        turn.notes.append(research.wish_offer_text(turn.wished["text"]))
     if (turn.wished or turn.answered) and not turn.changed and not turn.analysed and turn.listed is None and turn.stats is None:
         await session.commit()
-        return {"kind": "answer", "text": research.wish_answer() if turn.wished else tr(research.THANKS, research.THANKS_EN)}
+        if turn.wished:
+            return {"kind": "answer", "text": research.wish_offer_text(turn.wished["text"]), "replies": research.wish_buttons(), "wish": turn.wished}
+        return {"kind": "answer", "text": tr(research.THANKS, research.THANKS_EN)}
     if not turn.changed and not turn.analysed:
         reply = await by_rules(turn)
         if reply is not None:
@@ -1734,6 +1739,9 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
         reply = {**reply, "replies": turn.asked["replies"]}
         key = "text" if reply.get("kind") in ("answer", "not_found", "completed", "reminder", "cancelled") else "answer"
         reply[key] = "\n\n".join(part for part in (reply.get(key), turn.asked["text"]) if part)
+    if turn.wished and reply["kind"] != "nothing" and not reply.get("replies"):
+        # Done something and offered a wish: its buttons go with the result
+        reply = {**reply, "replies": research.wish_buttons(), "wish": turn.wished}
     if reply["kind"] == "nothing":
         # The model wrote nothing (a message about something else, an answer its filter dropped): the chat still answers
         logger.info("Agent gave no answer; the chat model talks instead")

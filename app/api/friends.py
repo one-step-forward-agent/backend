@@ -83,3 +83,37 @@ async def remove_friend(friend_id: int, user: User = Depends(get_current_user), 
 @router.post("/friend-tasks/{task_id}/{action}")
 async def friend_task_action(task_id: int, action: TaskAction, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await answer(friends.act(session, user, task_id, action))
+
+
+# ---------- drafts of what the chat sends to friends and team members (app.services.send_drafts) ----------
+
+
+class SendDraftEdit(BaseModel):
+    title: str | None = Field(default=None, max_length=300)
+    date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+
+
+async def draft_answer(call):
+    from app.services import send_drafts, teams
+
+    try:
+        return await call
+    except LookupError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from None
+    except (send_drafts.DraftError, friends.FriendError, teams.TeamError) as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from None
+
+
+@router.patch("/send-drafts/{draft_id}")
+async def edit_send_draft(draft_id: int, payload: SendDraftEdit, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    from app.services import send_drafts
+
+    return await draft_answer(send_drafts.edit(session, user, draft_id, payload.model_dump(exclude_unset=True)))
+
+
+@router.post("/send-drafts/{draft_id}/{action}")
+async def send_draft_action(draft_id: int, action: Literal["send", "cancel"], user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    from app.services import send_drafts
+
+    return await draft_answer((send_drafts.send if action == "send" else send_drafts.cancel)(session, user, draft_id))

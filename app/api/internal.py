@@ -363,3 +363,13 @@ async def team_task_action(
         raise HTTPException(status_code=404, detail=str(error)) from None
     except teams.TeamError as error:
         raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@router.post("/chat/{chat_id}/send-drafts/{draft_id}/{action}")
+async def send_draft_action(chat_id: int, draft_id: int, action: Literal["send", "cancel"], session: AsyncSession = Depends(get_session)):
+    """«Отправить» / «Отмена» under a draft of a task or reminder for a friend or team member: the card as it is now."""
+    from app.api.friends import draft_answer
+    from app.services import send_drafts
+
+    user = await _user_by_chat(session, chat_id)
+    return await draft_answer((send_drafts.send if action == "send" else send_drafts.cancel)(session, user, draft_id))

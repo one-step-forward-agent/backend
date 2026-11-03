@@ -148,15 +148,39 @@ async def test_the_assistant_takes_a_chat_message_as_the_answer(client, user, qu
     assert "Вопроса пользователю сейчас нет" in refused[1][-1]["content"]
 
 
-async def test_a_wish_gets_the_fixed_answer_and_is_logged(client, user, agent):
+async def test_a_wish_is_offered_and_logged_only_when_the_user_sends_it(client, user, agent):
     headers, _ = user
     me = await user_id(client, headers)
     agent([act(op("wish", text="Заказать такси"))])
     reply = await say(client, headers, "Закажи мне такси на 9 утра")
-    assert reply == {**reply, "kind": "answer", "text": research.WISH_ANSWER}
+    assert reply["kind"] == "answer" and "«Заказать такси»" in reply["text"]
+    assert reply["replies"] == ["Отправить пожелание", "Не надо"]
+    async with session_factory() as session:
+        assert await session.scalar(select(FeatureWish).where(FeatureWish.user_id == me)) is None
+
+    sent = await say(client, headers, "Отправить пожелание")
+    assert sent["text"] == research.WISH_SENT[0]
     async with session_factory() as session:
         wish = await session.scalar(select(FeatureWish).where(FeatureWish.user_id == me))
     assert (wish.wish, wish.message, wish.channel) == ("Заказать такси", "Закажи мне такси на 9 утра", "web")
+    # Answered once: pressing it again does not log the wish twice, and the buttons are gone from the history
+    agent(["Хорошо"])
+    await say(client, headers, "Отправить пожелание")
+    async with session_factory() as session:
+        assert len((await session.scalars(select(FeatureWish).where(FeatureWish.user_id == me))).all()) == 1
+    history = (await client.get("/api/assistant/history", headers=headers)).json()
+    offers = [item for item in history if (item.get("reply") or {}).get("wish")]
+    assert offers and all(item["reply"]["replies"] == [] and item["reply"]["wish"]["done"] == "sent" for item in offers)
+
+
+async def test_a_declined_wish_is_not_logged(client, user, agent):
+    headers, _ = user
+    me = await user_id(client, headers)
+    agent([act(op("wish", text="Оплатить счёт"))])
+    await say(client, headers, "оплати мне счёт за свет")
+    assert (await say(client, headers, "Не надо"))["text"] == research.WISH_SKIPPED[0]
+    async with session_factory() as session:
+        assert await session.scalar(select(FeatureWish).where(FeatureWish.user_id == me)) is None
 
 
 async def test_admins_manage_questions_and_read_the_answers(client, user, questions):

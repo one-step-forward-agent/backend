@@ -29,6 +29,15 @@ NO_ACTION_CLAIMS = (
     "Твой текстовый ответ ничего не меняет в календаре. Никогда не пиши, что ты удалила, перенесла, изменила, "
     "отметила, отменила или добавила задачи: это делает приложение отдельно и само сообщит результат. "
 )
+# What the assistant talks about: plans. Everything else (code, homework, recipes, essays, trivia) is declined
+SCOPE = (
+    "ТЕМЫ. Ты помогаешь только с планированием: календарь, задачи, встречи, напоминания, время, загрузка, привычки, "
+    "как организовать дела и успеть их. Не выполняй просьбы не о планах, даже простые: не пиши, не объясняй и не исправляй код, "
+    "не решай задачи по математике, домашние и контрольные, не давай рецептов, не пиши тексты, письма, посты, стихи и сочинения, "
+    "не переводи, не отвечай на справочные и энциклопедические вопросы, не давай медицинских, юридических и финансовых советов. "
+    "На такую просьбу ответь одной фразой, что с этим не помогаешь, и предложи помочь с планами — например, выделить на это время "
+    "в календаре. Само решение, рецепт или код не пиши, даже частично. Приветствие и пара слов о дне пользователя — можно. "
+)
 # Advice is worth reading only when it is about this user: their tasks, their numbers, their habits
 PERSONAL_ADVICE = (
     "Советы должны быть персональными. Каждый совет обязательно опирается на конкретику из фактов: называет задачу "
@@ -42,7 +51,7 @@ PERSONAL_ADVICE = (
     "поставить на любой день», «задачи, которые нельзя переносить». "
 )
 # Requests whose text the user reads; the rest only extract fields the app parses in Russian
-USER_FACING = {"agent", "explain_recommendation", "suggest_replies", "chat_reply", "process_message", "analysis", "breakdown", "recommendations", "plan_recommendations"}
+USER_FACING = {"agent", "desktop", "explain_recommendation", "suggest_replies", "chat_reply", "process_message", "analysis", "breakdown", "recommendations", "plan_recommendations"}
 ENGLISH = (
     "LANGUAGE: the user's site is in English. Everything the user reads — answers, questions, advice, "
     "recommendation titles and texts, step titles — must be in natural English; this overrides any instruction "
@@ -474,6 +483,7 @@ class GigaChatClient:
         system = (
             PERSONA
             + NO_ACTION_CLAIMS
+            + SCOPE
             + "Ты дружелюбная и собранная. "
             "Ты общаешься с пользователем в Telegram и умеешь добавлять события в его календарь, "
             "показывать расписание и присылать напоминания. "
@@ -648,16 +658,16 @@ class GigaChatClient:
         text = (result["choices"][0]["message"].get("content") or "").strip()
         return "" if text.upper().startswith("НЕТ") and len(text) < 10 else text[:4000]
 
-    async def agent_step(self, messages: list[dict], functions: list[dict]) -> dict:
+    async def agent_step(self, messages: list[dict], functions: list[dict], purpose: str = "agent") -> dict:
         """One step of the assistant agent: the model either calls one of `functions` or answers.
         Returns the assistant message as GigaChat sent it ({"content", "function_call"?, "functions_state_id"?})."""
         payload = {"model": settings.llm_agent_model, "temperature": 0.2, "max_tokens": 1500}
         if settings.uses_openai:
             payload |= {"messages": openai_messages(messages), "tools": openai_tools(functions), "tool_choice": "auto"}
-            result = await self._complete(payload, "agent", timeout=60)
+            result = await self._complete(payload, purpose, timeout=60)
             return gigachat_message(result["choices"][0]["message"])
         payload |= {"messages": one_system_message(messages), "functions": functions, "function_call": "auto"}
-        result = await self._complete(payload, "agent", timeout=60)
+        result = await self._complete(payload, purpose, timeout=60)
         message = result["choices"][0]["message"]
         call = message.get("function_call")
         if call and isinstance(call.get("arguments"), str):
@@ -667,6 +677,16 @@ class GigaChatClient:
             except json.JSONDecodeError:
                 call["arguments"] = {}
         return message
+
+    async def desktop_reply(self, messages: list[dict]) -> dict:
+        """The desktop agent's last word once its actions for the task are used up: an answer, no functions."""
+        payload = {"model": settings.llm_agent_model, "temperature": 0.2, "max_tokens": 600}
+        if settings.uses_openai:
+            payload["messages"] = openai_messages(messages)
+        else:
+            payload["messages"] = one_system_message(messages)
+        result = await self._complete(payload, "desktop", timeout=60)
+        return {"role": "assistant", "content": result["choices"][0]["message"].get("content") or ""}
 
     async def extract_events(self, text: str, timezone: str = "Europe/Moscow") -> list[dict]:
         return (await self.process_message(text, timezone))["events"]

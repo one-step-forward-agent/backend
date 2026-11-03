@@ -11,7 +11,7 @@ from app.core.database import session_factory
 from app.models.models import Event, TeamInvite, TeamTask
 from app.services import teams
 from tests.conftest import BOT_HEADERS
-from tests.test_friends import clean_outbox, person, queued  # noqa: F401 - clean_outbox is a fixture
+from tests.test_friends import clean_outbox, person, queued, send_draft  # noqa: F401 - clean_outbox is a fixture
 
 
 async def team_of(client, admin: dict, *others: tuple[dict, str], name: str | None = None, **settings) -> dict:
@@ -32,10 +32,11 @@ def member_id(team: dict, name: str) -> int:
     return next(member["id"] for member in team["members"] if member["name"] == name)
 
 
-async def team_chat(client, who: dict, team: dict, text: str) -> dict:
+async def team_chat(client, who: dict, team: dict, text: str, send: bool = True) -> dict:
+    """A message to the team's assistant; an assignment's draft is sent at once unless send=False."""
     response = await client.post(f"/api/teams/{team['id']}/chat", json={"text": text}, headers=who["headers"])
     assert response.status_code == 200, response.text
-    return response.json()
+    return await send_draft(client, who, response.json()) if send else response.json()
 
 
 async def personal_cards(client, who: dict) -> list[dict]:
@@ -157,6 +158,7 @@ async def test_the_personal_chat_reaches_a_team_by_its_tag(client):
     boss, ivan = await person(client, "Анна"), await person(client, "Иван")
     team = await team_of(client, boss, (ivan, "Иван"))
     reply = (await client.post("/api/assistant/chat", json={"text": f"В команде @{team['tag']} поручи Ивану подготовить презентацию"}, headers=boss["headers"])).json()
+    reply = await send_draft(client, boss, reply)
     assert reply["kind"] == "team_task" and reply["team"] == team["tag"] and reply["title"] == "Подготовить презентацию"
     # A tag of a team the user is not in is an ordinary message
     stranger = await person(client, "Пётр")
