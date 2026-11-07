@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.dataenc import email_lookup
 from app.models.models import Event, Notification, NotificationStatus, ReminderSettings, User
-from app.services import insights, tasks
+from app.services import insights, rewards, tasks
 from app.services.events import default_calendar
 from app.services.integrations.service import user_timezone
 from app.core import lang
@@ -196,6 +196,7 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
     )
     values = []
     for user, reminder_settings in rows.all():
+        await rewards.observe_level(session, user)
         # Each user's notifications are written in the language chosen on the site
         with lang.using(user.language):
             await queue_for_user(session, user, reminder_settings, now, values)
@@ -354,6 +355,9 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
     for notification, user, reminder_settings in rows.all():
         if len(claimed) >= limit:
             break
+        if notification.kind == "level_up" and not user.rewards_enabled:
+            notification.status = NotificationStatus.EXPIRED
+            continue
         if not user.telegram_chat_id:
             notification.status = NotificationStatus.FAILED
             notification.error = "Telegram is not linked"

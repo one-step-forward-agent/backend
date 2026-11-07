@@ -125,6 +125,17 @@ class UserRead(BaseModel):
     rewards_enabled: bool = True
 
 
+class AssistantMemoryUpdate(BaseModel):
+    notes: list[str] = Field(max_length=50)
+
+    @field_validator("notes")
+    @classmethod
+    def check_notes(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() or len(value.strip()) > 500 for value in values):
+            raise ValueError("Each memory must contain 1–500 characters")
+        return list(dict.fromkeys(value.strip() for value in values))
+
+
 class UserUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=200)
     timezone: str | None = None

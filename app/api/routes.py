@@ -23,6 +23,7 @@ from app.core.database import get_session
 from app.core.lang import tr
 from app.models.models import Calendar, Event, EventFile, Integration, Tag, User
 from app.schemas import (
+    AssistantMemoryUpdate,
     AssistantConfirmation,
     AssistantMessage,
     AssistantResponse,
@@ -133,6 +134,17 @@ async def current_user(user: User = Depends(get_current_user)):
     return user
 
 
+@router.put("/me/assistant-memory", response_model=UserRead)
+async def save_assistant_memory(payload: AssistantMemoryUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    from app.services import personalization
+
+    await session.refresh(user, ["profile"], with_for_update=True)
+    personalization.save(user, payload.notes)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 @router.patch("/me", response_model=UserRead)
 async def update_current_user(payload: UserUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     for key, value in payload.model_dump(exclude_unset=True).items():
@@ -174,7 +186,8 @@ async def delete_current_user(user: User = Depends(get_current_user), session: A
 
 @router.put("/me/onboarding", response_model=UserRead)
 async def save_onboarding(payload: OnboardingProfile, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    user.profile = payload.model_dump()
+    await session.refresh(user, ["profile"], with_for_update=True)
+    user.profile = {**(user.profile or {}), **payload.model_dump()}
     if payload.timezone and not user.timezone:
         user.timezone = payload.timezone
     # Each sphere gets its tag: tasks tagged with it count towards the sphere's badges
@@ -341,6 +354,13 @@ async def stats_activity(tag_id: int | None = None, user: User = Depends(get_cur
 @router.get("/rewards")
 async def rewards_progress(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await rewards.progress(session, user)
+
+
+@router.post("/rewards/celebration")
+async def reward_celebration(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    level = await rewards.observe_level(session, user, web=True)
+    await session.commit()
+    return {"level": level}
 
 
 @router.get("/recommendations")

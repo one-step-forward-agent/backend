@@ -36,6 +36,47 @@ def test_levels():
     assert rewards.level_of(0) == 1 and rewards.level_of(99) == 1 and rewards.level_of(100) == 2 and rewards.level_of(650) == 4
 
 
+async def test_level_celebration_and_telegram_are_once_per_level(client, user):
+    from app.models.models import Notification
+    from app.services import reminders
+
+    headers, chat_id = user
+    assert (await client.post("/api/rewards/celebration", headers=headers)).json()["level"] is None
+    async with session_factory() as session:
+        row = await user_row(session, chat_id)
+        calendar = await tasks.default_calendar(session, row, "Europe/Moscow")
+        now = datetime.now(TZ)
+        for i in range(10):
+            session.add(task(row, calendar.id, now.date(), f"Task {i}", True))
+        await session.commit()
+    assert (await client.post("/api/rewards/celebration", headers=headers)).json()["level"] == 2
+    assert (await client.post("/api/rewards/celebration", headers=headers)).json()["level"] is None
+    async with session_factory() as session:
+        await reminders.generate_due(session, now)
+        await reminders.generate_due(session, now)
+        await session.commit()
+        row = await user_row(session, chat_id)
+        queued = list(await session.scalars(select(Notification).where(Notification.user_id == row.id, Notification.kind == "level_up")))
+        assert len(queued) == 1 and "2" in queued[0].text
+        # Falling below a level, then earning it again, must not repeat the celebration.
+        events = list(await session.scalars(select(Event).where(Event.user_id == row.id)))
+        for event in events:
+            event.completed_at = None
+        await session.commit()
+    assert (await client.post("/api/rewards/celebration", headers=headers)).json()["level"] is None
+    async with session_factory() as session:
+        for event in await session.scalars(select(Event).where(Event.user_id == row.id)):
+            event.completed_at = now
+        await session.commit()
+    assert (await client.post("/api/rewards/celebration", headers=headers)).json()["level"] is None
+    await client.patch("/api/me", headers=headers, json={"rewards_enabled": False})
+    async with session_factory() as session:
+        await reminders.claim(session)
+        await session.commit()
+        notification = await session.get(Notification, queued[0].id)
+        assert notification.status == "expired"
+
+
 async def test_points_for_tasks_and_streak(client, user):
     headers, chat_id = user
     async with session_factory() as session:

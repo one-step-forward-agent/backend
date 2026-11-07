@@ -228,6 +228,7 @@ COMMANDS = {
     "reminders": ("/reminders", "напоминания", "настройки напоминаний", "уведомления", "reminders"),
 }
 HELP_SECTIONS = [
+    {"title": "Рассказать о себе", "examples": ["По вечерам я занят, а в обед хочу отдыхать", "Лучше всего сосредотачиваюсь утром", "Что ты помнишь обо мне?", "Забудь всё обо мне"]},
     {"title": "Планировать", "examples": ["Созвон с командой завтра в 11:00 на час", "Каждую пятницу в 18:00 спортзал", "Отчёт, дедлайн в пятницу 18:00", "Конференция с 10 по 12 октября"]},
     {"title": "Менять и удалять", "examples": ["Перенеси созвон на пятницу в 15:00", "Продли встречу до 18:00", "Удали встречу с Олей", "Отметь отчёт выполненным"]},
     {"title": "Спрашивать и анализировать", "examples": ["Что у меня завтра?", "Проанализируй мою неделю", "Что можно перенести?", "Советы"]},
@@ -236,6 +237,7 @@ HELP_SECTIONS = [
     {"title": "Быстрые команды", "examples": ["Сегодня", "Завтра", "Неделя", "Выполнено", "Статистика", "Напоминания"]},
 ]
 HELP_SECTIONS_EN = [
+    {"title": "Tell me about yourself", "examples": ["I'm busy in the evenings and I rest at lunch", "I focus best in the morning", "What do you remember about me?", "Forget everything about me"]},
     {"title": "Plan", "examples": ["Team call tomorrow at 11:00 for an hour", "Gym every Friday at 18:00", "Report, deadline Friday 18:00", "Conference from 10 to 12 October"]},
     {"title": "Change and delete", "examples": ["Move the call to Friday at 15:00", "Extend the meeting until 18:00", "Delete the meeting with Olya", "Mark the report done"]},
     {"title": "Ask and analyse", "examples": ["What do I have tomorrow?", "Analyse my week", "What can I move?", "Advice"]},
@@ -403,7 +405,9 @@ async def calendar_context(session: AsyncSession, user: User, tz: ZoneInfo) -> s
     now = datetime.now(tz)
     today = now.date()
     events = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=7), time.min, tz), datetime.combine(today + timedelta(days=8), time.min, tz))
-    lines = []
+    from app.services import personalization
+
+    lines = [personalization.context(user)] if personalization.notes(user) else []
     for event in events:
         start = event.start_at.astimezone(tz)
         overdue = tasks.is_overdue(event, today, tz)

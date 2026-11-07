@@ -125,7 +125,56 @@ class Audit:
 
 async def scenario(a, name):
     await a.setup(english=name == "english_recipient", ambiguous=name == "ambiguous_name", team=name.startswith("team_"))
-    if name == "relative_before_lesson":
+    if name.startswith("memory_"):
+        headers = a.sender["headers"]
+        if name == "memory_english":
+            headers["Accept-Language"] = "en"
+            await a.http.get("/api/me", headers=headers)
+
+        async def memory():
+            me = await a.http.get("/api/me", headers=headers)
+            require(me.status_code == 200, "Cannot read synthetic user's memory")
+            return me.json().get("profile", {}).get("assistant_memory", [])
+
+        if name == "memory_english":
+            response = await a.say("I'm busy every evening from 18:00 to 23:00, and I always rest at lunch from 12:00 to 14:00. Please take this into account when planning.")
+        else:
+            response = await a.say("По вечерам с 18:00 до 23:00 я всегда занят, а в обед с 12:00 до 14:00 хочу отдыхать и ничего не планировать. Учитывай это при планировании.")
+        notes = await memory()
+        require(bool(notes), "Self-disclosure was not persisted as assistant memory")
+        require(not (await a.state())["events"], "Self-disclosure created calendar events")
+        if name == "memory_correction":
+            await a.say("Мои обстоятельства изменились: теперь вечера свободны, по вечерам можно планировать дела. Замени старое ограничение про занятые вечера, но сохрани отдых в обед.")
+            updated = await memory()
+            require(bool(updated) and updated != notes, "Correction did not update memory")
+            require(not any("всегда занят" in note.lower() for note in updated), "Old evening restriction remains active after correction")
+            require(any("обед" in note.lower() or "12:00" in note for note in updated), "Correction lost the separate lunch preference")
+        elif name == "memory_forget":
+            await a.say("Забудь всё обо мне, полностью очисти свою память о моих предпочтениях.")
+            require(not await memory(), "Forget request did not clear assistant memory")
+        else:
+            cleared = await a.http.delete("/api/assistant/history", headers=headers)
+            require(cleared.status_code == 200, "Cannot clear synthetic chat history")
+            require(await memory() == notes, "Clearing chat erased persistent preferences")
+            prompt = (
+                "Please plan two tasks for tomorrow: report writing and exam preparation, one hour each. Choose suitable start times based on what you know about me."
+                if name == "memory_english" else
+                "Спланируй на завтра две задачи: написать отчёт и подготовиться к экзамену, по одному часу на каждую. Сам подбери подходящее время с учётом того, что ты обо мне знаешь."
+            )
+            await a.say(prompt)
+            require(a.reply.get("kind") == "proposal", f"Expected confirmable personalized plan, got {a.reply.get('kind')}")
+            items = a.reply.get("events") or []
+            require(len(items) == 2, "The personalized plan must contain both tasks")
+            for item in items:
+                clock = item.get("time")
+                require(bool(clock), "Assistant did not choose the requested suitable start time")
+                hour, minute = map(int, clock.split(":"))
+                start = hour * 60 + minute
+                require(start + 60 <= 12 * 60 or 14 * 60 <= start and start + 60 <= 18 * 60, "Proposed task overlaps lunch or evening restriction")
+            require(not (await a.state())["events"], "Personalized plan bypassed draft confirmation")
+            confirmed = await a.http.post(f"/api/assistant/drafts/{a.reply['draft_id']}/confirm", headers=headers)
+            require(confirmed.status_code == 200 and len(confirmed.json().get("event_ids", [])) == 2, "Personalized plan did not persist after confirmation")
+    elif name == "relative_before_lesson":
         today = datetime.now(TZ).date()
         for title, start, end in (("Урок с Лизой", "15:00", "16:00"), ("ОС2", "16:15", "18:15")):
             response = await a.http.post("/api/events", json={"title": title, "start_at": f"{today}T{start}:00+03:00", "end_at": f"{today}T{end}:00+03:00", "timezone": "Europe/Moscow", "all_day": False}, headers=a.sender["headers"])

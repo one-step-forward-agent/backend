@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import lang, ratelimit
 from app.core.config import settings
 from app.models.models import Event, RecommendationCache, Tag, User, plain_priority
-from app.services import dates, rewards, tasks, usage
+from app.services import dates, personalization, rewards, tasks, usage
 from app.services.ru import MONTHS, MONTHS_NOMINATIVE, WEEKDAYS_SHORT, plural
 
 logger = logging.getLogger(__name__)
@@ -385,6 +385,7 @@ async def facts(session: AsyncSession, user: User, now: datetime, ahead: bool = 
         "week_total": stats["total"],
         "streak": stats["streak"],
         "habits": await habits(session, user, datetime.now(tz)),
+        "profile": personalization.context(user),
         "tone": profile.get("toneOfVoice"),
     }
 
@@ -459,7 +460,7 @@ def cache_key(user: User, now: datetime, events: list[Event], data: dict) -> str
         "today": sorted((event.id, event.completed_at is not None, event.start_at.isoformat()) for event in events),
         "overdue": data["overdue"],
         "week": data["week_percent"] // 10,
-        "profile": [data["habits"].get("goals"), data["tone"]],
+        "profile": [data["habits"].get("goals"), data["tone"], data.get("profile")],
         "habits": [data["habits"].get("slipping"), data["habits"].get("done_per_day")],
         "deadlines": data.get("deadlines"),
     }
@@ -578,6 +579,7 @@ async def period_facts(session: AsyncSession, user: User, now: datetime, first: 
         "past_done": sum(tasks.is_done(event, now) for event in past),
         "past_total": len(past),
         "habits": await habits(session, user, now),
+        "profile": personalization.context(user),
         "tone": profile.get("toneOfVoice"),
     }
 

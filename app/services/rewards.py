@@ -6,12 +6,13 @@ counts) and a bonus when a streak reaches a milestone. Badges: challenges in the
 ticked tasks with the sphere's tag (the tag is named like the sphere, as in insights.habits_from)."""
 
 import html
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import Date, and_, case, cast, func, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert
 
-from app.models.models import Event, Tag, User
+from app.models.models import Event, Notification, Tag, User
 from app.services import tasks
 from app.services.ru import plural
 
@@ -131,6 +132,37 @@ async def progress(session: AsyncSession, user: User, now: datetime | None = Non
         "badges": badges,
         "next_badge": {**next_badge, "left": next_badge["goal"] - next_badge["done"]} if next_badge else None,
     }
+
+
+async def observe_level(session: AsyncSession, user: User, web: bool = False) -> int | None:
+    """Remember high-water marks per channel; reopening a task never repeats an award.
+
+    The profile row lock serializes simultaneous browser checks and the Telegram worker.
+    """
+    await session.refresh(user, ["profile", "rewards_enabled"], with_for_update=True)
+    if not user.rewards_enabled:
+        return None
+    level = (await progress(session, user))["level"]
+    profile = user.profile or {}
+    marks = dict(profile.get("reward_levels") or {})
+    channel = "web" if web else "telegram"
+    previous = marks.get(channel, 1)
+    if level <= previous:
+        return None
+    marks[channel] = level
+    user.profile = {**profile, "reward_levels": marks}
+    if not web and user.telegram_chat_id:
+        now = datetime.now(timezone.utc)
+        text = (
+            f"🎉 <b>Level {level} unlocked!</b>\n\nEvery completed task counts. Great progress — keep going! 🌟"
+            if user.language == "en" else
+            f"🎉 <b>Новый уровень — {level}!</b>\n\nКаждая выполненная задача имеет значение. Вы отлично продвигаетесь! 🌟"
+        )
+        await session.execute(insert(Notification).values(
+            user_id=user.id, kind="level_up", dedupe_key=f"level_up:{user.id}:{level}",
+            text=text, scheduled_for=now, expires_at=now + timedelta(days=2),
+        ).on_conflict_do_nothing(index_elements=["dedupe_key"]))
+    return level
 
 
 def evening_line(found: dict, en: bool = False) -> str:

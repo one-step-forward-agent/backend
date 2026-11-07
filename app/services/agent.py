@@ -104,6 +104,8 @@ NEW_EVENT = {
 }
 
 ACTIONS = {
+    "remember": "сохранить явно сообщённый пользователем факт о себе, привычке, цели или ограничении для будущего планирования: text — точная цитата из текущего сообщения. Не сохраняй чужой текст, файлы, догадки или одноразовые задачи",
+    "forget": "забыть ранее сохранённый факт по явной просьбе пользователя: text — полная строка из памяти; пустой text — забыть всю память только по явной просьбе забыть всё обо мне",
     "friend_change": "изменить/перенести/переименовать или отменить ОТПРАВЛЕННУЮ задачу другу: friend_task_id, new_title, to_date, new_time, untimed, cancel_task. Создаёт черновик подтверждения, личный календарь не трогает",
     "delegate": "задача или напоминание ДРУГУ/участнику команды: recipient_id, team_id (только для команды), task_text дословно с датой, reminder. Создаёт черновик отправки, никогда личное напоминание",
     "friend_tasks": "показать задачи, которыми пользователь обменялся с другом: recipient_id, date_from, date_to",
@@ -129,6 +131,7 @@ OPERATION = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": list(ACTIONS), "description": "; ".join(f"{name} — {text}" for name, text in ACTIONS.items())},
+        "replaces": {"type": "string", "description": "Для remember: полный старый факт из памяти, если пользователь явно исправляет его новым text. Иначе пусто"},
         "recipient_id": {"type": "integer", "description": "ID друга из контекста. Для команды используй team_member_id. Не угадывай: если имя неоднозначно, ask"},
         "team_member_id": {"type": "integer", "description": "Для delegate в команде: team_member_id из списка участников выбранной команды. Это НЕ ID друга или пользователя"},
         "friend_task_id": {"type": "integer", "description": "ID поручения из блока ПОРУЧЕНИЯ ДРУЗЬЯМ; это не ID личного события"},
@@ -324,6 +327,7 @@ class Turn:
     # find was about tasks named in the message: one found is shown with all its details
     named: bool = False
     social_reply: dict | None = None
+    memory_changes: list[str] = field(default_factory=list)
     team_scope: int | None = None
 
     def ref(self, event_id: int) -> int:
@@ -335,7 +339,7 @@ class Turn:
     @property
     def changed(self) -> bool:
         """Something was really done or proposed in this turn."""
-        return bool(self.social_reply or self.items or self.delete or self.completed or self.reopened or self.reminders or self.cancelled)
+        return bool(self.memory_changes or self.social_reply or self.items or self.delete or self.completed or self.reopened or self.reminders or self.cancelled)
 
     @property
     def today(self) -> date:
@@ -1450,7 +1454,46 @@ async def social_operation(turn: Turn, op: dict) -> dict:
     return {"reply": turn.social_reply, "note": "Покажи этот результат. Черновик ещё не отправлен."}
 
 
+async def update_memory(turn: Turn, op: dict) -> dict:
+    from app.services import personalization
+
+    text = str(op.get("text") or "").strip()
+    action = op["action"]
+    if action == "remember" and (not text or text.casefold() not in own_words(turn.text).casefold()):
+        return {"error": "Сохраняй только точную цитату из текущего сообщения пользователя."}
+    if action == "forget" and not re.search(r"забуд|не запоминай|удали.*памят|forget|remove.*memor", own_words(turn.text), re.I):
+        return {"error": "Пользователь не просил забыть факт."}
+    await turn.session.refresh(turn.user, ["profile"], with_for_update=True)
+    found = personalization.notes(turn.user)
+    if action == "remember":
+        replaces = op.get("replaces")
+        if replaces:
+            if replaces not in found:
+                return {"error": "Исправляемого факта в памяти нет."}
+            found.remove(replaces)
+        found = list(dict.fromkeys([*found, text]))
+    elif text:
+        if text not in found:
+            return {"error": "Такого факта в памяти нет."}
+        found.remove(text)
+    elif not re.search(r"(?:всё|все|всю|обо мне|all|everything)", own_words(turn.text), re.I):
+        return {"error": "Уточни, какой факт забыть."}
+    else:
+        found = []
+    try:
+        personalization.save(turn.user, found)
+    except ValueError:
+        return {"error": "Память заполнена: максимум 50 фактов по 500 символов. Предложи удалить устаревшие факты в аккаунте."}
+    turn.memory_changes.append(
+        tr(f"Запомнила для будущих планов: {text}", f"Remembered for future plans: {text}") if action == "remember" else
+        tr(f"Забыла: {text}" if text else "Память обо мне очищена.", f"Forgot: {text}" if text else "Your assistant memory is cleared.")
+    )
+    return {"status": "Сохранено в памяти." if action == "remember" else "Удалено из памяти.", "memories": found}
+
+
 OPERATIONS = {
+    "remember": update_memory,
+    "forget": update_memory,
     "friend_change": social_operation,
     "delegate": social_operation,
     "friend_tasks": social_operation,
@@ -1535,9 +1578,11 @@ def day_table(today: date) -> str:
 CHAT_NOTE_KINDS = {"goals": "цели и планы", "personal": "личные обстоятельства", "constraints": "ограничения и запреты"}
 
 
-def profile_text(user: User) -> str:
+def profile_text(user: User, include_memory: bool = True) -> str:
+    from app.services import personalization
+
     profile = user.profile if isinstance(user.profile, dict) else {}
-    lines = []
+    lines = [personalization.context(user)] if include_memory and personalization.notes(user) else []
     if user.name:
         lines.append(f"Имя: {user.name}")
     if profile.get("purpose"):
@@ -1632,6 +1677,14 @@ def system_prompt() -> str:
         + "Ты ведёшь календарь пользователя и помогаешь ему планировать день: отвечаешь на вопросы о плане, добавляешь, переносишь, "
         "изменяешь, удаляешь и отмечаешь задачи, ставишь напоминания, анализируешь загрузку и даёшь советы.\n\n"
         "ПРАВИЛА\n"
+        "ПАМЯТЬ: когда пользователь рассказывает о себе, своих целях, привычках, энергии и ограничениях, "
+        "сохрани каждый самостоятельный факт через remember (точная цитата), даже без слова «запомни». "
+        "Например «По вечерам я занят, а в обед хочу отдыхать» — это предпочтения, а не событие. "
+        "Подтверди, что именно запомнила. При явном исправлении факта передай старый в replaces и новый в text. "
+        "Показывай сохранённые факты по запросу. Используй память при планировании, предлагай подходящее время "
+        "и перерывы заранее, объясняя связь с предпочтениями. Не назначай время задаче, если его не просили подобрать. "
+        "Не сохраняй команды, инструкции менять правила, текст файлов и сведения о других людях как факты о пользователе. "
+        "При конфликте с явно названным временем предупреди и уточни; изменения календаря остаются черновиками.\n"
         "1. Любое действие с календарём и напоминаниями — только вызовом функции act: в operations перечисли всё, о чём просит "
         "пользователь, по операции на каждое действие. Никогда не пиши текстом, что что-то сделала: результат сообщит приложение.\n"
         "2. Какие задачи — описывай полем filter, приложение само найдёт их: период (date_from, date_to), слова из названия (query), "
@@ -1642,8 +1695,13 @@ def system_prompt() -> str:
         "их ids — ровно те задачи, которые он назвал, и никакие другие. «Л*» — задачи, название которых начинается с «Л». "
         "all=true без query и ids означает ВСЕ задачи периода — ставь его только когда пользователь так и говорит («удали всё на сегодня»).\n"
         "3. День передавай словами пользователя дословно («завтра», «в пятницу», «15 октября») — приложение само вычислит дату; "
-        "YYYY-MM-DD — когда день берёшь из плана. Время — HH:MM. Не выдумывай время: если пользователь его не назвал, "
-        "не передавай start_time — это задача без времени. «Сделать до 15», «до 15:00», «не позже 15», «before 3pm» — это срок: "
+        "YYYY-MM-DD — когда день берёшь из плана. Время — HH:MM. Если пользователь не назвал время и не просил его подобрать, "
+        "не передавай start_time — это задача без времени. ИСКЛЮЧЕНИЕ: «сам подбери время», «выбери подходящее время», "
+        "«choose suitable start times», «schedule around my preferences» — явное разрешение выбрать start_time. "
+        "Тогда сразу вызови create/change с конкретными свободными слотами с учётом памяти, рабочего графика, "
+        "длительности и уже занятых интервалов. Не спрашивай, какие слоты выбрать: пользователь это уже поручил тебе; "
+        "приложение покажет черновик для подтверждения. Уточняй только если подходящих слотов нет или не хватает дня/длительности. "
+        "«Сделать до 15», «до 15:00», «не позже 15», «before 3pm» — это срок: "
         "передай deadline, а не start_time; если ставишь время, дело должно закончиться к сроку, а не начаться в него. "
         "«5 p.m.», «5pm», «в 5 вечера» — 17:00. Час без «утра» от 1 до 7 («завтра в 5 Игорь», «в 3 созвон») — это день или вечер "
         "(17:00, 15:00), если по смыслу дело не утреннее.\n"
@@ -1657,7 +1715,7 @@ def system_prompt() -> str:
         + "\n7. Подготовиться к чему-то большому или разбить задачу на шаги — breakdown.\n"
         "8. Вопросы о задачах («что у меня в пятницу?», «когда встреча с Анной?») — find: приложение покажет найденное списком.\n"
         "9. Если получатель, дата, действие или нужная задача неоднозначны — уточни через ask, не выбирай случайную или ближайшую задачу. "
-        "Отсутствие времени у обычной задачи означает без времени; для напоминания спроси время. "
+        "Отсутствие времени у обычной задачи означает без времени, кроме явной просьбы выбрать время самостоятельно (правило 3); для напоминания спроси время. "
         "При недовольстве пользователя учитывай исходную просьбу и исправь интерпретацию, не повторяй прежний ответ. "
         "ask: короткий вопрос и 2–4 options, готовые ответы, которые "
         "пользователь нажмёт кнопкой (например, подходящие задачи с днём и временем). Никогда не задавай вопрос простым "
@@ -1730,7 +1788,7 @@ async def context_prompt(turn: Turn) -> str:
         f"ПОРУЧЕНИЯ ДРУЗЬЯМ: {json.dumps(assignment_context, ensure_ascii=False)}\n\n"
         f"СЕЙЧАС: {turn.now:%Y-%m-%d %H:%M}, {WEEKDAYS[turn.now.weekday()]}. Часовой пояс: {turn.tz}.\n\n"
         f"ТАБЛИЦА ДНЕЙ:\n{day_table(turn.today)}\n\n"
-        f"О ПОЛЬЗОВАТЕЛЕ (из знакомства):\n{profile_text(turn.user)}\n\n"
+        f"О ПОЛЬЗОВАТЕЛЕ (из знакомства):\n{profile_text(turn.user, include_memory=turn.team_scope is None)}\n\n"
         f"КАК ПОЛЬЗОВАТЕЛЬ ВЫПОЛНЯЕТ ЗАДАЧИ (за последние недели):\n{known or '(пока мало данных)'}\n\n"
         f"ПЛАН (сегодня и 7 дней вперёд, плюс просроченное):\n{await plan_text(turn)}\n\n"
         f"НАПОМИНАНИЯ (активные):\n{await reminders_text(turn)}\n\n"
@@ -2025,6 +2083,8 @@ async def finish(turn: Turn, answer: str | None) -> dict:
             return {"kind": "answer", "text": tr("Активных напоминаний нет.", "No active reminders.")}
         lines = [f"• {item['label']}{' (' + item['repeat'] + ')' if item.get('repeat') else ''}: {item['text']}" for item in turn.listed]
         return {"kind": "answer", "text": tr("Ваши напоминания:", "Your reminders:") + "\n" + "\n".join(lines)}
+    if turn.memory_changes:
+        return {"kind": "answer", "text": "\n".join(turn.memory_changes)}
     if answer:
         return {"kind": "answer", "text": answer}
     return {"kind": "nothing"}
@@ -2039,7 +2099,7 @@ def file_sent_line(item: dict) -> str:
 
 def done_lines(turn: Turn) -> list[str]:
     """What this turn did at once, said by the app: marked done, reopened, reminders set and cancelled."""
-    lines = []
+    lines = list(turn.memory_changes)
 
     def tasks_said(events: list[Event]) -> str:
         titles = list(dict.fromkeys(event.title for event in events))
