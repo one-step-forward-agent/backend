@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import lang
 from app.core.config import settings
 from app.core.lang import tr
-from app.models.models import CheckState, Event, Project, Team, TeamInvite, TeamMember, TeamMessage, TeamTask, TeamTaskStatus, User
+from app.models.models import CheckState, Event, Project, Team, TeamInvite, TeamMember, TeamMessage, TeamTask, TeamTaskFile, TeamTaskStatus, User
 from app.services import dates, friends, tasks
 from app.services.ru import relative_day
 
@@ -191,6 +191,9 @@ async def update_team(session: AsyncSession, user: User, team_id: int, values: d
 async def delete_team(session: AsyncSession, user: User, team_id: int) -> None:
     team, me = await member_of(session, user, team_id)
     require_admin(me)
+    from app.services import team_files
+    task_ids = list(await session.scalars(select(TeamTask.id).where(TeamTask.team_id == team.id)))
+    await team_files.remove_task_contents(session, task_ids)
     await session.delete(team)
     await session.commit()
 
@@ -441,10 +444,11 @@ async def team_tasks(session: AsyncSession, user: User, team_id: int, assignee: 
     if project:
         query = query.where(TeamTask.project_id == project)
     rows = list(await session.scalars(query.order_by(TeamTask.status == TeamTaskStatus.DONE, TeamTask.deadline_at.is_(None), TeamTask.deadline_at, TeamTask.id).limit(1000)))
+    counts = dict((await session.execute(select(TeamTaskFile.task_id, func.count()).where(TeamTaskFile.task_id.in_([task.id for task in rows])).group_by(TeamTaskFile.task_id))).all()) if rows else {}
     people = {person.id: person for person in await members(session, team.id)}
     names = dict((await session.execute(select(Project.id, Project.name).where(Project.team_id == team.id))).all())
     now = datetime.now(timezone.utc)
-    return [{**task_view(task, people, names, tasks.local_tz(user), now), "can_manage": task.created_by == user.id or me.role == "admin", "calendar_event_id": task.event_id if task.assignee_id == me.id and task.confirm == "accepted" else None} for task in rows]
+    return [{**task_view(task, people, names, tasks.local_tz(user), now), "files_count": counts.get(task.id, 0), "can_manage": task.created_by == user.id or me.role == "admin", "calendar_event_id": task.event_id if task.assignee_id == me.id and task.confirm == "accepted" else None} for task in rows]
 
 
 async def create_task(
@@ -548,11 +552,11 @@ def task_actions(task: TeamTask, role: str, event: str, now: datetime) -> list[s
     if event not in LIVE_TASK_EVENTS:
         return []
     if role == "assignee":
-        if event == "ask":
-            return ["start"] if task.check_state in (CheckState.ASKED, CheckState.MISSED) else []
         if task.confirm == "pending":
             return ["accept", "reject"]
-        return ["done"] if task.confirm == "accepted" and task.status != TeamTaskStatus.DONE else []
+        if task.confirm == "accepted":
+            return ["start"] if task.status == TeamTaskStatus.TODO else ["done"] if task.status == TeamTaskStatus.IN_PROGRESS else []
+        return []
     if task.start_at and task.start_at > now and task.check_state is None and task.status != TeamTaskStatus.DONE and task.assignee_id:
         return ["check_off" if task.check_enabled else "check_on"]
     return []
@@ -581,6 +585,8 @@ def task_card(task: TeamTask, team: Team, viewer: User, other: str, event: str, 
         }.get(task.confirm or "")
         if task.status == TeamTaskStatus.DONE:
             status = tr("Выполнена", "Done")
+        elif task.status == TeamTaskStatus.IN_PROGRESS:
+            status = tr("В работе", "In progress")
         if status:
             lines.append(f"_{status}_")
         if role == "creator" and task.start_at and task.assignee_id:
@@ -661,16 +667,10 @@ async def act(session: AsyncSession, user: User, task_id: int, action: str, acce
     if action == "start":
         if task.confirm != "accepted":
             raise TeamError(tr("Сначала примите задачу", "Accept the task first"))
-        if task.check_state == CheckState.STARTED:
+        if task.status != TeamTaskStatus.TODO:
             raise TeamError(tr("Начало уже отмечено", "The start is already confirmed"))
-        task.check_state = CheckState.STARTED
-        task.started_at = now
-        if task.status == TeamTaskStatus.TODO:
-            task.status = TeamTaskStatus.IN_PROGRESS
-        if task.check_enabled:
-            await tell_giver("started")
-        await session.commit()
-        return await card_for(session, task, user, "ask")
+        await set_status(session, user, task, TeamTaskStatus.IN_PROGRESS)
+        return await card_for(session, task, user, "assigned")
     if action == "done":
         await set_status(session, user, task, TeamTaskStatus.DONE)
         return await card_for(session, task, user, "assigned")
@@ -683,25 +683,47 @@ async def act(session: AsyncSession, user: User, task_id: int, action: str, acce
     raise LookupError(tr("Неизвестное действие", "Unknown action"))
 
 
-async def set_status(session: AsyncSession, user: User, task: TeamTask, status: str, notify: bool = True) -> None:
+async def set_status(session: AsyncSession, user: User, task: TeamTask, status: str, notify: bool = True, commit: bool = True) -> None:
     """Done or back to work: the copy in the performer's calendar is ticked too, and the giver hears it is done."""
     if status not in (TeamTaskStatus.TODO, TeamTaskStatus.IN_PROGRESS, TeamTaskStatus.DONE) or status == task.status:
         return
     if task.assignee_id and task.confirm != "accepted" and status != TeamTaskStatus.TODO:
         raise TeamError(tr("Сначала исполнитель должен принять задачу", "The performer must accept the task first"))
+    if status == TeamTaskStatus.DONE and task.status != TeamTaskStatus.IN_PROGRESS:
+        raise TeamError(tr("Сначала нажмите «Начал выполнение» у задачи команды", "First press “Started execution” on the team task"))
     was_done = task.status == TeamTaskStatus.DONE
+    starting = status == TeamTaskStatus.IN_PROGRESS and task.started_at is None
     task.status = status
+    if status == TeamTaskStatus.IN_PROGRESS:
+        task.started_at = task.started_at or datetime.now(timezone.utc)
+        task.check_state = CheckState.STARTED
+    elif status == TeamTaskStatus.TODO:
+        task.started_at, task.check_state = None, None
     task.completed_at = datetime.now(timezone.utc) if status == TeamTaskStatus.DONE else None
     event = await session.get(Event, task.event_id) if task.event_id else None
     if event:
         event.completed_at = task.completed_at
+    if notify and starting and task.check_enabled and task.created_by and task.created_by != user.id and task.assignee_id:
+        giver = await session.get(User, task.created_by)
+        team = await session.get(Team, task.team_id)
+        assignee = await session.get(TeamMember, task.assignee_id)
+        if giver and assignee and await session.scalar(select(TeamMember.id).where(TeamMember.team_id == task.team_id, TeamMember.user_id == giver.id)):
+            await friends.post(session, giver, lambda: task_card(task, team, giver, assignee.name, "started", assignee.name), f"team:{task.id}:started:{assignee.id}")
     if notify and status == TeamTaskStatus.DONE and not was_done and task.created_by and task.created_by != user.id and task.assignee_id:
         giver = await session.get(User, task.created_by)
         team = await session.get(Team, task.team_id)
         assignee = await session.get(TeamMember, task.assignee_id)
-        if giver and assignee:
+        if giver and assignee and await session.scalar(select(TeamMember.id).where(TeamMember.team_id == task.team_id, TeamMember.user_id == giver.id)):
             await friends.post(session, giver, lambda: task_card(task, team, giver, assignee.name, "done", assignee.name), f"team:{task.id}:done:{int(task.completed_at.timestamp())}")
-    await session.commit()
+    if commit:
+        await session.commit()
+
+
+async def ensure_completion_started(session: AsyncSession, user: User, event_ids: list[int]) -> None:
+    if event_ids and await session.scalar(select(TeamTask.id).join(Event, Event.id == TeamTask.event_id).where(
+        Event.user_id == user.id, TeamTask.event_id.in_(event_ids), TeamTask.status.not_in((TeamTaskStatus.IN_PROGRESS, TeamTaskStatus.DONE)),
+    ).limit(1)):
+        raise TeamError(tr("Сначала нажмите «Начал выполнение» у задачи команды", "First press “Started execution” on the team task"))
 
 
 async def event_completed(session: AsyncSession, event: Event) -> None:
@@ -711,7 +733,7 @@ async def event_completed(session: AsyncSession, event: Event) -> None:
         return
     user = await session.get(User, event.user_id)
     status = TeamTaskStatus.DONE if event.completed_at else (TeamTaskStatus.IN_PROGRESS if task.started_at else TeamTaskStatus.TODO)
-    await set_status(session, user, task, status)
+    await set_status(session, user, task, status, commit=False)
 
 
 async def clear_calendar_copy(session: AsyncSession, task: TeamTask) -> None:
@@ -771,6 +793,8 @@ async def delete_task(session: AsyncSession, user: User, team_id: int, task_id: 
     if task.created_by != user.id and me.role != "admin":
         raise PermissionError(tr("Удалить задачу может тот, кто её поставил, или администратор", "Only whoever set the task or an admin can delete it"))
     await clear_calendar_copy(session, task)
+    from app.services import team_files
+    await team_files.remove_task_contents(session, [task.id])
     await session.delete(task)
     await session.commit()
 

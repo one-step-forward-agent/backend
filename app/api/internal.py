@@ -231,7 +231,11 @@ async def event_move_date(chat_id: int, event_id: int, session: AsyncSession = D
 @router.post("/chat/{chat_id}/events/{event_id}/complete")
 async def complete(chat_id: int, event_id: int, payload: BotCompleteRequest, session: AsyncSession = Depends(get_session)):
     user = await _user_by_chat(session, chat_id)
-    event = await tasks.set_completed(session, user, event_id, payload.completed)
+    from app.services import teams
+    try:
+        event = await tasks.set_completed(session, user, event_id, payload.completed)
+    except teams.TeamError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     return chat.event_view(event, tasks.local_tz(user))

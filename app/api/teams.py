@@ -1,9 +1,11 @@
 """Teams (app.services.teams): the team pages of the site, the invitation links and the team's assistant chat."""
 
+import asyncio
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,7 +13,9 @@ from app.api.deps import get_current_user
 from app.core.database import get_session
 from app.models.models import User
 from app.schemas import TASK_COLORS, TeamTaskAcceptance
-from app.services import teams
+from app.services import team_files, teams
+from app.core.config import settings
+from app.core.lang import tr
 
 router = APIRouter(prefix="/api", tags=["teams"])
 
@@ -194,6 +198,38 @@ async def update_task(team_id: int, task_id: int, payload: TaskUpdate, user: Use
 @router.delete("/teams/{team_id}/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_task(team_id: int, task_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     await answer(teams.delete_task(session, user, team_id, task_id))
+
+
+@router.get("/teams/{team_id}/tasks/{task_id}/files")
+async def task_files(team_id: int, task_id: int, response: Response, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    response.headers["Cache-Control"] = "no-store"
+    return await answer(team_files.listing(session, user, team_id, task_id))
+
+
+@router.post("/teams/{team_id}/tasks/{task_id}/files", status_code=201)
+async def upload_task_file(team_id: int, task_id: int, file: UploadFile = File(...), user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    from app.api.routes import limit_uploads
+
+    await answer(team_files.task_access(session, user, team_id, task_id, manage=True))
+    limit_uploads(user)
+    content = await file.read(settings.max_file_size_mb * 1024 * 1024 + 1)
+    if len(content) > settings.max_file_size_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=tr("Файл слишком большой", "File is too large"))
+    return await answer(team_files.add(session, user, team_id, task_id, file.filename or "", file.content_type or "application/octet-stream", content))
+
+
+@router.get("/teams/{team_id}/tasks/{task_id}/files/{file_id}")
+async def download_task_file(team_id: int, task_id: int, file_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    record = await answer(team_files.get(session, user, team_id, task_id, file_id))
+    path = team_files.file_path(record)
+    if not await asyncio.to_thread(path.is_file):
+        raise HTTPException(status_code=404, detail=tr("Файл не найден", "File not found"))
+    return FileResponse(path, filename=record.original_filename, media_type="application/octet-stream", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@router.delete("/teams/{team_id}/tasks/{task_id}/files/{file_id}", status_code=204)
+async def delete_task_file(team_id: int, task_id: int, file_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    await answer(team_files.remove(session, user, team_id, task_id, file_id))
 
 
 @router.post("/team-tasks/{task_id}/{action}")

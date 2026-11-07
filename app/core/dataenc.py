@@ -50,6 +50,7 @@ ENCRYPTED_COLUMNS = (
     ("event_metadata", "notes", "text"),
     ("event_metadata", "tags", "text"),
     ("event_files", "original_filename", "text"),
+    ("team_task_files", "original_filename", "text"),
     ("integrations", "account_email", "text"),
     ("notifications", "text", "text"),
     ("conversation_messages", "content", "text"),

@@ -122,13 +122,16 @@ async def test_the_team_assistant_sets_a_task_that_is_confirmed(client):
     assert any(note.payload["card"]["kind"] == "team_task" for note in await queued(ivan["id"]))
 
     accepted = await client.post(f"/internal/bot/chat/{ivan['chat_id']}/team-tasks/{reply['task_id']}/accept", headers=BOT_HEADERS)
-    assert accepted.status_code == 200 and accepted.json()["actions"] == ["done"]
+    assert accepted.status_code == 200 and accepted.json()["actions"] == ["start"]
+    assert (await personal_cards(client, boss))[-1]["event"] == "accepted"
+    started = await client.post(f"/api/team-tasks/{reply['task_id']}/start", headers=ivan["headers"])
+    assert started.status_code == 200 and started.json()["actions"] == ["done"]
     async with session_factory() as session:
         task = await session.get(TeamTask, reply["task_id"])
         event = await session.get(Event, task.event_id)
         assert event.user_id == ivan["id"] and event.title == "Подготовить презентацию" and event.deadline_at == task.deadline_at
         assert task.deadline_at.astimezone(ZoneInfo("Europe/Moscow")).weekday() == 4
-    assert (await personal_cards(client, boss))[-1]["event"] == "accepted"
+    assert (await personal_cards(client, boss))[-1]["event"] == "started"
 
     # Ticked in Ivan's own calendar, done in the team; Anna hears of it
     assert (await client.post(f"/api/events/{task.event_id}/complete", json={"completed": True}, headers=ivan["headers"])).status_code == 200
@@ -210,6 +213,7 @@ async def test_projects_progress_reports_load_and_reallocation(client):
     first = (await client.get(f"/api/teams/{team['id']}/tasks?project={project['id']}", headers=boss["headers"])).json()
     assert len(first) == 4 and all(task["project"] == "Сайт" for task in first)
     assert (await client.post(f"/api/team-tasks/{first[0]['id']}/accept", headers=ivan["headers"])).status_code == 200
+    assert (await client.post(f"/api/team-tasks/{first[0]['id']}/start", headers=ivan["headers"])).status_code == 200
     done = await client.patch(f"/api/teams/{team['id']}/tasks/{first[0]['id']}", json={"status": "done"}, headers=ivan["headers"])
     assert done.json()["status"] == "done"
     [listed] = (await client.get(f"/api/teams/{team['id']}/projects", headers=boss["headers"])).json()

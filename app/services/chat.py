@@ -2536,9 +2536,15 @@ async def complete_request(session: AsyncSession, user: User, text: str, tz: Zon
     events = [event for event in events if event.completed_at is None]
     if not events:
         return {"kind": "not_found", "text": tr("Не нашла невыполненных задач по запросу. Напишите название, например: «отметь отчёт выполненным».", "Couldn't find unfinished tasks for that. Give the title, for example: “mark the report done”.")}
+    from app.services import teams
+    try:
+        await teams.ensure_completion_started(session, user, [event.id for event in events[:200]])
+    except teams.TeamError as error:
+        return {"kind": "answer", "text": str(error)}
     moment = datetime.now(timezone.utc)
     for event in events[:200]:
         event.completed_at = moment
+        await teams.event_completed(session, event)
     await session.commit()
     count = min(len(events), 200)
     return {

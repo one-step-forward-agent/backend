@@ -472,6 +472,17 @@ class TeamTask(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class TeamTaskFile(Base):
+    __tablename__ = "team_task_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("team_tasks.id", ondelete="CASCADE"), index=True)
+    original_filename: Mapped[str] = mapped_column(EncryptedText("team_task_files.original_filename"))
+    stored_filename: Mapped[str] = mapped_column(String(255), unique=True)
+    mime_type: Mapped[str] = mapped_column(String(100))
+    file_size: Mapped[int] = mapped_column(Integer)
+
+
 class TeamMessage(Base):
     """One message of a member's conversation with the team's assistant (each member talks to it on their own)."""
 

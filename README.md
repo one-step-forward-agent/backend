@@ -4,6 +4,8 @@ Backend for Focus Day, a calendar assistant built on FastAPI. It stores users, c
 
 ## Features
 
+Team execution follows acceptance → “Started execution” → “Done”. Completing a team task through the calendar, bot, or assistant also requires it to be in progress first.
+
 - **Events and calendars**: CRUD for events, including reminders and recurrence, plus file attachments (PDF, DOC/DOCX, XLS/XLSX, PNG/JPG).
 - **AI assistant**: natural-language requests (in Russian) are parsed by GigaChat into proposed events, which the user confirms before they are saved.
 - **Assistant agent** (`app/services/agent.py`): GigaChat gets the user's onboarding profile (spheres and goals by priority, tone of voice, work days and hours), habits and the plan for the next 7 days, and calls the app's functions: find, add, change, move, delete and complete tasks, set reminders, analyse the plan, split a big task into steps. The app runs each function and returns the real result to the model. Changes go into one draft the user confirms; completing tasks and reminders apply at once. Built to work with the free GigaChat Lite: tasks get short per-turn numbers, days and times are resolved from the user's own words by `app/services/dates.py`, the chosen task is checked against the words of the request, and confirmations are written by the app, not by the model. A clear command the model only talked about is done by the rule-based handlers; when GigaChat is unreachable they answer alone (`ASSISTANT_AGENT=false` turns the agent off). The model behind it is chosen with `LLM_PROVIDER`: GigaChat, or any OpenAI-compatible API (`API_KEY`, `BASE_URL`, `OPENAI_MODEL`); the agent's functions are sent to it as OpenAI tools.
@@ -145,6 +147,7 @@ Interactive docs are served at `/docs` (Swagger) and `/redoc`.
 | Events | `GET/POST /api/events` (`recurrence_rule` creates a series), `GET/PUT/DELETE /api/events/{id}` (`?scope=series` deletes this and later occurrences), `POST /api/events/{id}/complete`, `POST /api/events/move`, `POST /api/events/{id}/sync/google`, `GET /api/events/{id}/links` |
 | Shared schedules | `GET /api/friends/{user_id}/schedule?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD` (inclusive dates in the friend's timezone, at most 93 days). Events use `visibility`: `private` (default), `friends`, or `selected` with `shared_friend_ids` (accepted friends' user IDs). Only title, schedule, deadline and completion are shared; removal revokes access and clears selected grants. |
 | Team projects | `GET/POST /api/teams/{id}/projects`, `PATCH /api/teams/{id}/projects/{project_id}`; `color` uses the tag palette and defaults to `indigo`. |
+| Team attachments | `GET/POST /api/teams/{id}/tasks/{task_id}/files`, `GET/DELETE .../files/{file_id}`. Current members can read/download; the task creator or an admin can upload/delete. Filenames are encrypted, and downloads require membership on every request. |
 | Statistics | `GET /api/stats?days=7`, `GET /api/recommendations` |
 | Integrations | `GET /api/integrations`, `POST /api/integrations/{provider}/connect`, `.../test`, `.../sync`, `POST /api/integrations/{provider}/export/{event_id}`, `DELETE /api/integrations/{provider}?purge=` |
 | Reminders | `GET/PUT /api/reminders/settings`, `POST /api/reminders/test`, `GET /api/reminders/history` |

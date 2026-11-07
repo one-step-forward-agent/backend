@@ -1026,15 +1026,22 @@ async def complete_events(turn: Turn, args: dict) -> dict:
     events = [event for event in events if event.completed_at is None][:200]
     if not events:
         return {"error": "Не нашла невыполненных задач по запросу."}
+    from app.services import teams
+    try:
+        await teams.ensure_completion_started(turn.session, turn.user, [event.id for event in events])
+    except teams.TeamError as error:
+        return {"error": str(error)}
     moment = datetime.now(timezone.utc)
     for event in events:
         event.completed_at = moment
+        await teams.event_completed(turn.session, event)
     await turn.session.flush()
     turn.completed += events
     return {"status": "Готово: отмечены выполненными.", "titles": [event.title for event in events[:20]], "count": len(events)}
 
 
 async def reopen_events(turn: Turn, args: dict) -> dict:
+    from app.services import teams
     events, problem = await pick(turn, args, default_day=turn.today, status="done")
     if problem:
         return {"error": problem}
@@ -1043,6 +1050,7 @@ async def reopen_events(turn: Turn, args: dict) -> dict:
         return {"error": "Не нашла выполненных задач по запросу."}
     for event in events:
         event.completed_at = None
+        await teams.event_completed(turn.session, event)
     await turn.session.flush()
     turn.reopened += events
     return {"status": "Готово: задачи снова невыполненные.", "titles": [event.title for event in events[:20]], "count": len(events)}

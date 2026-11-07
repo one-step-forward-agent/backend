@@ -313,7 +313,11 @@ async def delete_event(
 
 @router.post("/events/{event_id}/complete", response_model=EventRead)
 async def complete_event(event_id: int, payload: CompleteRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    event = await tasks.set_completed(session, user, event_id, payload.completed)
+    from app.services import teams
+    try:
+        event = await tasks.set_completed(session, user, event_id, payload.completed)
+    except teams.TeamError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
     return event

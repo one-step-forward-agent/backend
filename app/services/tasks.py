@@ -373,12 +373,14 @@ async def set_completed(session: AsyncSession, user: User, event_id: int, comple
     event = await session.get(Event, event_id)
     if not event or event.user_id != user.id:
         return None
-    event.completed_at = datetime.now(timezone.utc) if completed else None
-    await session.commit()
     from app.services import teams
 
+    if completed:
+        await teams.ensure_completion_started(session, user, [event.id])
+    event.completed_at = datetime.now(timezone.utc) if completed else None
     # A team's task ticked in the performer's own calendar is done in the team too
     await teams.event_completed(session, event)
+    await session.commit()
     await session.refresh(event)
     return event
 
