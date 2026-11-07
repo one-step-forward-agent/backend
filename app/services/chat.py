@@ -2271,6 +2271,14 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, atta
         response = await send_drafts.respond_by_rules(session, user, text)
         if response is not None:
             return response
+        from app.services import friends, schedule_sharing
+
+        try:
+            sharing = await schedule_sharing.request_by_rules(session, user, text)
+        except friends.FriendError as error:
+            sharing = {"kind": "answer", "text": str(error)}
+        if sharing is not None:
+            return sharing
         from app.services import planning_scope
 
         scoped = await planning_scope.reschedule(session, user, text, tz)

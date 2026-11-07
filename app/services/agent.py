@@ -109,6 +109,7 @@ ACTIONS = {
     "friend_change": "изменить/перенести/переименовать или отменить ОТПРАВЛЕННУЮ задачу другу: friend_task_id, new_title, to_date, new_time, untimed, cancel_task. Создаёт черновик подтверждения, личный календарь не трогает",
     "delegate": "задача или напоминание ДРУГУ/участнику команды: recipient_id, team_id (только для команды), task_text дословно с датой, reminder. Создаёт черновик отправки, никогда личное напоминание",
     "friend_tasks": "показать задачи, которыми пользователь обменялся с другом: recipient_id, date_from, date_to",
+    "share_schedule": "открыть другу ПРОСМОТР МОИХ существующих задач: recipient_id и filter. Это видимость, а не поручение. Создаёт черновик подтверждения",
     "find": "найти и показать задачи (вопросы «что у меня в пятницу?», «когда встреча с Анной?»)",
     "create": "добавить новые задачи, встречи, дела — поле events",
     "change": "изменить или перенести существующие задачи, одну или сразу много: to_date, shift_days, shift_minutes, new_time, new_end_time, new_title, untimed, tags",
@@ -1383,6 +1384,23 @@ async def social_operation(turn: Turn, op: dict) -> dict:
         if op.get("team_id") not in (None, turn.team_scope) or op.get("action") != "delegate":
             return {"error": "В этом чате работай только с текущей командой."}
         op = {**op, "team_id": turn.team_scope}
+    if op.get("action") == "share_schedule":
+        from app.services import schedule_sharing
+
+        recipient_id = as_int(op.get("recipient_id"))
+        if not recipient_id or op.get("team_id"):
+            return {"error": "Выбери recipient_id друга для просмотра личных задач."}
+        selected = selector(op)
+        events, problem = await pick(turn, selected)
+        if problem:
+            return {"error": problem}
+        if len(events) >= chat.MAX_DELETE:
+            return {"error": "Слишком много задач: уточни период, чтобы не открыть частичный список."}
+        turn.social_reply = await schedule_sharing.sharing_draft(
+            turn.session, turn.user, recipient_id, [event.id for event in events],
+            str(selected.get("query") or tr("Выбранные задачи", "Selected tasks")),
+        )
+        return {"reply": turn.social_reply}
     if op.get("action") == "friend_change":
         task_id = as_int(op.get("friend_task_id"))
         if not task_id:
@@ -1497,6 +1515,7 @@ OPERATIONS = {
     "friend_change": social_operation,
     "delegate": social_operation,
     "friend_tasks": social_operation,
+    "share_schedule": social_operation,
     "find": lambda turn, op: get_events(turn, selector(op)),
     "create": lambda turn, op: create_events(turn, op),
     "change": change_events,
@@ -1529,11 +1548,11 @@ async def act(turn: Turn, args: dict) -> dict:
     if not isinstance(operations, list) or not operations:
         return {"results": [{"error": "Передай operations — список операций."}]}
     operations = [op for op in operations if isinstance(op, dict)][:MAX_OPERATIONS]
-    social = [op for op in operations if op.get("action") in ("delegate", "friend_tasks", "friend_change")]
-    if len(social) == 1 and all(op.get("action") in ("delegate", "friend_tasks", "friend_change", "ask") for op in operations):
+    social = [op for op in operations if op.get("action") in ("delegate", "friend_tasks", "friend_change", "share_schedule")]
+    if len(social) == 1 and all(op.get("action") in ("delegate", "friend_tasks", "friend_change", "share_schedule", "ask") for op in operations):
         # Validate the concrete action first; it will ask for any information actually missing.
         operations = social
-    if any(op.get("action") in ("delegate", "friend_tasks", "friend_change") for op in operations) and len(operations) != 1:
+    if any(op.get("action") in ("delegate", "friend_tasks", "friend_change", "share_schedule") for op in operations) and len(operations) != 1:
         turn.social_reply = {"kind": "answer", "text": tr("Пока могу подготовить одно поручение за раз. Напишите отдельный запрос для каждого получателя и дела.", "I can prepare one assignment at a time. Send a separate request for each recipient and task.")}
         return {"results": [{"reply": turn.social_reply}]}
     alone = len(operations) == 1
@@ -1776,7 +1795,9 @@ async def context_prompt(turn: Turn) -> str:
         "ПОЛУЧАТЕЛИ: Если просят напомнить/поручить ДРУГОМУ человеку, используй delegate. "
         "Никогда не заменяй это личным remind/create. Имена могут быть в падежах. Неизвестное или неоднозначное имя — ask. "
         "«Напомни мне позвонить Артёму» — личное напоминание; «Напомни Артёму купить бананы» — delegate с reminder=true. "
-        "Задачи друга — friend_tasks; это только обмен задачами, доступа к личному календарю друга нет. "
+        "Обмен поручениями с другом — friend_tasks; скрытые личные задачи друга читать нельзя. "
+        "«Пусть мои задачи видит Маша», «Покажи Маше все ЗАЛ» — share_schedule с recipient_id и filter моих задач. "
+        "Это открытие просмотра через подтверждаемый черновик, а не delegate, friend_change или wish. "
         "Изменение, перенос, отмена отправленного поручения — friend_change, ID из ПОРУЧЕНИЯ ДРУЗЬЯМ; не wish и не личный change/delete. "
         "Короткий ответ на уточнение дополняет предыдущую просьбу: сохрани получателя и дело, а время возьми из текущего сообщения. "
         "Исправление неотправленного черновика — delegate с полными исправленными данными; предыдущий черновик будет отменён. "
@@ -1939,6 +1960,8 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
         if turn.wished:
             return {"kind": "answer", "text": research.wish_offer_text(turn.wished["text"]), "replies": research.wish_buttons(), "wish": turn.wished}
         return {"kind": "answer", "text": tr(research.THANKS, research.THANKS_EN)}
+    if not turn.changed and "share_schedule" in turn.failed:
+        return {"kind": "answer", "text": tr("Уточните друга и какие ваши задачи открыть для просмотра. Видимость не изменена.", "Specify the friend and which of your tasks to share. Visibility has not changed.")}
     if not turn.changed and any(action in ("delegate", "friend_tasks", "friend_change") for action in turn.failed):
         return {"kind": "answer", "text": tr("Уточните получателя, задачу и время. Задача себе не создана.", "Please clarify the recipient, task and time. No personal task was created.")}
     if not turn.team_scope and not turn.changed and not turn.analysed:

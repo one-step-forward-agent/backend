@@ -20,6 +20,7 @@ from app.services.ru import relative_day
 
 CARD = "send_draft"
 FRIEND_TASK, FRIEND_REMINDER, TEAM_TASK = "friend_task", "friend_reminder", "team_task"
+SCHEDULE_SHARE = "schedule_share"
 OPEN, SENT, CANCELLED = "open", "sent", "cancelled"
 MAX_TITLE = 300
 
@@ -58,18 +59,31 @@ def view(draft: SendDraft, user: User) -> dict:
         FRIEND_TASK: tr(f"📝 Отправить задачу другу **{to}**?", f"📝 Send this task to **{to}**?"),
         FRIEND_REMINDER: tr(f"🔔 Поставить напоминание другу **{to}**?", f"🔔 Set this reminder for **{to}**?"),
         TEAM_TASK: tr(f"📝 Поручить **{to}** в команде {payload.get('team', '')}?", f"📝 Assign to **{to}** in {payload.get('team', '')}?"),
+        SCHEDULE_SHARE: tr(f"👁 **{to}** сможет видеть эти задачи. Открыть доступ?", f"👁 Share tasks with **{to}**?"),
     }[draft.kind]
     if payload.get("update_task_id"):
         head = tr(f"📝 Изменить задачу у друга **{to}**?", f"📝 Update the task for **{to}**?")
         if payload.get("cancel_task"):
             head = tr(f"🗑 Отменить задачу у друга **{to}**?", f"🗑 Cancel the task for **{to}**?")
     lines = [head, f"**{payload['title'].replace('*', '')}**", f"🕒 {when}"]
+    if draft.kind == SCHEDULE_SHARE:
+        count = len(payload['events'])
+        when = tr(f"Существующих задач: {count}", f"Existing tasks: {count}")
+        lines = [head, f"**{payload['title'].replace('*', '')}**", when, tr(
+            "Только просмотр названий, дат и статуса. Новые отдельные задачи автоматически не открываются. Доступ других друзей сохранится.",
+            "View titles, dates and status only. New separate tasks will not be shared automatically. Other friends keep their access.",
+        )]
+        for event in payload['events'][:5]:
+            start = _local(event['start'], tz)
+            lines.append(f"• {event['title'].replace('*', '')} · {start:%d.%m.%Y %H:%M}")
+        if count > 5:
+            lines.append(tr(f"И ещё {count - 5}.", f"And {count - 5} more."))
     if payload.get("shared"):
         lines.append(tr("👥 Совместная — будет в календарях у обоих", "👥 Shared — goes to both calendars"))
     if draft.status == CANCELLED:
-        lines.append(f"_{tr('Отменено — ничего не отправлено', 'Cancelled — nothing was sent')}_")
+        lines.append(f"_{tr('Отменено — видимость не изменена', 'Cancelled — visibility has not changed') if draft.kind == SCHEDULE_SHARE else tr('Отменено — ничего не отправлено', 'Cancelled — nothing was sent')}_")
     else:
-        lines.append(f"_{tr('Пока не отправлено', 'Not sent yet')}_")
+        lines.append(f"_{tr('Доступ пока не открыт', 'Not shared yet') if draft.kind == SCHEDULE_SHARE else tr('Пока не отправлено', 'Not sent yet')}_")
     moment = _local(payload.get("start") or payload.get("deadline"), tz)
     return {
         "kind": CARD,
@@ -81,8 +95,8 @@ def view(draft: SendDraft, user: User) -> dict:
         "time": (f"{moment:%H:%M}" if moment and not payload.get("all_day") else None),
         "when": when,
         "status": draft.status,
-        "actions": (["send", "cancel"] if payload.get("cancel_task") else ["send", "edit", "cancel"]) if draft.status == OPEN else [],
-        "operation": "cancel" if payload.get("cancel_task") else "edit" if payload.get("update_task_id") else "create",
+        "actions": (["send", "cancel"] if payload.get("cancel_task") or draft.kind == SCHEDULE_SHARE else ["send", "edit", "cancel"]) if draft.status == OPEN else [],
+        "operation": "share" if draft.kind == SCHEDULE_SHARE else "cancel" if payload.get("cancel_task") else "edit" if payload.get("update_task_id") else "create",
         "text": "\n".join(lines),
     }
 
@@ -121,7 +135,7 @@ async def respond_by_rules(session: AsyncSession, user: User, text: str) -> dict
         await session.flush()
     result = view(draft, user)
     if send_match:
-        result["text"] += "\n" + tr("Нажмите «Отправить» под черновиком для подтверждения.", "Press Send below the draft to confirm.")
+        result["text"] += "\n" + (tr("Нажмите «Открыть доступ» под черновиком для подтверждения.", "Press Share below the draft to confirm.") if draft.kind == SCHEDULE_SHARE else tr("Нажмите «Отправить» под черновиком для подтверждения.", "Press Send below the draft to confirm."))
     return result
 
 
@@ -211,6 +225,8 @@ async def edit(session: AsyncSession, user: User, draft_id: int, values: dict) -
     """«Изменить»: the title, the day (YYYY-MM-DD) and the time (HH:MM; empty — no time, not for a reminder)."""
     draft = await own(session, user, draft_id)
     _open(draft)
+    if draft.kind == SCHEDULE_SHARE:
+        raise DraftError(tr("Для другого набора задач отмените черновик и напишите новый запрос.", "Cancel this draft and make a new request to share a different set of tasks."))
     payload = dict(draft.payload)
     tz = tasks.local_tz(user)
     if "title" in values:
@@ -259,7 +275,11 @@ async def send(session: AsyncSession, user: User, draft_id: int) -> dict:
     _open(draft)
     payload = draft.payload
     tz = tasks.local_tz(user)
-    if draft.kind in (FRIEND_TASK, FRIEND_REMINDER):
+    if draft.kind == SCHEDULE_SHARE:
+        from app.services import schedule_sharing
+
+        result = await schedule_sharing.apply_sharing(session, user, payload)
+    elif draft.kind in (FRIEND_TASK, FRIEND_REMINDER):
         friend = await session.get(User, payload["friend_id"])
         mine, theirs = await friends.pair(session, user.id, payload["friend_id"])
         if not friend or not mine or not theirs or mine.status != FriendStatus.ACCEPTED or theirs.status != FriendStatus.ACCEPTED:

@@ -304,6 +304,8 @@ def when_label(task: FriendTask, tz: ZoneInfo, sender_tz: ZoneInfo | None = None
             label += f" – {relative_day(last, today)}"
         return f"{label}, {tr('без времени', 'no set time')}"
     start, end = task.start_at.astimezone(tz), task.end_at.astimezone(tz)
+    if task.is_reminder:
+        return f"{relative_day(start.date(), today)}, {start:%H:%M}"
     return f"{relative_day(start.date(), today)}, {time_range(start, end)}"
 
 

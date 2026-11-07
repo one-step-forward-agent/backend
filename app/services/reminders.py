@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.dataenc import email_lookup
-from app.models.models import Event, Notification, NotificationStatus, ReminderSettings, User
+from app.models.models import Event, FriendTask, FriendTaskStatus, Notification, NotificationStatus, ReminderSettings, User
 from app.services import insights, rewards, tasks
 from app.services.events import default_calendar
 from app.services.integrations.service import user_timezone
@@ -106,8 +106,10 @@ def with_links(text: str, source: str) -> str:
     return " ".join([text, *missing]).strip() if missing else text
 
 
-def reminder_text(event: Event, minutes: int, tz: ZoneInfo) -> str:
+def reminder_text(event: Event, minutes: int, tz: ZoneInfo, *, friend_reminder: bool = False) -> str:
     starts = event.start_at.astimezone(tz)
+    if friend_reminder:
+        return f"🔔 <b>{tr('Напоминание', 'Reminder')}</b>\n\n<b>{html.escape(event.title)}</b>\n🕒 {starts:%H:%M}"
     ends = event.end_at.astimezone(tz)
     today = datetime.now(tz).date()
     if is_en():
@@ -192,7 +194,15 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
     rows = await session.execute(
         select(User, ReminderSettings)
         .join(ReminderSettings, ReminderSettings.user_id == User.id)
-        .where(User.telegram_chat_id.is_not(None), User.is_active.is_(True), ReminderSettings.enabled.is_(True))
+        .where(
+            User.telegram_chat_id.is_not(None), User.is_active.is_(True),
+            or_(ReminderSettings.enabled.is_(True), User.id.in_(
+                select(FriendTask.performer_id).where(
+                    FriendTask.is_reminder.is_(True), FriendTask.status == FriendTaskStatus.ACCEPTED,
+                    FriendTask.performer_event_id.is_not(None),
+                )
+            )),
+        )
     )
     values = []
     for user, reminder_settings in rows.all():
@@ -211,6 +221,12 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
 async def queue_for_user(session: AsyncSession, user: User, reminder_settings: ReminderSettings, now: datetime, values: list[dict]) -> None:
     """The notifications due for one user now, added to `values`."""
     tz = ZoneInfo(user_timezone(user))
+    friend_reminder = select(FriendTask.id).where(
+        FriendTask.performer_event_id == Event.id,
+        FriendTask.performer_id == user.id,
+        FriendTask.is_reminder.is_(True),
+        FriendTask.status == FriendTaskStatus.ACCEPTED,
+    ).exists()
     leads = sorted({minutes for minutes in reminder_settings.lead_times or [] if 0 <= minutes <= MAX_LEAD_MINUTES})
     conditions = [Event.user_id == user.id, or_(Event.start_at > now, and_(Event.start_at > now - AT_START_GRACE, Event.reminder_minutes == 0)), Event.all_day.is_(False), Event.completed_at.is_(None)]
     conditions.append(
@@ -219,9 +235,11 @@ async def queue_for_user(session: AsyncSession, user: User, reminder_settings: R
             and_(Event.reminder_minutes.is_not(None), Event.start_at <= now + timedelta(minutes=MAX_LEAD_MINUTES)),
         )
     )
-    if reminder_settings.sources:
-        conditions.append(Event.source.in_(reminder_settings.sources))
-    for event in await session.scalars(select(Event).where(*conditions)):
+    if not reminder_settings.enabled:
+        conditions.append(friend_reminder)
+    elif reminder_settings.sources:
+        conditions.append(or_(Event.source.in_(reminder_settings.sources), friend_reminder))
+    for event, is_friend_reminder in (await session.execute(select(Event, friend_reminder).where(*conditions))).all():
         event_leads = [event.reminder_minutes] if event.reminder_minutes is not None else leads
         due = [minutes for minutes in event_leads if event.start_at - timedelta(minutes=minutes) <= now]
         if not due:
@@ -233,12 +251,15 @@ async def queue_for_user(session: AsyncSession, user: User, reminder_settings: R
                 "event_id": event.id,
                 "kind": "reminder",
                 "dedupe_key": f"reminder:{event.id}:{int(event.start_at.timestamp())}:{minutes}",
-                "text": reminder_text(event, max(0, round((event.start_at - now).total_seconds() / 60)), tz),
+                "text": reminder_text(event, max(0, round((event.start_at - now).total_seconds() / 60)), tz, friend_reminder=is_friend_reminder),
                 "scheduled_for": now,
                 "expires_at": event.start_at + AT_START_GRACE if event.reminder_minutes == 0 else event.start_at,
-                "payload": {"explicit_at_start": True} if event.reminder_minutes == 0 else None,
+                "payload": {"explicit_at_start": True, **({"friend_reminder": True} if is_friend_reminder else {})} if event.reminder_minutes == 0 else None,
             }
         )
+
+    if not reminder_settings.enabled:
+        return
 
     if reminder_settings.daily_digest_enabled:
         local_now = now.astimezone(tz)
@@ -532,13 +553,14 @@ async def snooze(session: AsyncSession, notification: Notification, minutes: int
         user = await session.get(User, notification.user_id)
         lead = int((event.start_at - scheduled).total_seconds() // 60)
         with lang.using(user.language):
-            body = reminder_text(event, lead, ZoneInfo(user_timezone(user)))
+            body = reminder_text(event, lead, ZoneInfo(user_timezone(user)), friend_reminder=(notification.payload or {}).get("friend_reminder") is True)
     copy = Notification(
         user_id=notification.user_id,
         event_id=notification.event_id,
         kind=notification.kind,
         dedupe_key=f"snooze:{notification.id}:{secrets.token_hex(6)}",
         text=body,
+        payload=notification.payload if notification.kind == "reminder" else None,
         scheduled_for=scheduled,
         expires_at=scheduled + timedelta(hours=2),
         status=NotificationStatus.PENDING,
