@@ -33,6 +33,22 @@ def local_tz(user: User) -> ZoneInfo:
     return ZoneInfo(user_timezone(user))
 
 
+async def team_execution(session: AsyncSession, user: User, events: list[Event]) -> dict[int, dict]:
+    """Execution state for the performer's calendar copies, including self-assigned tasks."""
+    from app.models.models import TeamMember, TeamTask
+
+    ids = [event.id for event in events]
+    if not ids:
+        return {}
+    rows = await session.execute(
+        select(TeamTask.event_id, TeamTask.id, TeamTask.status)
+        .join(TeamMember, TeamMember.id == TeamTask.assignee_id)
+        .join(Event, Event.id == TeamTask.event_id)
+        .where(TeamMember.user_id == user.id, Event.user_id == user.id, Event.id.in_(ids))
+    )
+    return {event_id: {"task_id": task_id, "status": status} for event_id, task_id, status in rows}
+
+
 async def assigned_origins(session: AsyncSession, user: User, events: list[Event]) -> dict[int, dict]:
     """Identify calendar copies assigned to this user; exclude reminders and self-created tasks."""
     from app.models.models import FriendTask, Friendship, Project, Team, TeamMember, TeamTask

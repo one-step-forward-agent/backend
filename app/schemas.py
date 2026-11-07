@@ -255,6 +255,11 @@ class AssignmentOrigin(BaseModel):
     friend_name: str | None = None
 
 
+class TeamTaskExecution(BaseModel):
+    task_id: int
+    status: Literal["todo", "in_progress", "done"]
+
+
 class EventRead(EventCreate):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -267,6 +272,7 @@ class EventRead(EventCreate):
     series_id: str | None = None
     completed_at: datetime | None = None
     assignment: AssignmentOrigin | None = None
+    team_task: TeamTaskExecution | None = None
 
     @computed_field
     @property

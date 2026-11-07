@@ -41,6 +41,7 @@ from app.schemas import (
     EventCreate,
     EventRead,
     AssignmentOrigin,
+    TeamTaskExecution,
     EventUpdate,
     MoveRequest,
     OnboardingProfile,
@@ -250,6 +251,15 @@ async def create_event(payload: EventCreate, user: User = Depends(get_current_us
     return event
 
 
+async def _read_events(session: AsyncSession, user: User, events: list[Event]) -> list[EventRead]:
+    origins = await tasks.assigned_origins(session, user, events)
+    execution = await tasks.team_execution(session, user, events)
+    return [EventRead.model_validate(event).model_copy(update={
+        "assignment": AssignmentOrigin(**origins[event.id]) if event.id in origins else None,
+        "team_task": TeamTaskExecution(**execution[event.id]) if event.id in execution else None,
+    }) for event in events]
+
+
 @router.get("/events", response_model=list[EventRead])
 async def list_events(
     start: datetime | None = None,
@@ -267,15 +277,13 @@ async def list_events(
     if tag is not None:
         query = query.where(tag == any_(Event.tag_ids))
     events = list((await session.scalars(query)).all())
-    origins = await tasks.assigned_origins(session, user, events)
-    return [EventRead.model_validate(event).model_copy(update={"assignment": AssignmentOrigin(**origins[event.id]) if event.id in origins else None}) for event in events]
+    return await _read_events(session, user, events)
 
 
 @router.get("/events/{event_id}", response_model=EventRead)
 async def get_event(event_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     event = await _owned_event(session, user, event_id)
-    origins = await tasks.assigned_origins(session, user, [event])
-    return EventRead.model_validate(event).model_copy(update={"assignment": AssignmentOrigin(**origins[event.id]) if event.id in origins else None})
+    return (await _read_events(session, user, [event]))[0]
 
 
 @router.put("/events/{event_id}", response_model=EventRead)
@@ -333,7 +341,7 @@ async def complete_event(event_id: int, payload: CompleteRequest, user: User = D
         raise HTTPException(status_code=409, detail=str(error)) from None
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
-    return event
+    return (await _read_events(session, user, [event]))[0]
 
 
 @router.post("/events/move")

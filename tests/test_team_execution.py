@@ -65,3 +65,40 @@ async def test_assistant_completion_cannot_skip_start_and_updates_team_status(cl
         reply = await chat.complete_request(session, user, "Отметь проверить смету выполненным", tz)
         assert reply["kind"] == "completed", reply
         assert (await session.get(TeamTask, task["id"])).status == "done"
+
+
+async def test_calendar_execution_state_survives_start_done_and_reopen(client):
+    boss, worker, _, task, event = await accepted_task(client)
+    url = f"/api/events/{event.id}"
+    initial = (await client.get(url, headers=worker["headers"])).json()
+    assert initial["team_task"] == {"task_id": task["id"], "status": "todo"}
+    assert (await client.get(url, headers=boss["headers"])).status_code == 404
+    assert (await client.post(f"/api/team-tasks/{task['id']}/start", headers=worker["headers"])).status_code == 200
+    started = (await client.get(url, headers=worker["headers"])).json()
+    assert started["team_task"]["status"] == "in_progress" and started["completed_at"] is None
+    listed = (await client.get("/api/events", headers=worker["headers"])).json()
+    assert next(item for item in listed if item["id"] == event.id)["team_task"] == started["team_task"]
+    assert (await client.post(f"/api/team-tasks/{task['id']}/done", headers=worker["headers"])).status_code == 200
+    done = (await client.get(url, headers=worker["headers"])).json()
+    assert done["team_task"]["status"] == "done" and done["completed_at"] is not None
+    reopened = await client.post(url + "/complete", headers=worker["headers"], json={"completed": False})
+    assert reopened.status_code == 200
+    assert reopened.json()["team_task"]["status"] == "in_progress" and reopened.json()["completed_at"] is None
+
+
+async def test_self_assigned_team_task_has_execution_without_assignment_group(client):
+    from tests.test_teams import team_of, member_id
+    from app.services import tasks
+
+    owner = await person(client, "Владелец")
+    team = await team_of(client, owner)
+    created = await client.post(f"/api/teams/{team['id']}/tasks", headers=owner["headers"], json={
+        "title": "Своя задача проекта", "assignee_id": member_id(team, owner["name"]),
+    })
+    assert created.status_code == 201, created.text
+    [event] = (await client.get("/api/events", headers=owner["headers"])).json()
+    assert event["assignment"] is None
+    assert event["team_task"] == {"task_id": created.json()["id"], "status": "todo"}
+    async with session_factory() as session:
+        stranger = await session.get(User, (await person(client, "Посторонний"))["id"])
+        assert await tasks.team_execution(session, stranger, [await session.get(Event, event["id"])]) == {}
