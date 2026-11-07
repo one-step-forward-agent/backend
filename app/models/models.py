@@ -160,6 +160,9 @@ class Event(Base):
     tag_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list, server_default="{}")
     # The colour the user chose for the task in the calendar (the tag palette); NULL: the usual one
     color: Mapped[str | None] = mapped_column(String(20))
+    # Only explicit owner choices expose a task to accepted friends.
+    visibility: Mapped[str] = mapped_column(String(20), default="private", server_default="private")
+    shared_friend_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     calendar: Mapped[Calendar] = relationship(back_populates="events")
@@ -424,6 +427,7 @@ class Project(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(Text)
+    color: Mapped[str] = mapped_column(String(20), default="indigo", server_default="indigo")
     description: Mapped[str | None] = mapped_column(Text)
     # "active" or "archived"
     status: Mapped[str] = mapped_column(String(20), default="active", server_default="active")

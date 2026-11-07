@@ -198,6 +198,8 @@ class EventCreate(BaseModel):
     is_fixed: bool = False
     tag_ids: list[int] = Field(default_factory=list, max_length=20)
     color: Literal[TASK_COLORS] | None = None
+    visibility: Literal["private", "friends", "selected"] = "private"
+    shared_friend_ids: list[int] = Field(default_factory=list, max_length=200)
 
     @field_validator("priority", mode="after")
     @classmethod
@@ -220,6 +222,8 @@ class EventUpdate(BaseModel):
     tag_ids: list[int] | None = Field(default=None, max_length=20)
     # null takes the colour off
     color: Literal[TASK_COLORS] | None = None
+    visibility: Literal["private", "friends", "selected"] | None = None
+    shared_friend_ids: list[int] | None = Field(default=None, max_length=200)
     # A new repeat from this occurrence on ("" or null: no longer repeats); left out: the repeat stays
     recurrence_rule: str | None = Field(default=None, max_length=300)
 

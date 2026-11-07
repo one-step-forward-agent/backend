@@ -20,7 +20,7 @@ import re
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import or_, select
+from sqlalchemy import any_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +30,7 @@ from app.core.lang import is_en, tr
 from app.models.models import (
     CheckState,
     ConversationMessage,
+    Event,
     FriendStatus,
     FriendTask,
     FriendTaskStatus,
@@ -276,6 +277,13 @@ async def remove_friend(session: AsyncSession, user: User, friend_id: int) -> No
     )
     for task in waiting:
         task.status = FriendTaskStatus.CANCELLED
+    # Re-adding a friend must not restore an old, explicitly selected audience.
+    for owner_id, removed_id in ((user.id, friend_id), (friend_id, user.id)):
+        remaining = func.array_remove(Event.shared_friend_ids, removed_id)
+        await session.execute(update(Event).where(Event.user_id == owner_id, removed_id == any_(Event.shared_friend_ids)).values(
+            shared_friend_ids=remaining,
+            visibility=case((func.cardinality(remaining) == 0, "private"), else_=Event.visibility),
+        ))
     for row in (mine, theirs):
         if row:
             await session.delete(row)

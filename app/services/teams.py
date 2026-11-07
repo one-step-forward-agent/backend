@@ -20,6 +20,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import lang
@@ -96,17 +97,30 @@ async def create_team(session: AsyncSession, user: User, name: str, tag: str | N
     name = clean_name(name, 100)
     if not name:
         raise TeamError(tr("Назовите команду", "Name the team"))
-    tag = (tag or "").strip().lstrip("@") or tag_from(name)
-    if not TAG_PATTERN.match(tag):
+    custom_tag = (tag or "").strip().lstrip("@")
+    base_tag = custom_tag or tag_from(name)
+    if not custom_tag and len(base_tag) < 2:
+        base_tag = "team"
+    if not TAG_PATTERN.fullmatch(base_tag):
         raise TeamError(tr("Тег — от 2 до 40 букв, цифр, «_» или «-»", "A tag is 2 to 40 letters, digits, “_” or “-”"))
-    if await session.scalar(select(Team.id).where(Team.tag_key == key_of(tag))):
-        raise TeamError(tr(f"Тег @{tag} уже занят — выберите другой", f"The tag @{tag} is taken — choose another"))
     count = await session.scalar(select(func.count()).select_from(TeamMember).where(TeamMember.user_id == user.id))
     if count >= MAX_TEAMS:
         raise TeamError(tr(f"Можно состоять не больше чем в {MAX_TEAMS} командах", f"You can be in up to {MAX_TEAMS} teams"))
-    team = Team(name=name, tag=tag, tag_key=key_of(tag), created_by=user.id)
-    session.add(team)
-    await session.flush()
+    # Let PostgreSQL arbitrate collisions, including simultaneous creations.
+    # Display names may repeat; only the tag used in chat must be unique.
+    suffix_number = 1
+    while True:
+        suffix = f"_{suffix_number}" if suffix_number > 1 else ""
+        tag = base_tag[:40 - len(suffix)] + suffix
+        team = await session.scalar(
+            insert(Team).values(name=name, tag=tag, tag_key=key_of(tag), created_by=user.id)
+            .on_conflict_do_nothing(index_elements=[Team.tag_key]).returning(Team)
+        )
+        if team is not None:
+            break
+        if custom_tag:
+            raise TeamError(tr(f"Тег @{tag} уже занят — выберите другой", f"The tag @{tag} is taken — choose another"))
+        suffix_number += 1
     own = clean_name(my_name or friends.own_name(user))
     session.add(TeamMember(team_id=team.id, user_id=user.id, name=own, name_key=key_of(own), role="admin"))
     await session.commit()
@@ -335,6 +349,7 @@ def project_view(project: Project, progress: tuple[int, int], tz: ZoneInfo) -> d
     return {
         "id": project.id,
         "name": project.name,
+        "color": project.color,
         "description": project.description,
         "status": project.status,
         "deadline_at": project.deadline_at.astimezone(tz).isoformat() if project.deadline_at else None,
@@ -364,6 +379,8 @@ async def save_project(session: AsyncSession, user: User, team_id: int, values: 
         project.status = values["status"]
     if "deadline_at" in values:
         project.deadline_at = values["deadline_at"]
+    if "color" in values:
+        project.color = values["color"] or "indigo"
     await session.commit()
     progress = await project_progress(session, team.id)
     return project_view(project, progress.get(project.id, (0, 0)), tasks.local_tz(user))

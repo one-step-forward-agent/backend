@@ -49,7 +49,7 @@ from app.schemas import (
     UserRead,
     UserUpdate,
 )
-from app.services import chat, insights, rewards, tasks, usage
+from app.services import chat, friends, insights, rewards, schedule_sharing, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
 from app.services.google_calendar import revoke_google_access
@@ -214,6 +214,10 @@ async def create_event(payload: EventCreate, user: User = Depends(get_current_us
     if payload.end_at <= payload.start_at:
         raise HTTPException(status_code=422, detail="end_at must be later than start_at")
     values = payload.model_dump()
+    try:
+        await schedule_sharing.visibility_values(session, user, values)
+    except friends.FriendError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     calendar_id = values.pop("calendar_id")
     values["recurrence_rule"] = valid_rrule(values.get("recurrence_rule"))
     if payload.recurrence_rule and not values["recurrence_rule"]:
@@ -265,6 +269,10 @@ async def get_event(event_id: int, user: User = Depends(get_current_user), sessi
 async def update_event(event_id: int, payload: EventUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     event = await _owned_event(session, user, event_id)
     values = payload.model_dump(exclude_unset=True)
+    try:
+        await schedule_sharing.visibility_values(session, user, values, event)
+    except friends.FriendError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     if "tag_ids" in values:
         values["tag_ids"] = await tasks.owned_tag_ids(session, user, values["tag_ids"])
     if values.get("is_fixed") is None:

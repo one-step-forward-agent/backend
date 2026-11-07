@@ -4,14 +4,14 @@ the assistant chat. Tasks are given to friends in the chat itself ("добавь
 from typing import Literal
 from datetime import date as Date, time as Clock
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.core.database import get_session
 from app.models.models import User
-from app.services import friends
+from app.services import friends, schedule_sharing
 
 router = APIRouter(prefix="/api", tags=["friends"])
 
@@ -86,6 +86,12 @@ async def update_friend(friend_id: int, payload: FriendUpdate, user: User = Depe
 @router.get("/friends/{friend_id}/tasks")
 async def friend_tasks(friend_id: int, date_from: Date, date_to: Date, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await answer(friends.task_list(session, user, friend_id, date_from, date_to))
+
+
+@router.get("/friends/{friend_id}/schedule")
+async def friend_schedule(friend_id: int, date_from: Date, date_to: Date, response: Response, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    response.headers["Cache-Control"] = "no-store"
+    return await answer(schedule_sharing.schedule(session, user, friend_id, date_from, date_to))
 
 
 @router.post("/friends/{friend_id}/tasks", status_code=201)

@@ -1,5 +1,5 @@
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -63,6 +63,7 @@ def profile(user: User) -> dict:
         "email": user.email,
         "name": user.name,
         "timezone": user_timezone(user),
+        "today": datetime.now(tasks.local_tz(user)).date().isoformat(),
         "app_url": settings.public_app_url or None,
         "language": user.language or "ru",
     }

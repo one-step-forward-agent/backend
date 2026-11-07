@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user
 from app.core.database import get_session
 from app.models.models import User
-from app.schemas import TeamTaskAcceptance
+from app.schemas import TASK_COLORS, TeamTaskAcceptance
 from app.services import teams
 
 router = APIRouter(prefix="/api", tags=["teams"])
@@ -46,6 +46,7 @@ class ProjectSave(BaseModel):
     description: str | None = Field(default=None, max_length=5000)
     status: Literal["active", "archived"] | None = None
     deadline_at: datetime | None = None
+    color: Literal[TASK_COLORS] | None = None
 
 
 class TaskCreate(BaseModel):

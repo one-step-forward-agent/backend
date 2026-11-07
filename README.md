@@ -143,6 +143,8 @@ Interactive docs are served at `/docs` (Swagger) and `/redoc`.
 | Profile | `GET/PATCH /api/me`, `PUT /api/me/onboarding` |
 | Calendars | `GET/POST /api/calendars`, `GET /api/calendars/{id}`, `POST /api/calendars/{id}/sync` |
 | Events | `GET/POST /api/events` (`recurrence_rule` creates a series), `GET/PUT/DELETE /api/events/{id}` (`?scope=series` deletes this and later occurrences), `POST /api/events/{id}/complete`, `POST /api/events/move`, `POST /api/events/{id}/sync/google`, `GET /api/events/{id}/links` |
+| Shared schedules | `GET /api/friends/{user_id}/schedule?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD` (inclusive dates in the friend's timezone, at most 93 days). Events use `visibility`: `private` (default), `friends`, or `selected` with `shared_friend_ids` (accepted friends' user IDs). Only title, schedule, deadline and completion are shared; removal revokes access and clears selected grants. |
+| Team projects | `GET/POST /api/teams/{id}/projects`, `PATCH /api/teams/{id}/projects/{project_id}`; `color` uses the tag palette and defaults to `indigo`. |
 | Statistics | `GET /api/stats?days=7`, `GET /api/recommendations` |
 | Integrations | `GET /api/integrations`, `POST /api/integrations/{provider}/connect`, `.../test`, `.../sync`, `POST /api/integrations/{provider}/export/{event_id}`, `DELETE /api/integrations/{provider}?purge=` |
 | Reminders | `GET/PUT /api/reminders/settings`, `POST /api/reminders/test`, `GET /api/reminders/history` |

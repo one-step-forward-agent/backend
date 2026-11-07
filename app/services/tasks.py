@@ -167,6 +167,8 @@ def _copy(template: Event, moment: datetime, duration: timedelta) -> Event:
         is_fixed=template.is_fixed,
         tag_ids=list(template.tag_ids or []),
         color=template.color,
+        visibility=template.visibility or "private",
+        shared_friend_ids=list(template.shared_friend_ids or []),
         # A deadline belongs to one task; occurrences of a series do not share it
         deadline_at=None if template.recurrence_rule else template.deadline_at,
     )

@@ -26,6 +26,31 @@ async def assignment(client, boss, worker, **values):
     return team, response.json()
 
 
+async def test_bot_accepts_a_specific_future_date_and_keeps_deadline(client):
+    boss, worker, outsider = await person(client, "Анна"), await person(client, "Иван"), await person(client, "Пётр")
+    day = (datetime.now(TZ) + timedelta(days=17)).date()
+    deadline = datetime.combine(day + timedelta(days=3), datetime.min.time(), TZ)
+    team, task = await assignment(client, boss, worker, deadline_at=deadline.isoformat())
+    body = {"day": day.isoformat(), "start_time": None}
+    url = f"/internal/bot/chat/{worker['chat_id']}/team-tasks/{task['id']}/accept"
+    assert (await client.post(url, json=body)).status_code == 401
+    assert (await client.post(f"/internal/bot/chat/{outsider['chat_id']}/team-tasks/{task['id']}/accept", headers=BOT_HEADERS, json=body)).status_code == 404
+    accepted = await client.post(url, headers=BOT_HEADERS, json=body)
+    assert accepted.status_code == 200, accepted.text
+    [event] = await events_of(worker["id"])
+    assert event.all_day and event.start_at.astimezone(TZ).date() == day
+    assert event.deadline_at == deadline
+    assert event.visibility == "private"
+
+
+async def test_bot_calendar_today_uses_recipients_timezone(client):
+    worker = await person(client, "Иван")
+    assert (await client.patch("/api/me", headers=worker["headers"], json={"timezone": "Pacific/Kiritimati"})).status_code == 200
+    profile = await client.get(f"/internal/bot/users/{worker['chat_id']}", headers=BOT_HEADERS)
+    assert profile.status_code == 200
+    assert profile.json()["today"] == datetime.now(ZoneInfo("Pacific/Kiritimati")).date().isoformat()
+
+
 async def test_legacy_auto_requires_acceptance_and_recipient_chooses_untimed_day(client):
     boss, worker = await person(client, "Анна"), await person(client, "Иван")
     deadline = (datetime.now(TZ) + timedelta(days=2)).replace(hour=18, minute=0, second=0, microsecond=0)

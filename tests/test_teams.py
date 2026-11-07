@@ -44,6 +44,37 @@ async def personal_cards(client, who: dict) -> list[dict]:
     return [item["reply"] for item in history if (item.get("reply") or {}).get("kind") == "team_task"]
 
 
+async def test_repeated_team_names_get_available_tags(client):
+    boss = await person(client, "Анна")
+    name = f"Design_{uuid.uuid4().hex[:12]}"
+    created = []
+    for _ in range(3):
+        response = await client.post("/api/teams", json={"name": name}, headers=boss["headers"])
+        assert response.status_code == 201, response.text
+        created.append(response.json())
+    assert [team["name"] for team in created] == [name] * 3
+    assert [team["tag"] for team in created] == [name, f"{name}_2", f"{name}_3"]
+    assert len({team["id"] for team in created}) == 3
+    taken = await client.post("/api/teams", json={"name": name, "tag": name.upper()}, headers=boss["headers"])
+    assert taken.status_code == 409 and "detail" in taken.json()
+
+
+async def test_project_colors_persist_and_are_scoped_to_the_team(client):
+    boss, outsider = await person(client, "Анна"), await person(client, "Пётр")
+    team = await team_of(client, boss)
+    url = f"/api/teams/{team['id']}/projects"
+    created = await client.post(url, json={"name": "Launch", "color": "green"}, headers=boss["headers"])
+    assert created.status_code == 201 and created.json()["color"] == "green"
+    project_id = created.json()["id"]
+    changed = await client.patch(f"{url}/{project_id}", json={"color": "pink"}, headers=boss["headers"])
+    assert changed.status_code == 200 and changed.json()["color"] == "pink"
+    assert (await client.get(url, headers=boss["headers"])).json()[0]["color"] == "pink"
+    assert (await client.patch(f"{url}/{project_id}", json={"color": "invalid"}, headers=boss["headers"])).status_code == 422
+    assert (await client.patch(f"{url}/{project_id}", json={"color": "blue"}, headers=outsider["headers"])).status_code == 404
+    default = await client.post(url, json={"name": "Other"}, headers=boss["headers"])
+    assert default.json()["color"] == "indigo"
+
+
 async def test_a_link_works_once_and_for_24_hours_and_names_are_unique(client):
     boss, ivan, other_ivan, late = await person(client, "Анна"), await person(client, "Иван"), await person(client, "Иван"), await person(client, "Пётр")
     team = await team_of(client, boss, (ivan, "Иван"))
