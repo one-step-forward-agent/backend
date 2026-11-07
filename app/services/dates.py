@@ -219,14 +219,16 @@ def parse_time(text: str) -> tuple[time | None, time | None, list[tuple[int, int
 def parse_recurrence(text: str) -> tuple[str | None, list[tuple[int, int]]]:
     """An RFC 5545 RRULE (without the RRULE: prefix) for phrases such as "по вторникам и четвергам"."""
     low = text.lower()
+    weeks = re.search(rf"\b(?:каждые|раз\s+в)\s+({NUMBER})\s+нед\w*\.?", low)
+    interval = f";INTERVAL={_number(weeks.group(1))}" if weeks and _number(weeks.group(1)) > 1 else ""
     if match := re.search(r"\b(ежедневно|каждый\s+день|каждое\s+утро|каждый\s+вечер|каждую\s+ночь)\b", low):
         return "FREQ=DAILY", [match.span()]
     if match := re.search(rf"\bкаждые\s+({NUMBER})\s+(?:дн|день|дня)\w*", low):
         return f"FREQ=DAILY;INTERVAL={_number(match.group(1))}", [match.span()]
     if match := re.search(r"\b(по\s+будн\w*(?:\s+дням)?|каждый\s+будний\s+день|в\s+будни)\b", low):
-        return "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", [match.span()]
+        return f"FREQ=WEEKLY{interval};BYDAY=MO,TU,WE,TH,FR", [match.span(), *([weeks.span()] if weeks else [])]
     if match := re.search(r"\b(по\s+выходным|каждые\s+выходные|каждый\s+выходной)\b", low):
-        return "FREQ=WEEKLY;BYDAY=SA,SU", [match.span()]
+        return f"FREQ=WEEKLY{interval};BYDAY=SA,SU", [match.span(), *([weeks.span()] if weeks else [])]
     weekday_list = rf"(?:{ANY_WEEKDAY})(?:\s*(?:,|и)\s*(?:{ANY_WEEKDAY}))*"
     # "раз в две недели", "каждые 2 нед." — alone, or with the days anywhere in the message: "раз в две недели по чт"
     weeks = re.search(rf"\b(?:каждые|раз\s+в)\s+({NUMBER})\s+нед\w*\.?", low)
@@ -294,6 +296,26 @@ def _explicit_date(low: str, today: date, earliest: date | None = None) -> tuple
         if day and (match.group(1) or match.group(4)):
             return _month_day(day, today, earliest), match.span()
     return None, None
+
+
+def invalid_explicit_date(text: str, today: date) -> bool:
+    """An impossible stated date must not silently become today's task."""
+    low = text.lower()
+    clock, _, time_spans = parse_time(low)
+    if clock is not None:
+        low = strip_spans(low, time_spans)
+    found, span = _explicit_date(low, today)
+    if span and found is None:
+        return True
+    for match in re.finditer(r"(?<![\d.:])(\d{1,2})[./](\d{1,2})(?:[./](\d{4}|\d{2}))?(?![\d:]|[./]\d)", low):
+        before = low[:match.start()].rstrip()
+        if not match.group(3) and (before.endswith((" в", " к")) or before in ("в", "к")):
+            continue
+        year = int(match.group(3)) if match.group(3) else today.year
+        year += 2000 if year < 100 else 0
+        if _safe_date(year, int(match.group(2)), int(match.group(1))) is None:
+            return True
+    return False
 
 
 def _weekday_date(low: str, today: date) -> tuple[date | None, tuple[int, int] | None]:
@@ -364,6 +386,14 @@ def _series_end(low: str, today: date) -> tuple[date, tuple[int, int]] | None:
         if match.group(1) == "года":
             return date(today.year, 12, 31), match.span()
         return (today.replace(day=1) + relativedelta(months=1)) - timedelta(days=1), match.span()
+    if match := re.search(rf"\b(до|по)\s+({MONTH_FORMS})\b(?:\s+(\d{{4}}))?", low):
+        month = _month(match.group(2))
+        year = int(match.group(3)) if match.group(3) else today.year + (month < today.month or (month == today.month and match.group(1) == "до"))
+        start = _safe_date(year, month, 1)
+        if start:
+            # "до января" ends before January; "по январь" includes January.
+            end = start - timedelta(days=1) if match.group(1) == "до" else start + relativedelta(months=1) - timedelta(days=1)
+            return end, match.span()
     for index, match in enumerate(re.finditer(r"\b(?:до|по)\s+", low)):
         if index >= 20:
             break
@@ -389,6 +419,21 @@ def parse(text: str, now: datetime) -> Parsed:
         result.rrule += f";UNTIL={until:%Y%m%d}T235959Z"
         result.spans.append(span)
         low = low[: span[0]] + " " * (span[1] - span[0]) + low[span[1]:]
+
+    relative = re.search(r"\b(?:через\s+полтора\s+часа|in\s+(?:an?\s+)?hour\s+and\s+a\s+half)\b", low)
+    english = re.search(r"\bin\s+(\d+(?:\.\d+)?|an?|one|two|three|half)\s+(minutes?|hours?)\b", low)
+    if relative or english:
+        if relative:
+            minutes, match = 90, relative
+        else:
+            amount = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "half": .5}.get(english.group(1))
+            amount = amount if amount is not None else float(english.group(1))
+            minutes, match = amount * (60 if english.group(2).startswith("hour") else 1), english
+        moment = now + timedelta(minutes=minutes)
+        result.date, result.time = moment.date(), moment.time().replace(second=0, microsecond=0)
+        result.end_time = None
+        result.spans.append(match.span())
+        return result
 
     if match := re.search(rf"\bчерез\s+(?:({NUMBER})\s+)?(полчаса|минут\w*|мин\b|час\w*)", low):
         if match.group(2) == "полчаса":
@@ -525,9 +570,9 @@ def _describe_frequency(parts: dict) -> str:
     if freq == "WEEKLY":
         days = [RRULE_DAYS.index(day) for day in parts.get("BYDAY", "").split(",") if day in RRULE_DAYS]
         if days == [0, 1, 2, 3, 4]:
-            return "по будням"
+            return "по будням" if interval == 1 else f"раз в {interval} нед. по будням"
         if days == [5, 6]:
-            return "по выходным"
+            return "по выходным" if interval == 1 else f"раз в {interval} нед. по выходным"
         names = ("понедельникам", "вторникам", "средам", "четвергам", "пятницам", "субботам", "воскресеньям")
         if interval == 2 and len(days) == 1:
             single = ("каждый второй понедельник", "каждый второй вторник", "каждую вторую среду", "каждый второй четверг",
@@ -538,9 +583,10 @@ def _describe_frequency(parts: dict) -> str:
             return listed if interval == 1 else f"раз в {interval} нед. {listed}"
         return "каждую неделю" if interval == 1 else f"каждые {interval} нед."
     if freq == "MONTHLY":
-        return f"каждый месяц, {parts['BYMONTHDAY']} числа" if parts.get("BYMONTHDAY") else "каждый месяц"
+        base = "каждый месяц" if interval == 1 else f"каждые {interval} мес."
+        return f"{base}, {parts['BYMONTHDAY']} числа" if parts.get("BYMONTHDAY") else base
     if freq == "YEARLY":
-        return "каждый год"
+        return "каждый год" if interval == 1 else f"каждые {interval} г."
     return "повторяется"
 
 
@@ -556,9 +602,9 @@ def _describe_en(parts: dict) -> str:
     elif freq == "WEEKLY":
         days = [RRULE_DAYS.index(day) for day in parts.get("BYDAY", "").split(",") if day in RRULE_DAYS]
         if days == [0, 1, 2, 3, 4]:
-            base = "on weekdays"
+            base = "on weekdays" if interval == 1 else f"every {interval} weeks on weekdays"
         elif days == [5, 6]:
-            base = "on weekends"
+            base = "on weekends" if interval == 1 else f"every {interval} weeks on weekends"
         elif days:
             names = [WEEKDAYS_EN[day] for day in days]
             listed = ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0]
@@ -566,9 +612,11 @@ def _describe_en(parts: dict) -> str:
         else:
             base = "every week" if interval == 1 else f"every {interval} weeks"
     elif freq == "MONTHLY":
-        base = f"every month on day {parts['BYMONTHDAY']}" if parts.get("BYMONTHDAY") else "every month"
+        base = "every month" if interval == 1 else f"every {interval} months"
+        if parts.get("BYMONTHDAY"):
+            base += f" on day {parts['BYMONTHDAY']}"
     elif freq == "YEARLY":
-        base = "every year"
+        base = "every year" if interval == 1 else f"every {interval} years"
     if parts.get("COUNT", "").isdigit():
         count = int(parts["COUNT"])
         return f"{base}, {count} {'time' if count == 1 else 'times'}"

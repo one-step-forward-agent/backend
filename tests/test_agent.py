@@ -192,7 +192,8 @@ async def test_agent_creates_several_tasks_in_one_draft(client, user, agent):
         ]
     )
     reply = await say(client, headers, "завтра в 15 созвон с командой на час и купить хлеб")
-    assert reply["kind"] == "proposal" and reply["answer"] == "Добавлю 2 задачи. Проверьте и подтвердите."
+    # At night the app may prefix its explicit warning about the meaning of "tomorrow".
+    assert reply["kind"] == "proposal" and reply["answer"].endswith("Добавлю 2 задачи. Проверьте и подтвердите.")
     assert [(event["title"], event["time"], event["end_time"]) for event in reply["events"]] == [("Созвон с командой", "15:00", "16:00"), ("Купить хлеб", None, None)]
 
 
@@ -317,7 +318,7 @@ def test_look_alike_actions_are_offered_only_when_asked():
     plain = offered("завтра в 15:00 созвон с командой", "")
     assert "create" in plain and "remind" not in plain and "delete" not in plain and "reopen" not in plain
     assert {"remind", "create"} <= offered("напомни помыть посуду через 10 минут", "")
-    assert offered("какие у меня напоминания?", "") == {"reminders", "cancel_reminder", "remind", "ask"}
+    assert offered("какие у меня напоминания?", "") == {"reminders", "cancel_reminder", "remind", "delegate", "friend_tasks", "friend_change", "ask"}
     assert "delete" in offered("удали встречу с Олей", "")
     assert "reopen" in offered("верни отчёт в невыполненные", "")
     # A follow-up keeps the actions of the request it continues
@@ -367,7 +368,7 @@ async def test_an_analysis_the_user_did_not_ask_for_stays_in_the_background(clie
     tomorrow = (datetime.now(TZ).date() + timedelta(days=1)).isoformat()
     agent([act(op("create", events=[{"title": "Созвон", "date": tomorrow, "start_time": "15:00"}]), op("analyze", period="week"))])
     reply = await say(client, headers, "завтра в 15:00 созвон")
-    assert reply["kind"] == "proposal" and reply["answer"] == "Добавлю «Созвон». Проверьте и подтвердите."
+    assert reply["kind"] == "proposal" and reply["answer"].endswith("Добавлю «Созвон». Проверьте и подтвердите.")
     assert not agent.analyses and [item["title"] for item in reply["events"]] == ["Созвон"]
 
 
@@ -402,7 +403,7 @@ async def test_move_everything_to_tomorrow_takes_todays_open_tasks(client, user,
     assert reply["kind"] == "proposal" and len(requests) == 1
     assert {item["event_id"] for item in reply["events"]} == {first, second}
     assert {item["date"] for item in reply["events"]} == {tomorrow.isoformat()}
-    assert reply["answer"] == f"Перенесу 2 задачи на {chat_service.date_day(tomorrow)}. Проверьте и подтвердите."
+    assert reply["answer"].endswith(f"Перенесу 2 задачи на {chat_service.date_day(tomorrow)}. Проверьте и подтвердите.")
     assert finished not in {item["event_id"] for item in reply["events"]} and later not in {item["event_id"] for item in reply["events"]}
 
 

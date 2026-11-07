@@ -20,6 +20,7 @@ from app.core.lang import is_en, tr
 from app.services.ru import MONTHS, WEEKDAYS_ACCUSATIVE, WEEKDAYS_EN, day_month, plural, relative_day, time_range
 
 MAX_LEAD_MINUTES = 7 * 24 * 60
+AT_START_GRACE = timedelta(minutes=5)
 DIGEST_WINDOW = timedelta(hours=6)
 CHECKIN_WINDOW = timedelta(hours=3)
 EVENING_WINDOW = timedelta(hours=3)
@@ -210,7 +211,7 @@ async def queue_for_user(session: AsyncSession, user: User, reminder_settings: R
     """The notifications due for one user now, added to `values`."""
     tz = ZoneInfo(user_timezone(user))
     leads = sorted({minutes for minutes in reminder_settings.lead_times or [] if 0 <= minutes <= MAX_LEAD_MINUTES})
-    conditions = [Event.user_id == user.id, Event.start_at > now, Event.all_day.is_(False), Event.completed_at.is_(None)]
+    conditions = [Event.user_id == user.id, or_(Event.start_at > now, and_(Event.start_at > now - AT_START_GRACE, Event.reminder_minutes == 0)), Event.all_day.is_(False), Event.completed_at.is_(None)]
     conditions.append(
         or_(
             Event.start_at <= now + timedelta(minutes=max(leads, default=0)),
@@ -233,7 +234,8 @@ async def queue_for_user(session: AsyncSession, user: User, reminder_settings: R
                 "dedupe_key": f"reminder:{event.id}:{int(event.start_at.timestamp())}:{minutes}",
                 "text": reminder_text(event, max(0, round((event.start_at - now).total_seconds() / 60)), tz),
                 "scheduled_for": now,
-                "expires_at": event.start_at,
+                "expires_at": event.start_at + AT_START_GRACE if event.reminder_minutes == 0 else event.start_at,
+                "payload": {"explicit_at_start": True} if event.reminder_minutes == 0 else None,
             }
         )
 
@@ -369,7 +371,8 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
         local_time = now.astimezone(ZoneInfo(user_timezone(user))).time()
         # A test and a reminder the user asked for at a set time are sent even in quiet hours
         # A friend's task starting: the friend agreed to that time, like a reminder they set
-        if notification.kind not in ("test", CUSTOM_KIND, "friend_start") and reminder_settings and reminder_settings.quiet_hours_enabled and in_quiet_hours(reminder_settings, local_time):
+        explicit_at_start = notification.kind == "reminder" and (notification.payload or {}).get("explicit_at_start") is True
+        if notification.kind not in ("test", CUSTOM_KIND, "friend_start") and not explicit_at_start and reminder_settings and reminder_settings.quiet_hours_enabled and in_quiet_hours(reminder_settings, local_time):
             continue
         notification.status = NotificationStatus.SENDING
         notification.claimed_at = now

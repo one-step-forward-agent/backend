@@ -2,7 +2,10 @@
 scroll depth come back to the dashboard as analytics."""
 
 import uuid
+import pytest
+from pydantic import ValidationError
 
+from app.api.blog import MAX_BLOCKS, MAX_BLOCK_DEPTH, PostSave
 from tests.test_admin import account
 
 POST = {
@@ -15,6 +18,53 @@ POST = {
     "blocks": [{"id": "a", "type": "heading", "level": 2, "text": "Начните с главного"}, {"id": "b", "type": "paragraph", "text": "Текст"}],
 }
 READER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/130"}
+
+
+def test_nested_lists_and_markdown_survive_validation():
+    blocks = [{"id": "list", "type": "list", "ordered": True, "items": ["**Первый**", "[Второй](https://example.com)"], "children": [
+        {"id": "note", "type": "callout", "variant": "tip", "text": "*Подсказка*", "children": [
+            {"id": "image", "type": "image", "src": "https://example.com/image.png", "alt": "Картинка"},
+        ]},
+    ]}]
+    assert PostSave(**{**POST, "blocks": blocks}).blocks == blocks
+
+
+@pytest.mark.parametrize("blocks", [
+    [{"type": "paragraph", "children": [{"type": "image", "src": "javascript:alert(1)"}]}],
+    [{"type": "paragraph", "children": [{"type": "script"}]}],
+    [{"type": "paragraph", "children": "invalid"}],
+    [{"type": "paragraph", "children": [None]}],
+    [{"type": []}],
+    [{"type": "image", "src": 1}],
+    [{"type": "list", "items": [123]}],
+    [{"type": "list", "items": "invalid"}],
+    [{"type": "list", "ordered": "false", "items": []}],
+    [{"type": "list", "items": ["item"] * (MAX_BLOCKS + 1)}],
+    [{"type": "paragraph", "children": [{"type": "divider"}] * MAX_BLOCKS}],
+])
+def test_nested_blocks_keep_validation_and_resource_limits(blocks):
+    with pytest.raises(ValidationError):
+        PostSave(**{**POST, "blocks": blocks})
+
+
+def test_nested_block_depth_is_bounded():
+    blocks = [{"type": "divider"}]
+    for _ in range(MAX_BLOCK_DEPTH):
+        blocks = [{"type": "paragraph", "children": blocks}]
+    with pytest.raises(ValidationError):
+        PostSave(**{**POST, "blocks": blocks})
+
+
+async def test_nested_list_post_is_saved_and_publicly_readable(client):
+    admin, _ = await account(client, "admin", admin=True)
+    blocks = [{"id": "list", "type": "list", "ordered": False, "items": ["**Первый**", "Второй"], "children": [
+        {"id": "child", "type": "paragraph", "text": "*Вложенный текст*"},
+    ]}]
+    slug = f"nested-{uuid.uuid4().hex[:8]}"
+    response = await client.post("/api/admin/blog/posts", json={**POST, "slug": slug, "status": "published", "blocks": blocks}, headers=admin)
+    assert response.status_code == 201, response.text
+    public = await client.get(f"/api/blog/posts/{slug}")
+    assert public.status_code == 200 and public.json()["blocks"] == blocks
 
 
 async def test_only_admins_write_and_drafts_stay_hidden(client):

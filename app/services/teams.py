@@ -7,16 +7,16 @@ assistant finds the performer among the members by the name they chose when join
 something is missing it asks, offering the full commands as buttons. It also shows the members' load, overdue tasks,
 progress reports and the status of a project, and suggests moving tasks from the busiest to the freest.
 
-Two settings of a team, independent of each other: confirmation (the performer accepts or rejects a task, or it is
-theirs at once) and execution control (at the task's start the performer is asked whether they have begun; the one
-who gave the task hears the answer, or that there was none in 10 minutes), on by default or not, switched per task.
+Assignments from other members require the performer's acceptance. The performer can choose a work day and an
+optional time without changing the original deadline. Self-assignment is accepted by that explicit action.
+Execution control asks whether work has begun and tells the creator; it can be switched per task.
 The performer gets a task in their personal chat and in Telegram (app.services.friends.post); accepted, it goes to
 their calendar, and ticking it there marks it done in the team.
 """
 
 import re
 import secrets
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, func, select
@@ -142,7 +142,7 @@ async def team_view(session: AsyncSession, user: User, team_id: int) -> dict:
         "id": team.id,
         "name": team.name,
         "tag": team.tag,
-        "task_confirm": team.task_confirm,
+        "task_confirm": "required",
         "check_default": team.check_default,
         "me": {"id": me.id, "name": me.name, "role": me.role},
         "members": [
@@ -166,7 +166,8 @@ async def update_team(session: AsyncSession, user: User, team_id: int, values: d
     if values.get("name"):
         team.name = clean_name(values["name"], 100)
     if values.get("task_confirm") in ("required", "auto"):
-        team.task_confirm = values["task_confirm"]
+        # Legacy clients may still submit "auto"; recipients always control acceptance now.
+        team.task_confirm = "required"
     if values.get("check_default") is not None:
         team.check_default = bool(values["check_default"])
     await session.commit()
@@ -405,6 +406,7 @@ def task_view(task: TeamTask, people: dict[int, TeamMember], project_names: dict
         "assignee": assignee.name if assignee else None,
         "deadline_at": task.deadline_at.astimezone(tz).isoformat() if task.deadline_at else None,
         "start_at": task.start_at.astimezone(tz).isoformat() if task.start_at else None,
+        "scheduled_day": task.scheduled_day.isoformat() if task.scheduled_day else None,
         "status": task.status,
         "confirm": task.confirm,
         "check": task.check_enabled,
@@ -415,7 +417,7 @@ def task_view(task: TeamTask, people: dict[int, TeamMember], project_names: dict
 
 
 async def team_tasks(session: AsyncSession, user: User, team_id: int, assignee: int | None = None, project: int | None = None) -> list[dict]:
-    team, _ = await member_of(session, user, team_id)
+    team, me = await member_of(session, user, team_id)
     query = select(TeamTask).where(TeamTask.team_id == team.id)
     if assignee:
         query = query.where(TeamTask.assignee_id == assignee)
@@ -425,7 +427,7 @@ async def team_tasks(session: AsyncSession, user: User, team_id: int, assignee: 
     people = {person.id: person for person in await members(session, team.id)}
     names = dict((await session.execute(select(Project.id, Project.name).where(Project.team_id == team.id))).all())
     now = datetime.now(timezone.utc)
-    return [task_view(task, people, names, tasks.local_tz(user), now) for task in rows]
+    return [{**task_view(task, people, names, tasks.local_tz(user), now), "can_manage": task.created_by == user.id or me.role == "admin", "calendar_event_id": task.event_id if task.assignee_id == me.id and task.confirm == "accepted" else None} for task in rows]
 
 
 async def create_task(
@@ -466,12 +468,13 @@ async def create_task(
 
 
 async def assign(session: AsyncSession, team: Team, task: TeamTask, assignee: TeamMember, by: User) -> None:
-    """The performer hears of the task in their chat and Telegram; with automatic acceptance it is in their calendar at once."""
+    """Notify the performer; another member's assignment waits for their acceptance."""
     task.assignee_id = assignee.id
     task.check_state = None
     performer = await session.get(User, assignee.user_id)
     giver = await giver_name(session, team.id, by.id)
-    if assignee.user_id == by.id or team.task_confirm == "auto":
+    task.scheduled_day = None
+    if assignee.user_id == by.id:
         task.confirm = "accepted"
         await to_calendar(session, task, team, performer)
         if assignee.user_id != by.id:
@@ -487,11 +490,13 @@ async def giver_name(session: AsyncSession, team_id: int, user_id: int | None) -
 
 
 async def to_calendar(session: AsyncSession, task: TeamTask, team: Team, performer: User) -> None:
-    """The accepted task in the performer's calendar: at its start, else on its deadline's day, else today."""
+    """The accepted task on its chosen untimed day, at its start, or on the deadline's day."""
     if task.event_id and await session.get(Event, task.event_id):
         return
     tz = tasks.local_tz(performer)
-    if task.start_at:
+    if task.scheduled_day:
+        item = {"date": task.scheduled_day.isoformat(), "time": None}
+    elif task.start_at:
         start = task.start_at.astimezone(tz)
         item = {"date": start.date().isoformat(), "time": f"{start:%H:%M}"}
     else:
@@ -547,6 +552,8 @@ def task_card(task: TeamTask, team: Team, viewer: User, other: str, event: str, 
         lines.append(task.description[:300])
     if task.start_at:
         lines.append(f"🕒 {tr('Начало', 'Start')}: {moment_label(task.start_at, tz)}")
+    if task.scheduled_day:
+        lines.append(tr(f"📅 Запланировано: {task.scheduled_day.isoformat()}, без времени", f"📅 Scheduled: {task.scheduled_day.isoformat()}, no set time"))
     if task.deadline_at:
         lines.append(f"⏳ {tr('Срок', 'Due')}: {moment_label(task.deadline_at, tz)}")
     if event in LIVE_TASK_EVENTS and event != "ask":
@@ -578,6 +585,9 @@ def task_card(task: TeamTask, team: Team, viewer: User, other: str, event: str, 
         "check": task.check_enabled,
         "check_state": task.check_state,
         "actions": task_actions(task, role, event, now),
+        "start_at": task.start_at.astimezone(tz).isoformat() if task.start_at else None,
+        "deadline_at": task.deadline_at.astimezone(tz).isoformat() if task.deadline_at else None,
+        "scheduled_day": task.scheduled_day.isoformat() if task.scheduled_day else None,
         "text": "\n".join(lines),
     }
 
@@ -587,10 +597,10 @@ async def card_for(session: AsyncSession, task: TeamTask, viewer: User, event: s
     assignee = await session.get(TeamMember, task.assignee_id) if task.assignee_id else None
     giver = await giver_name(session, team.id, task.created_by)
     other = giver if event in ("assigned", "auto", "ask") else assignee.name if assignee else ""
-    return task_card(task, team, viewer, other, event, assignee.name if assignee else None)
+    return {**task_card(task, team, viewer, other, event, assignee.name if assignee else None), "calendar_event_id": task.event_id if assignee and assignee.user_id == viewer.id and task.confirm == "accepted" else None}
 
 
-async def act(session: AsyncSession, user: User, task_id: int, action: str) -> dict:
+async def act(session: AsyncSession, user: User, task_id: int, action: str, accept_day: date | None = None, accept_time: time | None = None, accept_offset: int | None = None) -> dict:
     """A button under a team task: the performer's accept / reject / start / done, the giver's check_on / check_off."""
     task = await session.get(TeamTask, task_id, with_for_update=True)
     if not task:
@@ -612,6 +622,19 @@ async def act(session: AsyncSession, user: User, task_id: int, action: str) -> d
     if action in ("accept", "reject"):
         if task.confirm != "pending":
             raise TeamError(tr("Вы уже ответили на эту задачу", "You have already answered this task"))
+        if action == "accept" and accept_offset is not None:
+            accept_day = datetime.now(tasks.local_tz(user)).date() + timedelta(days=accept_offset)
+        if action == "accept" and accept_day is not None:
+            tz = tasks.local_tz(user)
+            if accept_day < datetime.now(tz).date():
+                raise TeamError(tr("Выберите сегодняшний или будущий день", "Choose today or a future day"))
+            if accept_time is not None:
+                chosen = datetime.combine(accept_day, accept_time, tz)
+                if chosen <= datetime.now(tz):
+                    raise TeamError(tr("Это время уже прошло", "This time has already passed"))
+                task.start_at, task.scheduled_day = chosen, None
+            else:
+                task.start_at, task.scheduled_day = None, accept_day
         task.confirm = "accepted" if action == "accept" else "rejected"
         if action == "accept":
             await to_calendar(session, task, team, user)
@@ -619,6 +642,8 @@ async def act(session: AsyncSession, user: User, task_id: int, action: str) -> d
         await session.commit()
         return await card_for(session, task, user, "assigned")
     if action == "start":
+        if task.confirm != "accepted":
+            raise TeamError(tr("Сначала примите задачу", "Accept the task first"))
         if task.check_state == CheckState.STARTED:
             raise TeamError(tr("Начало уже отмечено", "The start is already confirmed"))
         task.check_state = CheckState.STARTED
@@ -645,6 +670,8 @@ async def set_status(session: AsyncSession, user: User, task: TeamTask, status: 
     """Done or back to work: the copy in the performer's calendar is ticked too, and the giver hears it is done."""
     if status not in (TeamTaskStatus.TODO, TeamTaskStatus.IN_PROGRESS, TeamTaskStatus.DONE) or status == task.status:
         return
+    if task.assignee_id and task.confirm != "accepted" and status != TeamTaskStatus.TODO:
+        raise TeamError(tr("Сначала исполнитель должен принять задачу", "The performer must accept the task first"))
     was_done = task.status == TeamTaskStatus.DONE
     task.status = status
     task.completed_at = datetime.now(timezone.utc) if status == TeamTaskStatus.DONE else None
@@ -670,11 +697,27 @@ async def event_completed(session: AsyncSession, event: Event) -> None:
     await set_status(session, user, task, status)
 
 
+async def clear_calendar_copy(session: AsyncSession, task: TeamTask) -> None:
+    if task.event_id:
+        event = await session.get(Event, task.event_id)
+        if event:
+            from app.services.events import delete_from_calendars
+
+            await delete_from_calendars(session, event.user_id, [event])
+            await session.delete(event)
+        task.event_id = None
+
+
 async def update_task(session: AsyncSession, user: User, team_id: int, task_id: int, values: dict) -> dict:
     team, me = await member_of(session, user, team_id)
     task = await session.get(TeamTask, task_id)
     if not task or task.team_id != team.id:
         raise LookupError(tr("Задача не найдена", "Task not found"))
+    manager = task.created_by == user.id or me.role == "admin"
+    if set(values) - {"status"} and not manager:
+        raise PermissionError(tr("Изменять поручение может автор или администратор", "Only the creator or an admin can edit the assignment"))
+    if "status" in values and not manager and task.assignee_id != me.id:
+        raise PermissionError(tr("Статус меняет исполнитель задачи", "Only the performer can change this task's status"))
     for key in ("title", "description", "deadline_at", "start_at", "project_id", "check_enabled"):
         if key in values:
             value = values[key]
@@ -687,12 +730,13 @@ async def update_task(session: AsyncSession, user: User, team_id: int, task_id: 
             setattr(task, key, value)
     if "assignee_id" in values and values["assignee_id"] != task.assignee_id:
         if values["assignee_id"] is None:
+            await clear_calendar_copy(session, task)
             task.assignee_id, task.confirm = None, None
         else:
             assignee = await session.get(TeamMember, values["assignee_id"])
             if not assignee or assignee.team_id != team.id:
                 raise LookupError(tr("Участник не найден", "Member not found"))
-            task.event_id = None
+            await clear_calendar_copy(session, task)
             await assign(session, team, task, assignee, user)
     if values.get("status"):
         await set_status(session, user, task, values["status"])
@@ -709,6 +753,7 @@ async def delete_task(session: AsyncSession, user: User, team_id: int, task_id: 
         raise LookupError(tr("Задача не найдена", "Task not found"))
     if task.created_by != user.id and me.role != "admin":
         raise PermissionError(tr("Удалить задачу может тот, кто её поставил, или администратор", "Only whoever set the task or an admin can delete it"))
+    await clear_calendar_copy(session, task)
     await session.delete(task)
     await session.commit()
 
@@ -877,11 +922,19 @@ async def assistant(session: AsyncSession, user: User, team: Team, text: str) ->
     now = datetime.now(tz)
     people = await members(session, team.id)
     text = text.strip()
+    from app.services import planning_scope
+
+    scoped = await planning_scope.reschedule(session, user, text, tz, team_id=team.id)
+    if scoped is not None:
+        return scoped
     if match := REASSIGN.match(text):
         return await reassign_by_words(session, user, team, people, match.group("title"), match.group("rest"))
     request = parse_assignment(text, people, now)
     if request is not None:
         return await assign_by_words(session, user, team, people, request, now)
+    # A task can contain "report"; classify assignment paraphrases before report keywords.
+    if re.match(r"^\s*(?:пусть|пускай|нужно\s+чтобы|хочу\s+чтобы|could\s+you\s+ask|please\s+ask|have)\b", text, re.I):
+        return await free_answer(session, user, team, people, text, tz)
     if MY_TASKS.match(text):
         return await member_tasks_reply(session, team, next(person for person in people if person.user_id == user.id), tz)
     if REBALANCE.search(text):
@@ -1099,6 +1152,13 @@ HELP_EN = (
 
 async def free_answer(session: AsyncSession, user: User, team: Team, people: list[TeamMember], text: str, tz: ZoneInfo) -> dict:
     """A question the rules do not cover: the model answers from the team's data, or the help when it cannot."""
+    if settings.llm_enabled and settings.assistant_agent:
+        from app.services import agent
+
+        try:
+            return await agent.run(session, user, text, tz, team_scope=team.id)
+        except agent.AgentFailed:
+            pass
     if settings.llm_enabled:
         from services.gigachat import GigaChatClient
 

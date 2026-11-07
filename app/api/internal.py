@@ -31,6 +31,7 @@ from app.schemas import (
     MoveToDayRequest,
     ReminderSettingsRead,
     ReminderSettingsUpdate,
+    TeamTaskAcceptance,
 )
 from app.services import chat, reminders, tasks, usage
 from app.services.integrations.service import user_timezone
@@ -351,14 +352,14 @@ async def friend_invite_answer(chat_id: int, friend_id: int, decision: Literal["
 
 @router.post("/chat/{chat_id}/team-tasks/{task_id}/{action}")
 async def team_task_action(
-    chat_id: int, task_id: int, action: Literal["accept", "reject", "start", "done", "check_on", "check_off"], session: AsyncSession = Depends(get_session)
+    chat_id: int, task_id: int, action: Literal["accept", "reject", "start", "done", "check_on", "check_off"], payload: TeamTaskAcceptance | None = None, session: AsyncSession = Depends(get_session)
 ):
     """A button under a team's task in Telegram: the card comes back as it is now."""
     from app.services import teams
 
     user = await _user_by_chat(session, chat_id)
     try:
-        return await teams.act(session, user, task_id, action)
+        return await teams.act(session, user, task_id, action, payload.day if payload else None, payload.start_time if payload else None, payload.day_offset if payload else None)
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from None
     except teams.TeamError as error:

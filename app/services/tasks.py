@@ -33,6 +33,29 @@ def local_tz(user: User) -> ZoneInfo:
     return ZoneInfo(user_timezone(user))
 
 
+async def assigned_origins(session: AsyncSession, user: User, events: list[Event]) -> dict[int, dict]:
+    """Identify calendar copies assigned to this user; exclude reminders and self-created tasks."""
+    from app.models.models import FriendTask, Friendship, Project, Team, TeamMember, TeamTask
+
+    ids = [event.id for event in events]
+    if not ids:
+        return {}
+    from app.services import friends
+
+    found = {}
+    rows = await session.execute(select(FriendTask, User, Friendship).join(User, User.id == FriendTask.sender_id).outerjoin(Friendship, (Friendship.user_id == user.id) & (Friendship.friend_id == FriendTask.sender_id)).where(
+        FriendTask.performer_id == user.id, FriendTask.sender_id != user.id, FriendTask.is_reminder.is_(False), FriendTask.performer_event_id.in_(ids)))
+    for task, sender, relationship in rows:
+        found[task.performer_event_id] = {"kind": "friend", "task_id": task.id, "friend_id": sender.id, "friend_name": friends.display_name(relationship, sender)}
+    rows = await session.execute(select(TeamTask, Team, Project).join(TeamMember, TeamMember.id == TeamTask.assignee_id).join(Team, Team.id == TeamTask.team_id).outerjoin(Project, (Project.id == TeamTask.project_id) & (Project.team_id == TeamTask.team_id)).where(
+        TeamMember.user_id == user.id, TeamTask.event_id.in_(ids),
+        (TeamTask.created_by.is_(None)) | (TeamTask.created_by != user.id),
+    ))
+    for task, team, project in rows:
+        found[task.event_id] = {"kind": "team", "task_id": task.id, "team_id": task.team_id, "team_name": team.name, "project_id": project.id if project else None, "project_name": project.name if project else None}
+    return found
+
+
 def event_bounds(
     day: date, start: time | None, end: time | None, tz: ZoneInfo, end_day: date | None = None
 ) -> tuple[datetime, datetime, bool]:
@@ -509,10 +532,28 @@ async def move_events(session: AsyncSession, user: User, event_ids: list[int], t
         duration = event.end_at - event.start_at
         event.start_at = datetime.combine(target, local_start.time(), tz)
         event.end_at = event.start_at + duration
+        await sync_assignment_schedule(session, user, event)
         event.sync_status = "pending" if event.external_id else event.sync_status
     await session.commit()
     await push_changes(session, user.id, events)
     return len(events)
+
+
+async def sync_assignment_schedule(session: AsyncSession, user: User, event: Event) -> None:
+    """Keep accepted assignments' work schedule in step with the performer's calendar."""
+    from app.models.models import FriendTask, TeamMember, TeamTask
+
+    task = await session.scalar(select(TeamTask).join(TeamMember, TeamMember.id == TeamTask.assignee_id).where(TeamTask.event_id == event.id, TeamMember.user_id == user.id, TeamTask.confirm == "accepted"))
+    if task:
+        task.start_at = None if event.all_day else event.start_at
+        task.scheduled_day = event.start_at.astimezone(local_tz(user)).date() if event.all_day else None
+        task.asked_at = None
+        task.check_state = None
+    friend_task = await session.scalar(select(FriendTask).where(FriendTask.performer_event_id == event.id, FriendTask.performer_id == user.id, FriendTask.status == "accepted", FriendTask.is_reminder.is_(False)))
+    if friend_task:
+        friend_task.start_at, friend_task.end_at, friend_task.all_day = event.start_at, event.end_at, event.all_day
+        friend_task.asked_at = None
+        friend_task.check_state = None
 
 
 def task_view(event: Event, tz: ZoneInfo) -> dict:

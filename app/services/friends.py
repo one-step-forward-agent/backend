@@ -366,7 +366,7 @@ def actions(task: FriendTask, role: str, event: str, now: datetime) -> list[str]
         if event == "ask":
             return ["start"] if task.check_state in (CheckState.ASKED, CheckState.MISSED) else []
         return ["accept", "reject"] if task.status == FriendTaskStatus.PENDING else []
-    found = ["cancel"] if task.status == FriendTaskStatus.PENDING else []
+    found = ["cancel"] if task.status == FriendTaskStatus.PENDING or (task.status == FriendTaskStatus.ACCEPTED and (task.end_at if task.all_day else task.start_at) > now) else []
     if can_toggle_check(task, now):
         found.append("check_off" if task.check_enabled else "check_on")
     return found
@@ -395,6 +395,7 @@ def task_card(task: FriendTask, viewer: User, friend: str, event: str, tz: ZoneI
     return {
         "kind": TASK_CARD,
         "task_id": task.id,
+        "calendar_event_id": task.performer_event_id if viewer.id == task.performer_id and not task.is_reminder and task.status == FriendTaskStatus.ACCEPTED else None,
         "event": event,
         "role": role,
         "friend": friend,
@@ -486,6 +487,7 @@ RU_VERB = r"добавь|добавьте|поручи|поручите|попр
 EN_VERB = r"add|ask|assign|give|send|tell|plan|schedule|put"
 LEAD = re.compile(rf"^\s*(?:(?:пожалуйста|please|deyla|дейла)[\s,]+)?(?:{RU_VERB}|{EN_VERB})\b[\s,:]*", re.I)
 REMIND_LEAD = re.compile(r"^\s*(?:(?:пожалуйста|please|deyla|дейла)[\s,]+)?(?:напомни|напомните|remind)\b[\s,:]*", re.I)
+REMINDER_NOUN = re.compile(r"^\s*(?:(?:a|an)\s+)?(?:напоминание|reminder)\b[\s,:]*", re.I)
 # "задачу для Маши", "a task for Masha"
 TASK_WORDS = re.compile(r"^(?:(?:новую|новое|общую|совместную|a|an|new|shared|joint)\s+)?(?:задачу|задание|дело|встречу|task|to-?do|job)?\s*(?:для|for)?\s+", re.I)
 # What may stand between the name and the task: "Маше: купить", "Маше, чтобы купила", "Masha to buy"
@@ -530,8 +532,12 @@ def task_from_words(words: str, now: datetime) -> dict | None:
     the first time counts."""
     from app.services import chat
 
+    if dates.invalid_explicit_date(words, now.date()):
+        raise FriendError(tr("Такой даты нет. Укажите корректный день.", "That date does not exist. Please provide a valid day."))
     day, rest = english_day(words, now.date())
     parsed = dates.parse(rest, now)
+    if parsed.rrule or re.search(r"\b(?:every\s+(?:day|weekday|week|month|monday|tuesday|wednesday|thursday|friday)|daily|weekly|monthly)\b", rest, re.I):
+        raise FriendError(tr("Повторяющиеся поручения друзьям пока не поддерживаются. Укажите конкретный день для разового поручения.", "Recurring assignments to friends are not supported yet. Choose a specific day for a one-time assignment."))
     if day and not parsed.date:
         parsed.date = day
     title = chat.clean_title(dates.strip_spans(rest, parsed.spans))
@@ -553,6 +559,23 @@ def find_named(words: list[str], friends: list[tuple[Friendship, User]]) -> tupl
     return [(row, friend) for score, row, friend in scored if score == best], best
 
 
+async def may_address_someone_else(session: AsyncSession, user: User, text: str) -> bool:
+    """Conservative outage guard: a named person's request must not become a personal reminder."""
+    if re.search(r"\b(?:напомни(?:те)?|remind)\s+(?:мне|нам|me)\b", text, re.I):
+        return False
+    words = re.findall(r"[\w'-]+", text)
+    pals = await accepted(session, user)
+    if any(find_named(words[index:], pals)[0] for index in range(len(words))):
+        return True
+    # An unknown, explicitly named recipient also needs clarification during an outage.
+    lead = REMIND_LEAD.match(text)
+    if lead:
+        tail = text[lead.end():].strip()
+        first = tail.split(maxsplit=1)[0] if tail else ""
+        return bool(first and first[0].isupper())
+    return False
+
+
 def parse_request(text: str, friends: list[tuple[Friendship, User]]) -> dict | None:
     """{"friends": [...], "words": the task, "shared": bool, "check": True/False/None}, or None when the message does not
     give a friend a task."""
@@ -562,13 +585,17 @@ def parse_request(text: str, friends: list[tuple[Friendship, User]]) -> dict | N
         return None
     if reminder:
         # "Напомни Маше завтра в 9 позвонить врачу", "напомни Маше, чтобы позвонила": a friend named right after the verb
-        rest = text[lead.end() :].strip()
+        rest = re.sub(r"^(?:моему\s+другу|моей\s+подруге|другу|подруге|my\s+friend)\s+", "", text[lead.end() :].strip(), flags=re.I)
         named, used = find_named(rest.split(), friends)
         if not named:
             return None
         after = rest.split(None, used)[used] if len(rest.split()) > used else ""
         return {"friends": named, "words": CONNECTOR.sub("", after, count=1).strip(), "shared": False, "check": False, "reminder": True}
     rest = text[lead.end() :]
+    noun_reminder = bool(REMINDER_NOUN.match(rest))
+    if noun_reminder:
+        rest = REMINDER_NOUN.sub("", rest, count=1)
+        rest = re.sub(r"^(?:для|for|to)\s+", "", rest, flags=re.I)
     check = None
     if CHECK_OFF.search(rest):
         check, rest = False, CHECK_OFF.sub(" ", rest)
@@ -587,7 +614,9 @@ def parse_request(text: str, friends: list[tuple[Friendship, User]]) -> dict | N
     named, used = find_named(words, friends)
     if named:
         after = rest.split(None, used)[used] if len(words) > used else ""
-        return {"friends": named, "words": CONNECTOR.sub("", after, count=1).strip(), "shared": False, "check": check}
+        after = CONNECTOR.sub("", after, count=1).strip()
+        reminder = noun_reminder or bool(REMINDER_NOUN.match(after))
+        return {"friends": named, "words": REMINDER_NOUN.sub("", after, count=1).strip() if reminder else after, "shared": False, "check": False if reminder else check, "reminder": reminder}
     # "assign buy bread to Masha", "отправь купить хлеб для Маши"
     if tail := re.search(r"\s(?:to|for|для)\s+(?P<name>[\w'-]+(?:\s+[\w'-]+)?)\s*[.!]?\s*$", " " + rest, re.I):
         named, used = find_named(tail.group("name").split(), friends)
@@ -608,7 +637,7 @@ async def delegate_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
     """The chat's "добавь Маше …": a reply, or None when the message is not about a friend."""
     from app.services import chat
 
-    if len(text) > chat.LOCAL_TEXT_LIMIT or "\n" in text.strip() or not (LEAD.match(text) or REMIND_LEAD.match(text)) or chat.is_question(text):
+    if len(text) > chat.LOCAL_TEXT_LIMIT or not (LEAD.match(text) or REMIND_LEAD.match(text)):
         return None
     friends = await accepted(session, user)
     request = parse_request(text, friends)
@@ -623,6 +652,9 @@ async def delegate_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
                 f"Several friends match this name: {names}. Write the full name or rename a friend in Friends.",
             ),
         }
+    for match in re.finditer(r"(?:^|[,;]\s*|\s)(?:и|а|and)\s+(.+)", request["words"], re.I):
+        if find_named(match.group(1).split(), friends)[0]:
+            return {"kind": "answer", "text": tr("Пока могу подготовить одно поручение за раз. Напишите отдельный запрос для каждого получателя и дела.", "I can prepare one assignment at a time. Send a separate request for each recipient and task.")}
     row, friend = request["friends"][0]
     name = display_name(row, friend)
     now = datetime.now(tz)
@@ -645,6 +677,102 @@ async def delegate_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
             }
         return await send_drafts.friend_reminder(session, user, friend, name, item["title"], start)
     return await send_drafts.friend_task(session, user, friend, name, item["title"], start, end, all_day, request["shared"], request["check"])
+
+
+async def task_list(session: AsyncSession, user: User, friend_id: int, first: date, last: date) -> list[dict]:
+    """Only tasks exchanged by these two people; never the friend's private calendar."""
+    if last < first or (last - first).days > 366 or first <= date.min + timedelta(days=1) or last >= date.max - timedelta(days=2):
+        raise FriendError(tr("Выберите период до года", "Choose a period of up to a year"))
+    mine, _ = await pair(session, user.id, friend_id)
+    other = await session.get(User, friend_id)
+    if not mine or mine.status != FriendStatus.ACCEPTED or not other:
+        raise LookupError(tr("Такого друга нет", "No such friend"))
+    tz = tasks.local_tz(user)
+    rows = await session.scalars(select(FriendTask).where(
+        or_((FriendTask.sender_id == user.id) & (FriendTask.performer_id == friend_id),
+            (FriendTask.sender_id == friend_id) & (FriendTask.performer_id == user.id)),
+        FriendTask.start_at < datetime.combine(last + timedelta(days=2), time.min, tz),
+        FriendTask.end_at > datetime.combine(first - timedelta(days=1), time.min, tz),
+    ).order_by(FriendTask.start_at, FriendTask.id))
+    result = []
+    now = datetime.now(timezone.utc)
+    for task in rows:
+        sent = task.sender_id == user.id
+        event = ("reminder_sent" if sent else "reminder") if task.is_reminder else ("sent" if sent else "request")
+        sender_tz = tasks.local_tz(user if sent else other)
+        card = task_card(task, user, display_name(mine, other), event, tz, sender_tz)
+        # A day without a time keeps the sender's intended date in every viewer's calendar.
+        start, end = task.start_at.astimezone(tz), task.end_at.astimezone(tz)
+        if task.all_day:
+            start = datetime.combine(task.start_at.astimezone(sender_tz).date(), time.min, tz)
+            end = datetime.combine(task.end_at.astimezone(sender_tz).date(), time.min, tz)
+        if start >= datetime.combine(last + timedelta(days=1), time.min, tz) or end <= datetime.combine(first, time.min, tz):
+            continue
+        result.append({**card, "start": start.isoformat(), "end": end.isoformat(),
+                       "can_edit": sent and task.status in (FriendTaskStatus.PENDING, FriendTaskStatus.ACCEPTED) and (task.end_at if task.all_day else task.start_at) > now})
+    return result
+
+
+async def create_task_draft(session: AsyncSession, user: User, friend_id: int, title: str, day: date, clock: time | None, reminder: bool = False, shared: bool = False, check: bool | None = None) -> dict:
+    from app.services import send_drafts
+
+    mine, theirs = await pair(session, user.id, friend_id)
+    other = await session.get(User, friend_id)
+    if not mine or not theirs or not other or mine.status != FriendStatus.ACCEPTED or theirs.status != FriendStatus.ACCEPTED:
+        raise LookupError(tr("Такого друга нет", "No such friend"))
+    start, end, all_day = tasks.event_bounds(day, clock, None, tasks.local_tz(user))
+    if (end if all_day else start) <= datetime.now(timezone.utc) or (reminder and all_day):
+        raise FriendError(tr("Укажите будущее время", "Choose a future time"))
+    name = display_name(mine, other)
+    if reminder:
+        result = await send_drafts.friend_reminder(session, user, other, name, title.strip(), start)
+    else:
+        result = await send_drafts.friend_task(session, user, other, name, title.strip(), start, end, all_day, shared, check)
+    await session.commit()
+    return result
+
+
+async def clear_events(session: AsyncSession, task: FriendTask) -> None:
+    from app.models.models import Event
+    from app.services.events import delete_from_calendars
+
+    for field, owner_id in (("performer_event_id", task.performer_id), ("sender_event_id", task.sender_id)):
+        event_id = getattr(task, field)
+        if event_id:
+            event = await session.get(Event, event_id)
+            if event and event.user_id == owner_id:
+                await delete_from_calendars(session, owner_id, [event])
+                await session.delete(event)
+            setattr(task, field, None)
+
+
+async def edit_task(session: AsyncSession, user: User, task_id: int, title: str, day: date, clock: time | None) -> dict:
+    task = await own_task(session, user, task_id)
+    if task.sender_id != user.id:
+        raise LookupError(tr("Задача не найдена", "Task not found"))
+    if task.status not in (FriendTaskStatus.PENDING, FriendTaskStatus.ACCEPTED) or (task.end_at if task.all_day else task.start_at) <= datetime.now(timezone.utc):
+        raise FriendError(tr("Эту задачу уже нельзя изменить", "This task can no longer be edited"))
+    mine, theirs = await pair(session, user.id, task.performer_id)
+    if not mine or not theirs or mine.status != FriendStatus.ACCEPTED or theirs.status != FriendStatus.ACCEPTED:
+        raise FriendError(tr("Вы больше не друзья", "You are no longer friends"))
+    if task.is_reminder and clock is None:
+        raise FriendError(tr("Укажите время напоминания", "Set a reminder time"))
+    start, end, all_day = tasks.event_bounds(day, clock, None, tasks.local_tz(user))
+    if all_day == task.all_day:
+        end = start + (task.end_at - task.start_at)
+    if (end if all_day else start) <= datetime.now(timezone.utc):
+        raise FriendError(tr("Это время уже прошло", "This time has already passed"))
+    await clear_events(session, task)
+    task.title, task.start_at, task.end_at, task.all_day = title.strip(), start, end, all_day
+    task.status, task.responded_at = FriendTaskStatus.PENDING, None
+    task.check_state, task.asked_at, task.started_at = None, None, None
+    performer = await session.get(User, task.performer_id)
+    if task.is_reminder or theirs.auto_accept:
+        await accept(session, task, user, performer)
+    # Changed accepted tasks ask for consent again, unless the recipient opted into auto-accept.
+    await post(session, performer, lambda: task_card(task, performer, display_name(theirs, user), "reminder" if task.is_reminder else "request", tasks.local_tz(performer), tasks.local_tz(user)), f"{task.id}:edit:{datetime.now(timezone.utc).isoformat()}")
+    await session.commit()
+    return task_card(task, user, display_name(mine, performer), "reminder_sent" if task.is_reminder else "sent", tasks.local_tz(user))
 
 
 async def delegate(
@@ -833,15 +961,18 @@ async def act(session: AsyncSession, user: User, task_id: int, action: str) -> d
     if action == "cancel" and task.is_reminder:
         if task.status != FriendTaskStatus.ACCEPTED or task.start_at <= now:
             raise FriendError(tr("Напоминание уже нельзя отменить", "The reminder can't be cancelled now"))
-        await cancel_reminder(session, task)
+        await clear_events(session, task)
+        task.status, task.responded_at = FriendTaskStatus.CANCELLED, now
         await post(session, performer, lambda: task_card(task, performer, to_performer, "reminder_cancelled", performer_tz, sender_tz), f"{task.id}:reminder_cancelled")
         await session.commit()
         return task_card(task, sender, to_sender, "reminder_sent", sender_tz)
     if action == "cancel":
-        if task.status != FriendTaskStatus.PENDING:
+        if task.status not in (FriendTaskStatus.PENDING, FriendTaskStatus.ACCEPTED) or (task.status == FriendTaskStatus.ACCEPTED and (task.end_at if task.all_day else task.start_at) <= now):
             raise FriendError(already(task))
+        await clear_events(session, task)
         task.status = FriendTaskStatus.CANCELLED
         task.responded_at = now
+        await post(session, performer, lambda: task_card(task, performer, to_performer, "request", performer_tz, sender_tz), f"{task.id}:cancelled")
     elif action in ("check_on", "check_off"):
         if not can_toggle_check(task, now):
             raise FriendError(tr("Контроль уже не изменить: задача началась или закончилась", "The check can't be changed now: the task has started or ended"))

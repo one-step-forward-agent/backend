@@ -139,8 +139,8 @@ async def test_a_task_is_accepted_and_goes_to_the_friends_calendar_only(client):
     assert not await events_of(masha["id"])
     news = (await cards(client, masha))[-1]
     assert news["event"] == "accepted" and "Олег" in news["text"]
-    # The sender's first card follows: no cancel any more, the check can still be switched
-    assert [card for card in await cards(client, masha) if card["event"] == "sent"][0]["actions"] == ["check_off"]
+    # The sender may withdraw a future accepted task as well as toggle its check.
+    assert [card for card in await cards(client, masha) if card["event"] == "sent"][0]["actions"] == ["cancel", "check_off"]
     again = await client.post(f"/api/friend-tasks/{reply['task_id']}/reject", headers=oleg["headers"])
     assert again.status_code == 409
 

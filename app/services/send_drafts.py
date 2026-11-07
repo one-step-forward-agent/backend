@@ -8,12 +8,13 @@ draft sent in Telegram shows sent on the site too.
 """
 
 from datetime import date, datetime, time, timedelta, timezone
+import re
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.lang import tr
-from app.models.models import FriendStatus, SendDraft, Team, TeamMember, User
+from app.models.models import ConversationMessage, FriendStatus, SendDraft, Team, TeamMember, User
 from app.services import tasks
 from app.services.ru import relative_day
 
@@ -58,6 +59,10 @@ def view(draft: SendDraft, user: User) -> dict:
         FRIEND_REMINDER: tr(f"🔔 Поставить напоминание другу **{to}**?", f"🔔 Set this reminder for **{to}**?"),
         TEAM_TASK: tr(f"📝 Поручить **{to}** в команде {payload.get('team', '')}?", f"📝 Assign to **{to}** in {payload.get('team', '')}?"),
     }[draft.kind]
+    if payload.get("update_task_id"):
+        head = tr(f"📝 Изменить задачу у друга **{to}**?", f"📝 Update the task for **{to}**?")
+        if payload.get("cancel_task"):
+            head = tr(f"🗑 Отменить задачу у друга **{to}**?", f"🗑 Cancel the task for **{to}**?")
     lines = [head, f"**{payload['title'].replace('*', '')}**", f"🕒 {when}"]
     if payload.get("shared"):
         lines.append(tr("👥 Совместная — будет в календарях у обоих", "👥 Shared — goes to both calendars"))
@@ -76,7 +81,8 @@ def view(draft: SendDraft, user: User) -> dict:
         "time": (f"{moment:%H:%M}" if moment and not payload.get("all_day") else None),
         "when": when,
         "status": draft.status,
-        "actions": ["send", "edit", "cancel"] if draft.status == OPEN else [],
+        "actions": (["send", "cancel"] if payload.get("cancel_task") else ["send", "edit", "cancel"]) if draft.status == OPEN else [],
+        "operation": "cancel" if payload.get("cancel_task") else "edit" if payload.get("update_task_id") else "create",
         "text": "\n".join(lines),
     }
 
@@ -86,6 +92,75 @@ async def _create(session: AsyncSession, user: User, kind: str, payload: dict) -
     session.add(draft)
     await session.flush()
     return view(draft, user)
+
+
+async def latest_in_chat(session: AsyncSession, user: User) -> SendDraft | None:
+    message = await session.scalar(select(ConversationMessage).where(
+        ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant",
+        ConversationMessage.hidden_at.is_(None), ConversationMessage.created_at > datetime.now(timezone.utc) - timedelta(hours=6),
+    ).order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc()).limit(1))
+    reply = message.reply if message and isinstance(message.reply, dict) else {}
+    if reply.get("kind") != CARD or not reply.get("draft_id"):
+        return None
+    draft = await session.get(SendDraft, reply["draft_id"], with_for_update=True)
+    return draft if draft and draft.user_id == user.id and draft.status == OPEN else None
+
+
+async def respond_by_rules(session: AsyncSession, user: User, text: str) -> dict | None:
+    cancel_words = r"(?:не\s+надо(?:,?\s+отмени\s+отправку)?|отмени(?:\s+(?:отправку|черновик))?|отмена|cancel(?:\s+(?:it|the\s+draft))?|don'?t\s+send)"
+    send_words = r"(?:(?:да[,\s]+)?(?:отправляй|отправь)|(?:yes[,\s]+)?send(?:\s+it)?)"
+    cancel_match = re.fullmatch(cancel_words + r"[.!\s]*", text.strip(), re.I)
+    send_match = re.fullmatch(send_words + r"[.!\s]*", text.strip(), re.I)
+    if not (cancel_match or send_match):
+        return None
+    draft = await latest_in_chat(session, user)
+    if draft is None:
+        return None
+    if cancel_match:
+        draft.status = CANCELLED
+        await session.flush()
+    result = view(draft, user)
+    if send_match:
+        result["text"] += "\n" + tr("Нажмите «Отправить» под черновиком для подтверждения.", "Press Send below the draft to confirm.")
+    return result
+
+
+async def supersede_correction(session: AsyncSession, user: User, text: str, new_id: int) -> None:
+    if not re.match(r"^\s*(?:нет\b|не\b|лучше\b|вместо\b|измени\b|поменяй\b|actually\b|no\b|instead\b|change\b)", text, re.I):
+        return
+    previous = await latest_in_chat(session, user)
+    if previous and previous.id != new_id:
+        previous.status = CANCELLED
+        await session.flush()
+
+
+async def friend_change(session: AsyncSession, user: User, task_id: int, title: str | None = None, day: date | None = None, clock: time | None = None, untimed: bool = False, cancel_task: bool = False) -> dict:
+    from app.models.models import FriendTaskStatus
+    from app.services import friends
+
+    task = await friends.own_task(session, user, task_id)
+    if task.sender_id != user.id:
+        raise LookupError(tr("Задача не найдена", "Task not found"))
+    if task.status not in (FriendTaskStatus.PENDING, FriendTaskStatus.ACCEPTED):
+        raise DraftError(tr("Эта задача уже обработана", "This task has already been handled"))
+    mine, theirs = await friends.pair(session, user.id, task.performer_id)
+    other = await session.get(User, task.performer_id)
+    if not mine or not theirs or not other or mine.status != FriendStatus.ACCEPTED or theirs.status != FriendStatus.ACCEPTED:
+        raise DraftError(tr("Вы больше не друзья", "You are no longer friends"))
+    tz = tasks.local_tz(user)
+    current = task.start_at.astimezone(tz)
+    first = day or current.date()
+    when = None if untimed or (clock is None and task.all_day) else clock or current.time().replace(tzinfo=None)
+    if task.is_reminder and when is None:
+        raise DraftError(tr("Укажите время напоминания", "Set a reminder time"))
+    start, end, all_day = tasks.event_bounds(first, when, None, tz)
+    if not cancel_task and (end if all_day else start) <= datetime.now(timezone.utc):
+        raise DraftError(tr("Это время уже прошло", "This time has already passed"))
+    payload = {"friend_id": other.id, "to": friends.display_name(mine, other), "title": (title or task.title).strip()[:MAX_TITLE],
+               "start": None if all_day else start.isoformat(), "date": first.isoformat(), "all_day": all_day,
+               "update_task_id": task.id, "cancel_task": cancel_task, "shared": task.shared,
+               "length": int((task.end_at - task.start_at).total_seconds() // 60), "days": 1}
+    return await _create(session, user, FRIEND_REMINDER if task.is_reminder else FRIEND_TASK, payload)
 
 
 # ---------- drafts from the chat ----------
@@ -189,7 +264,17 @@ async def send(session: AsyncSession, user: User, draft_id: int) -> dict:
         mine, theirs = await friends.pair(session, user.id, payload["friend_id"])
         if not friend or not mine or not theirs or mine.status != FriendStatus.ACCEPTED or theirs.status != FriendStatus.ACCEPTED:
             raise DraftError(tr("Вы больше не друзья — отправить нельзя", "You are no longer friends — it can't be sent"))
-        if draft.kind == FRIEND_REMINDER:
+        if payload.get("update_task_id"):
+            task = await friends.own_task(session, user, payload["update_task_id"])
+            if task.sender_id != user.id or task.performer_id != friend.id:
+                raise LookupError(tr("Задача не найдена", "Task not found"))
+            if payload.get("cancel_task"):
+                result = await friends.act(session, user, task.id, "cancel")
+            else:
+                moment = _local(payload.get("start"), tz)
+                result = await friends.edit_task(session, user, task.id, payload["title"], date.fromisoformat(payload["date"]), moment.time().replace(tzinfo=None) if moment else None)
+            draft = await own(session, user, draft_id)
+        elif draft.kind == FRIEND_REMINDER:
             result = await friends.remind(session, user, friend, payload["title"], datetime.fromisoformat(payload["start"]))
         else:
             if payload.get("all_day"):

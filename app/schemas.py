@@ -9,6 +9,20 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 from app.models.models import Priority, Provider, plain_priority
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class TeamTaskAcceptance(BaseModel):
+    day: date | None = None
+    start_time: time | None = None
+    day_offset: int | None = Field(default=None, ge=0, le=366)
+
+    @model_validator(mode="after")
+    def day_for_time(self):
+        if self.day is not None and self.day_offset is not None:
+            raise ValueError("Choose either a date or a relative day")
+        if self.start_time is not None and self.day is None and self.day_offset is None:
+            raise ValueError("Choose a day for the task's time")
+        return self
 MAX_PROFILE_CHARS = 20_000
 
 
@@ -215,6 +229,17 @@ class EventUpdate(BaseModel):
         return None if value is None else Priority(plain_priority(value))
 
 
+class AssignmentOrigin(BaseModel):
+    kind: Literal["friend", "team"]
+    task_id: int
+    team_id: int | None = None
+    team_name: str | None = None
+    project_id: int | None = None
+    project_name: str | None = None
+    friend_id: int | None = None
+    friend_name: str | None = None
+
+
 class EventRead(EventCreate):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -226,6 +251,7 @@ class EventRead(EventCreate):
     external_id: str | None = None
     series_id: str | None = None
     completed_at: datetime | None = None
+    assignment: AssignmentOrigin | None = None
 
     @computed_field
     @property

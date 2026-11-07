@@ -1517,6 +1517,9 @@ def validate_item(raw: dict, now: datetime, originals: dict[int, dict] | None = 
         return None  # a change of an event that is not in this draft
     if item and original:
         item.update(event_id=original["event_id"], before=original.get("before"), rrule=None)
+        for key in ("team_task_id", "team_id", "project_id"):
+            if key in original:
+                item[key] = original[key]
     return item
 
 
@@ -1638,6 +1641,14 @@ async def apply_changes(session: AsyncSession, user: User, items: list[dict], tz
             continue
         event.title = str(item.get("title") or event.title).strip()[:300] or event.title
         event.start_at, event.end_at, event.all_day = start, end, all_day
+        if item.get("team_task_id"):
+            from app.models.models import TeamTask
+
+            team_task = await session.get(TeamTask, item["team_task_id"])
+            team_task.start_at = None if all_day else start
+            team_task.scheduled_day = start.astimezone(tz).date() if all_day else None
+            team_task.asked_at = None
+            team_task.check_state = None
         if isinstance(item.get("tag_ids"), list):
             event.tag_ids = await tasks.owned_tag_ids(session, user, item["tag_ids"])
         if "deadline" in item:
@@ -1657,6 +1668,18 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int, scope:
     tz = tasks.local_tz(user)
     items = list(draft.items)
     calendars = draft.calendars
+    from app.models.models import TeamMember, TeamTask
+
+    for item in items:
+        if not item.get("team_task_id"):
+            continue
+        valid = await session.scalar(select(TeamTask.id).join(TeamMember, TeamMember.id == TeamTask.assignee_id).join(Event, Event.id == TeamTask.event_id).where(
+            TeamTask.id == item["team_task_id"], TeamTask.team_id == item["team_id"], TeamTask.project_id == item.get("project_id"),
+            TeamTask.event_id == item["event_id"], TeamMember.user_id == user.id, Event.user_id == user.id,
+            TeamTask.confirm == "accepted", TeamTask.status != "done", Event.completed_at.is_(None),
+        ))
+        if not valid:
+            return {"kind": "answer", "text": tr("Состав или статус задач изменился. Запросите перенос заново — ничего не изменено.", "The task assignment or status changed. Request the move again; nothing has changed.")}
     await session.delete(draft)
     await session.flush()
     if items and items[0].get("action") == "delete":
@@ -2227,9 +2250,40 @@ async def import_ics_reply(session: AsyncSession, user: User, data: bytes, capti
     }
 
 
+def prefer_ai(text: str) -> bool:
+    """Long messages and corrections need conversation context, not another quick interpretation."""
+    return len(text.strip()) >= 180 or bool(re.search(
+        r"(?:ты\s+(?:меня\s+)?не\s+понял|не\s+то\s*(?:,|что|!|$)|нет[,!]?\s+(?:не\s+так|я\s+(?:же\s+)?(?:сказал|просил|имел))|опять\s+не|что\s+за\s+(?:бред|ерунда)|you\s+misunderstood|that'?s\s+not\s+what|no[,!]?\s+(?:that'?s\s+wrong|I\s+meant))", text, re.I))
+
+
 async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict:
     """Recognized actions run here and never depend on what the model writes about them. `attachment`: the file
     sent with the message, which a reminder set in it delivers ("пришли этот файл в 21:00")."""
+    if attachment is None:
+        from app.services import send_drafts
+
+        if dates.invalid_explicit_date(text, datetime.now(tz).date()):
+            return {"kind": "answer", "text": tr("Такой даты нет. Укажите, пожалуйста, корректный день.", "That date does not exist. Please provide a valid day.")}
+        response = await send_drafts.respond_by_rules(session, user, text)
+        if response is not None:
+            return response
+        from app.services import planning_scope
+
+        scoped = await planning_scope.reschedule(session, user, text, tz)
+        if scoped is not None:
+            return scoped
+        from app.services import relative_schedule
+
+        relative = await relative_schedule.reschedule(session, user, text, tz)
+        if relative is not None:
+            return relative
+        if prefer_ai(text) and settings.assistant_agent and settings.llm_enabled:
+            from app.services import agent
+
+            try:
+                return await agent.run(session, user, text, tz)
+            except agent.AgentFailed:
+                return {"kind": "answer", "text": tr("Не удалось обработать уточнение. Ничего не изменено — повторите запрос позже.", "I could not process your clarification. Nothing was changed; please try again later.")}
     draft = await pending_edit(session, user)
     if draft:
         reply = await apply_edit_text(session, user, draft, text, tz)
@@ -2281,7 +2335,13 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, atta
             return await agent.run(session, user, text, tz, attachment)
         except agent.AgentFailed:
             # GigaChat is unreachable before anything was done: the rules below still handle the usual requests
-            pass
+            from app.services import friends
+
+            if await friends.may_address_someone_else(session, user, text):
+                return {"kind": "answer", "text": tr(
+                    "Не удалось связаться с ассистентом. Не могу надёжно определить получателя — ничего не отправлено и личное напоминание не создано. Повторите запрос позже.",
+                    "The assistant could not be reached. I cannot reliably determine the recipient, so nothing was sent and no personal reminder was created. Please try again later.",
+                )}
     from app.services import agent as reminder_rules
 
     reminder = await reminder_rules.reminder_by_rules(session, user, text, tz, attachment)

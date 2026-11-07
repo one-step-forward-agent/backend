@@ -2,6 +2,7 @@
 the assistant chat. Tasks are given to friends in the chat itself ("добавь Маше купить хлеб")."""
 
 from typing import Literal
+from datetime import date as Date, time as Clock
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -30,6 +31,18 @@ class FriendUpdate(BaseModel):
 
 class FriendSettings(BaseModel):
     check_default: bool
+
+
+class FriendTaskWrite(BaseModel):
+    title: str = Field(min_length=1, max_length=300, pattern=r"\S")
+    date: Date
+    time: Clock | None = None
+
+
+class FriendTaskCreate(FriendTaskWrite):
+    reminder: bool = False
+    shared: bool = False
+    check: bool | None = None
 
 
 async def answer(call):
@@ -68,6 +81,21 @@ async def friend_inbox(after: int = 0, user: User = Depends(get_current_user), s
 @router.patch("/friends/{friend_id}")
 async def update_friend(friend_id: int, payload: FriendUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await answer(friends.update_friend(session, user, friend_id, payload.model_dump(exclude_unset=True)))
+
+
+@router.get("/friends/{friend_id}/tasks")
+async def friend_tasks(friend_id: int, date_from: Date, date_to: Date, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return await answer(friends.task_list(session, user, friend_id, date_from, date_to))
+
+
+@router.post("/friends/{friend_id}/tasks", status_code=201)
+async def create_friend_task(friend_id: int, payload: FriendTaskCreate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return await answer(friends.create_task_draft(session, user, friend_id, payload.title, payload.date, payload.time, payload.reminder, payload.shared, payload.check))
+
+
+@router.patch("/friend-tasks/{task_id}")
+async def edit_friend_task(task_id: int, payload: FriendTaskWrite, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return await answer(friends.edit_task(session, user, task_id, payload.title, payload.date, payload.time))
 
 
 @router.post("/friends/{friend_id}/{decision}")

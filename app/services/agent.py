@@ -23,7 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.models import ConversationMessage, Event, Tag, User
+from app.models.models import ConversationMessage, Event, FriendTask, SendDraft, Tag, TeamMessage, User
 from app.services import attachments, chat, dates, insights, reminders, research, tasks
 from app.core.lang import is_en, tr
 from app.services.ru import MONTHS, WEEKDAYS, WEEKDAYS_SHORT, day_label, plural
@@ -92,7 +92,7 @@ NEW_EVENT = {
         "end_time": {"type": "string", "description": "Время окончания HH:MM"},
         "duration_minutes": {"type": "integer", "description": "Длительность, если названа"},
         "end_date": {"type": "string", "description": "Последний день для дел на несколько дней («по 12 октября»)"},
-        "repeat": {"type": "string", "description": "Повторение словами: «каждую пятницу», «по будням», «каждый день»"},
+        "repeat": {"type": "string", "description": "Полное повторение словами или RRULE: сохраняй интервал и конец серии, например «каждые 2 недели по пятницам до января», не сокращай до «каждую пятницу»"},
         "deadline": {"type": "string", "description": "Крайний срок словами пользователя («до пятницы 18:00») или YYYY-MM-DDTHH:MM"},
         "reminder_minutes": {"type": "integer", "description": "За сколько минут до начала напомнить"},
         "location": {"type": "string"},
@@ -104,6 +104,9 @@ NEW_EVENT = {
 }
 
 ACTIONS = {
+    "friend_change": "изменить/перенести/переименовать или отменить ОТПРАВЛЕННУЮ задачу другу: friend_task_id, new_title, to_date, new_time, untimed, cancel_task. Создаёт черновик подтверждения, личный календарь не трогает",
+    "delegate": "задача или напоминание ДРУГУ/участнику команды: recipient_id, team_id (только для команды), task_text дословно с датой, reminder. Создаёт черновик отправки, никогда личное напоминание",
+    "friend_tasks": "показать задачи, которыми пользователь обменялся с другом: recipient_id, date_from, date_to",
     "find": "найти и показать задачи (вопросы «что у меня в пятницу?», «когда встреча с Анной?»)",
     "create": "добавить новые задачи, встречи, дела — поле events",
     "change": "изменить или перенести существующие задачи, одну или сразу много: to_date, shift_days, shift_minutes, new_time, new_end_time, new_title, untimed, tags",
@@ -126,6 +129,17 @@ OPERATION = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": list(ACTIONS), "description": "; ".join(f"{name} — {text}" for name, text in ACTIONS.items())},
+        "recipient_id": {"type": "integer", "description": "ID друга из контекста. Для команды используй team_member_id. Не угадывай: если имя неоднозначно, ask"},
+        "team_member_id": {"type": "integer", "description": "Для delegate в команде: team_member_id из списка участников выбранной команды. Это НЕ ID друга или пользователя"},
+        "friend_task_id": {"type": "integer", "description": "ID поручения из блока ПОРУЧЕНИЯ ДРУЗЬЯМ; это не ID личного события"},
+        "cancel_task": {"type": "boolean", "description": "Для friend_change: true, если отменить поручение"},
+        "direction": {"type": "string", "enum": ["sent", "received", "all"], "description": "Для friend_tasks: sent — я поручил другу, received — друг поручил мне, all — оба направления"},
+        "team_id": {"type": "integer", "description": "ID команды; пусто для друга"},
+        "task_text": {"type": "string", "description": "Дело и время дословно из сообщения пользователя, без имени получателя и глагола напомни/поручи"},
+        "reminder": {"type": "boolean", "description": "true для напомни ДРУГУ; false для поручения задачи"},
+        "shared": {"type": "boolean"},
+        "date_from": {"type": "string", "description": DAY_WORDS},
+        "date_to": {"type": "string", "description": DAY_WORDS},
         "filter": FILTER,
         "events": {"type": "array", "items": NEW_EVENT, "description": "Для create: каждое отдельное дело — отдельный элемент"},
         "to_date": {"type": "string", "description": f"Для change: новый день, время каждой задачи сохраняется — {DAY_WORDS}"},
@@ -227,7 +241,7 @@ def offered(text: str, history: str, attached: bool = False) -> set[str]:
         names -= {"delete"}
     if re.search(r"напоминани", text, re.I) and not re.search(r"\bнапомни", text, re.I):
         # "какие у меня напоминания?", "отмени напоминание про посуду": about reminders, not tasks
-        names = {"reminders", "cancel_reminder", "remind", "ask"}
+        names = {"reminders", "cancel_reminder", "remind", "delegate", "friend_tasks", "friend_change", "ask"}
     return names
 
 
@@ -309,6 +323,8 @@ class Turn:
     asked: dict | None = None
     # find was about tasks named in the message: one found is shown with all its details
     named: bool = False
+    social_reply: dict | None = None
+    team_scope: int | None = None
 
     def ref(self, event_id: int) -> int:
         if event_id not in self.aliases:
@@ -319,7 +335,7 @@ class Turn:
     @property
     def changed(self) -> bool:
         """Something was really done or proposed in this turn."""
-        return bool(self.items or self.delete or self.completed or self.reopened or self.reminders or self.cancelled)
+        return bool(self.social_reply or self.items or self.delete or self.completed or self.reopened or self.reminders or self.cancelled)
 
     @property
     def today(self) -> date:
@@ -1348,7 +1364,88 @@ def selector(op: dict) -> dict:
     return found
 
 
+async def social_operation(turn: Turn, op: dict) -> dict:
+    from app.services import friends, send_drafts, teams
+
+    if turn.team_scope:
+        if op.get("team_id") not in (None, turn.team_scope) or op.get("action") != "delegate":
+            return {"error": "В этом чате работай только с текущей командой."}
+        op = {**op, "team_id": turn.team_scope}
+    if op.get("action") == "friend_change":
+        task_id = as_int(op.get("friend_task_id"))
+        if not task_id:
+            return {"error": "Выбери friend_task_id из ПОРУЧЕНИЯ ДРУЗЬЯМ; при неоднозначности уточни."}
+        task = await friends.own_task(turn.session, turn.user, task_id)
+        if task.sender_id != turn.user.id:
+            return {"error": "Изменять можно только свои отправленные поручения."}
+        parsed = dates.parse(turn.text, turn.now)
+        day = parsed.date or parse_day(op.get("to_date"), turn)
+        clock = parsed.time or parse_clock(op.get("new_time"))
+        turn.social_reply = await send_drafts.friend_change(turn.session, turn.user, task.id, op.get("new_title"), day, clock, bool(op.get("untimed")), bool(op.get("cancel_task")))
+        return {"reply": turn.social_reply}
+    recipient_id = as_int(op.get("team_member_id") or op.get("recipient_id")) if op.get("team_id") else as_int(op.get("recipient_id"))
+    if not recipient_id:
+        return {"error": "Уточни получателя; не создавай личную задачу вместо задачи другу."}
+    if op.get("team_id"):
+        team, _ = await teams.member_of(turn.session, turn.user, int(op["team_id"]))
+        people = await teams.members(turn.session, team.id)
+        member = next((person for person in people if person.id == recipient_id), None)
+        if not member:
+            return {"error": "Такого участника в команде нет."}
+        request = teams.parse_assignment(f"Поручи {member.name}: {op.get('task_text', '')}", people, turn.now)
+        if not request:
+            return {"error": "Уточни задачу и срок."}
+        turn.social_reply = await teams.assign_by_words(turn.session, turn.user, team, people, request, turn.now)
+    else:
+        pals = await friends.accepted(turn.session, turn.user)
+        pair = next(((row, friend) for row, friend in pals if friend.id == recipient_id), None)
+        if not pair:
+            return {"error": "Получателя нет среди принятых друзей. Уточни имя, не ставь напоминание себе."}
+        row, friend = pair
+        if op["action"] == "friend_tasks":
+            first = parse_day(op.get("date_from"), turn) or turn.today
+            last = parse_day(op.get("date_to"), turn) or first + timedelta(days=30)
+            rows = await friends.task_list(turn.session, turn.user, friend.id, first, last)
+            if op.get("direction") in ("sent", "received"):
+                role = "sender" if op["direction"] == "sent" else "performer"
+                rows = [item for item in rows if item["role"] == role]
+            lines = [f"• #{item['task_id']} {item['title']} — {item['when']} ({item['status']})" for item in rows]
+            turn.social_reply = {"kind": "answer", "text": tr("Задачи с другом", "Tasks with your friend") + f" {friends.display_name(row, friend)}:\n" + ("\n".join(lines) or tr("Задач за этот период нет.", "No tasks in this period."))}
+        else:
+            try:
+                item = friends.task_from_words(str(op.get("task_text") or ""), turn.now)
+            except friends.FriendError as error:
+                turn.social_reply = {"kind": "answer", "text": str(error)}
+                return {"reply": turn.social_reply}
+            if not item:
+                return {"error": "Уточни, что и когда нужно сделать."}
+            # Current-turn corrections and time-only answers take precedence over copied model fields.
+            parsed = dates.parse(turn.text, turn.now)
+            if parsed.date:
+                item["date"] = parsed.date.isoformat()
+            if parsed.time:
+                item["time"] = parsed.time.strftime("%H:%M")
+                item["end_time"] = parsed.end_time.strftime("%H:%M") if parsed.end_time else None
+            start, end, all_day = friends.bounds(item, turn.tz)
+            if (end if all_day else start) <= turn.now:
+                return {"error": "Это время уже прошло. Уточни будущее время."}
+            name = friends.display_name(row, friend)
+            requested = friends.parse_request(turn.text, pals)
+            if op.get("reminder") or (requested and requested.get("reminder")):
+                if all_day:
+                    return {"error": "Во сколько напомнить другу? Спроси время."}
+                turn.social_reply = await send_drafts.friend_reminder(turn.session, turn.user, friend, name, item["title"], start)
+            else:
+                turn.social_reply = await send_drafts.friend_task(turn.session, turn.user, friend, name, item["title"], start, end, all_day, bool(op.get("shared")), None)
+    if turn.social_reply and turn.social_reply.get("kind") == "send_draft":
+        await send_drafts.supersede_correction(turn.session, turn.user, turn.text, turn.social_reply["draft_id"])
+    return {"reply": turn.social_reply, "note": "Покажи этот результат. Черновик ещё не отправлен."}
+
+
 OPERATIONS = {
+    "friend_change": social_operation,
+    "delegate": social_operation,
+    "friend_tasks": social_operation,
     "find": lambda turn, op: get_events(turn, selector(op)),
     "create": lambda turn, op: create_events(turn, op),
     "change": change_events,
@@ -1381,6 +1478,13 @@ async def act(turn: Turn, args: dict) -> dict:
     if not isinstance(operations, list) or not operations:
         return {"results": [{"error": "Передай operations — список операций."}]}
     operations = [op for op in operations if isinstance(op, dict)][:MAX_OPERATIONS]
+    social = [op for op in operations if op.get("action") in ("delegate", "friend_tasks", "friend_change")]
+    if len(social) == 1 and all(op.get("action") in ("delegate", "friend_tasks", "friend_change", "ask") for op in operations):
+        # Validate the concrete action first; it will ask for any information actually missing.
+        operations = social
+    if any(op.get("action") in ("delegate", "friend_tasks", "friend_change") for op in operations) and len(operations) != 1:
+        turn.social_reply = {"kind": "answer", "text": tr("Пока могу подготовить одно поручение за раз. Напишите отдельный запрос для каждого получателя и дела.", "I can prepare one assignment at a time. Send a separate request for each recipient and task.")}
+        return {"results": [{"reply": turn.social_reply}]}
     alone = len(operations) == 1
     results = []
     for op in operations:
@@ -1544,9 +1648,10 @@ def system_prompt() -> str:
         + PERSONAL_ADVICE
         + "\n7. Подготовиться к чему-то большому или разбить задачу на шаги — breakdown.\n"
         "8. Вопросы о задачах («что у меня в пятницу?», «когда встреча с Анной?») — find: приложение покажет найденное списком.\n"
-        "9. Не переспрашивай то, о чём можно догадаться: выбери самое вероятное и сразу вызови act — пользователь всё равно "
-        "проверит черновик и поправит его. Нет дня — сегодня, нет времени — без времени, подходят несколько задач — "
-        "ближайшая по плану. Если догадаться нельзя совсем — ask: короткий вопрос и 2–4 options, готовые ответы, которые "
+        "9. Если получатель, дата, действие или нужная задача неоднозначны — уточни через ask, не выбирай случайную или ближайшую задачу. "
+        "Отсутствие времени у обычной задачи означает без времени; для напоминания спроси время. "
+        "При недовольстве пользователя учитывай исходную просьбу и исправь интерпретацию, не повторяй прежний ответ. "
+        "ask: короткий вопрос и 2–4 options, готовые ответы, которые "
         "пользователь нажмёт кнопкой (например, подходящие задачи с днём и временем). Никогда не задавай вопрос простым "
         "текстом — пользователь не должен ничего печатать в ответ. Без act отвечай текстом, только когда сообщение не о планах: "
         "приветствие или пара слов о дне — коротко и дружелюбно; просьба о другом (код, задача по математике, рецепт, текст, "
@@ -1582,12 +1687,39 @@ def system_prompt() -> str:
 
 async def context_prompt(turn: Turn) -> str:
     """The time, the user and their plan: a second system message, after the rules and the function spec."""
+    from app.services import friends, teams
+
+    pals = await friends.accepted(turn.session, turn.user)
+    drafts = list(await turn.session.scalars(select(SendDraft).where(SendDraft.user_id == turn.user.id, SendDraft.status == "open").order_by(SendDraft.id.desc()).limit(10)))
+    assignments = list(await turn.session.scalars(select(FriendTask).where(FriendTask.sender_id == turn.user.id).order_by(FriendTask.id.desc()).limit(40)))
+    assignment_context = [{"friend_task_id": task.id, "recipient_id": task.performer_id, "title": task.title, "start": task.start_at.astimezone(turn.tz).isoformat(), "status": task.status, "reminder": task.is_reminder} for task in assignments]
+    draft_context = [{"draft_id": draft.id, "kind": draft.kind, "payload": draft.payload} for draft in drafts]
+    friend_context = [{"id": friend.id, "names": friends.names_of(row, friend)} for row, friend in pals] if not turn.team_scope else []
+    team_context = []
+    for team in await teams.my_teams(turn.session, turn.user):
+        if turn.team_scope and team["id"] != turn.team_scope:
+            continue
+        team_context.append({"id": team["id"], "name": team["name"], "tag": team["tag"],
+                             "members": [{"team_member_id": person.id, "name": person.name} for person in await teams.members(turn.session, team["id"])]})
     profile = turn.user.profile if isinstance(turn.user.profile, dict) else {}
     tone = TONES.get(profile.get("toneOfVoice"), TONES["neutral"])
     known = insights.habits_text(await insights.habits(turn.session, turn.user, turn.now))
     telegram = "подключён" if turn.user.telegram_chat_id else "НЕ подключён (напоминания не дойдут — предложи подключить Telegram в разделе «Интеграции»)"
     return (
         f"Говори {tone} — так пользователь выбрал при знакомстве.\n\n"
+        "ПОЛУЧАТЕЛИ: Если просят напомнить/поручить ДРУГОМУ человеку, используй delegate. "
+        "Никогда не заменяй это личным remind/create. Имена могут быть в падежах. Неизвестное или неоднозначное имя — ask. "
+        "«Напомни мне позвонить Артёму» — личное напоминание; «Напомни Артёму купить бананы» — delegate с reminder=true. "
+        "Задачи друга — friend_tasks; это только обмен задачами, доступа к личному календарю друга нет. "
+        "Изменение, перенос, отмена отправленного поручения — friend_change, ID из ПОРУЧЕНИЯ ДРУЗЬЯМ; не wish и не личный change/delete. "
+        "Короткий ответ на уточнение дополняет предыдущую просьбу: сохрани получателя и дело, а время возьми из текущего сообщения. "
+        "Исправление неотправленного черновика — delegate с полными исправленными данными; предыдущий черновик будет отменён. "
+        "Действия предыдущих ответов уже выполнены или оформлены в черновики. На «а ещё» выполняй только НОВОЕ дело из текущего сообщения, не повторяй прошлое. "
+        "Отправка всегда требует подтверждения черновика.\n"
+        f"ДРУЗЬЯ: {json.dumps(friend_context, ensure_ascii=False)}\n"
+        f"КОМАНДЫ: {json.dumps(team_context, ensure_ascii=False)}\n\n"
+        f"НЕОТПРАВЛЕННЫЕ ЧЕРНОВИКИ: {json.dumps(draft_context, ensure_ascii=False)}\n"
+        f"ПОРУЧЕНИЯ ДРУЗЬЯМ: {json.dumps(assignment_context, ensure_ascii=False)}\n\n"
         f"СЕЙЧАС: {turn.now:%Y-%m-%d %H:%M}, {WEEKDAYS[turn.now.weekday()]}. Часовой пояс: {turn.tz}.\n\n"
         f"ТАБЛИЦА ДНЕЙ:\n{day_table(turn.today)}\n\n"
         f"О ПОЛЬЗОВАТЕЛЕ (из знакомства):\n{profile_text(turn.user)}\n\n"
@@ -1606,14 +1738,15 @@ def reply_note(reply: dict | None, turn: Turn, existing: set[int]) -> str:
 
 
 async def history_messages(turn: Turn) -> list[dict]:
-    rows = list(
-        await turn.session.scalars(
-            select(ConversationMessage)
-            .where(ConversationMessage.user_id == turn.user.id, ConversationMessage.hidden_at.is_(None))
-            .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
-            .limit(HISTORY_MESSAGES)
-        )
-    )
+    if turn.team_scope:
+        query = select(TeamMessage).where(TeamMessage.team_id == turn.team_scope, TeamMessage.user_id == turn.user.id).order_by(TeamMessage.created_at.desc(), TeamMessage.id.desc())
+    else:
+        query = select(ConversationMessage).where(ConversationMessage.user_id == turn.user.id, ConversationMessage.hidden_at.is_(None)).order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+    rows = list(await turn.session.scalars(query.limit(HISTORY_MESSAGES)))
+    from app.services import send_drafts
+
+    draft_ids = {row.reply.get("draft_id") for row in rows if isinstance(row.reply, dict) and row.reply.get("kind") == "send_draft"}
+    current_drafts = {draft.id: draft for draft in await turn.session.scalars(select(SendDraft).where(SendDraft.id.in_(draft_ids), SendDraft.user_id == turn.user.id))} if draft_ids else {}
     mentioned = {value for row in rows for value in chat.reply_event_ids(row.reply or {})}
     existing = set(await turn.session.scalars(select(Event.id).where(Event.user_id == turn.user.id, Event.id.in_(list(mentioned)[:MAX_SELECTED])))) if mentioned else set()
     messages = []
@@ -1623,7 +1756,13 @@ async def history_messages(turn: Turn) -> list[dict]:
             continue
         role = "user" if row.role == "user" else "assistant"
         limit = HISTORY_USER_CHARS if role == "user" else HISTORY_ASSISTANT_CHARS
-        content = row.content[:limit] + (reply_note(row.reply, turn, existing) if role == "assistant" else "")
+        current_reply = row.reply
+        if role == "assistant" and isinstance(current_reply, dict) and current_reply.get("draft_id") in current_drafts:
+            current_reply = send_drafts.view(current_drafts[current_reply["draft_id"]], turn.user)
+            content = chat.summarize(current_reply)[:limit]
+        else:
+            content = row.content[:limit]
+        content += reply_note(current_reply, turn, existing) if role == "assistant" else ""
         if messages and messages[-1]["role"] == role:
             messages[-1]["content"] += "\n" + content
         else:
@@ -1637,18 +1776,25 @@ async def history_messages(turn: Turn) -> list[dict]:
 # ---------- the loop ----------
 
 
-async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict:
+async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None, team_scope: int | None = None) -> dict:
     """Answer one message: the model calls functions until it writes the answer; the reply shows what was done.
     `attachment`: the file sent with the message (a reminder set in it brings the file)."""
     from services.gigachat import GigaChatClient
 
-    turn = Turn(session=session, user=user, tz=tz, now=datetime.now(tz), text=text, attachment=attachment)
+    turn = Turn(session=session, user=user, tz=tz, now=datetime.now(tz), text=text, attachment=attachment, team_scope=team_scope)
     # The plan first: its tasks get the short numbers 1, 2, 3…
     context = await context_prompt(turn)
     history = await history_messages(turn)
     client = GigaChatClient()
     previous = next((message["content"] for message in reversed(history) if message["role"] == "user"), "")
     turn.allowed = offered(text, previous, attachment is not None)
+    if team_scope:
+        from app.services import teams
+
+        team, _ = await teams.member_of(session, user, team_scope)
+        context += f"\nТЕКУЩАЯ КОМАНДА id={team_scope}. Все поручения относятся только к ней. Используй delegate с team_id={team_scope}; никогда не создавай личные задачи.\n"
+        context += await teams.team_context(session, team, await teams.members(session, team.id), tz)
+        turn.allowed = {"delegate", "ask"}
     turn.question = await research.pending(session, user)
     if turn.question:
         options = f" Варианты: {'; '.join(turn.question['options'])}." if turn.question.get("options") else ""
@@ -1673,7 +1819,7 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
         {"role": "system", "content": system_prompt()},
         {"role": "system", "content": context},
         *history,
-        {"role": "user", "content": text[:8000]},
+        {"role": "user", "content": text[:50000]},
     ]
     answer = None
     corrected = False
@@ -1707,7 +1853,7 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
         if name != "act" and isinstance(args.get("operations"), list | dict):
             name = "act"
         result = await act(turn, args) if name == "act" else {"results": [{"error": "Есть только функция act."}]}
-        logger.info("Agent operations %s -> %s", json.dumps(args, ensure_ascii=False)[:400], [item.get("error") or "ok" for item in result["results"]])
+        logger.info("Agent operations %s: %s errors", [item.get("action") for item in result["results"]], sum(bool(item.get("error")) for item in result["results"]))
         messages.append({"role": "assistant", "content": message.get("content") or "", "function_call": {"name": "act", "arguments": args}, **({"functions_state_id": message["functions_state_id"]} if message.get("functions_state_id") else {})})
         messages.append({"role": "function", "name": "act", "content": json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))})
         operations = [item for item in result["results"] if "action" in item]
@@ -1727,7 +1873,9 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
         if turn.wished:
             return {"kind": "answer", "text": research.wish_offer_text(turn.wished["text"]), "replies": research.wish_buttons(), "wish": turn.wished}
         return {"kind": "answer", "text": tr(research.THANKS, research.THANKS_EN)}
-    if not turn.changed and not turn.analysed:
+    if not turn.changed and any(action in ("delegate", "friend_tasks", "friend_change") for action in turn.failed):
+        return {"kind": "answer", "text": tr("Уточните получателя, задачу и время. Задача себе не создана.", "Please clarify the recipient, task and time. No personal task was created.")}
+    if not turn.team_scope and not turn.changed and not turn.analysed:
         reply = await by_rules(turn)
         if reply is not None:
             return reply
@@ -1806,6 +1954,8 @@ async def finish(turn: Turn, answer: str | None) -> dict:
     """The reply the chat shows: the draft to confirm, done tasks, a reminder, the found tasks or just the answer."""
     session, user, tz = turn.session, turn.user, turn.tz
     await session.commit()
+    if turn.social_reply:
+        return turn.social_reply
     # Done at once in the same message ("я сделала отчёт и добавь созвон"): said next to the draft or the main result
     done = done_lines(turn)
     if turn.delete:

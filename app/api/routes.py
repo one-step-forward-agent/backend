@@ -39,6 +39,7 @@ from app.schemas import (
     DraftUpdate,
     EventCreate,
     EventRead,
+    AssignmentOrigin,
     EventUpdate,
     MoveRequest,
     OnboardingProfile,
@@ -248,12 +249,16 @@ async def list_events(
         query = query.where(Event.start_at < end)
     if tag is not None:
         query = query.where(tag == any_(Event.tag_ids))
-    return list((await session.scalars(query)).all())
+    events = list((await session.scalars(query)).all())
+    origins = await tasks.assigned_origins(session, user, events)
+    return [EventRead.model_validate(event).model_copy(update={"assignment": AssignmentOrigin(**origins[event.id]) if event.id in origins else None}) for event in events]
 
 
 @router.get("/events/{event_id}", response_model=EventRead)
 async def get_event(event_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    return await _owned_event(session, user, event_id)
+    event = await _owned_event(session, user, event_id)
+    origins = await tasks.assigned_origins(session, user, [event])
+    return EventRead.model_validate(event).model_copy(update={"assignment": AssignmentOrigin(**origins[event.id]) if event.id in origins else None})
 
 
 @router.put("/events/{event_id}", response_model=EventRead)
@@ -272,6 +277,7 @@ async def update_event(event_id: int, payload: EventUpdate, user: User = Depends
         setattr(event, key, value)
     if event.end_at <= event.start_at:
         raise HTTPException(status_code=422, detail="end_at must be later than start_at")
+    await tasks.sync_assignment_schedule(session, user, event)
     if event.external_id:
         event.sync_status = "pending"
     created = []

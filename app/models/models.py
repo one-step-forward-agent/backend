@@ -1,7 +1,7 @@
-from datetime import datetime, time
+from datetime import date, datetime, time
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
@@ -453,6 +453,7 @@ class TeamTask(Base):
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     # When the work starts ("в пятницу в 10"): execution control asks then; no start, no question
     start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    scheduled_day: Mapped[date | None] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(20), default=TeamTaskStatus.TODO, server_default="todo", index=True)
     # "pending" while the performer has not answered; "accepted", "rejected"; NULL: nobody is assigned
     confirm: Mapped[str | None] = mapped_column(String(20))

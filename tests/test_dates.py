@@ -173,6 +173,21 @@ def test_times_written_with_a_space_dash_or_bare_dot():
     assert dates.parse("в 10 15 октября", now).time == time(10, 0)
 
 
+@pytest.mark.parametrize("text, invalid", [
+    ("запиши звонок маме на завтра 19.30", False),
+    ("завтра 22.00", False),
+    ("завтра в 18.30", False),
+    ("встреча 10.11", False),
+    ("встреча 31.02", True),
+    ("встреча 2026-02-31 в 19.30", True),
+    ("встреча 31 февраля в 19.30", True),
+])
+def test_impossible_dates_do_not_reject_dotted_times(text, invalid):
+    from app.services.dates import invalid_explicit_date
+
+    assert invalid_explicit_date(text, NOW.date()) is invalid
+
+
 NIGHT = datetime(2026, 10, 9, 1, 12, tzinfo=TZ)  # Friday night: the user's "today" is still Thursday the 8th
 
 
@@ -209,3 +224,34 @@ def test_ordinal_and_night_dates(text, now, expected):
 )
 def test_bare_day_at_night(text, expected):
     assert bare_day(text, NIGHT) == expected
+
+
+@pytest.mark.parametrize("text, ending", [
+    ("каждую пятницу до января зал", "20261231T235959Z"),
+    ("каждую пятницу до января 2028 зал", "20271231T235959Z"),
+    ("каждую пятницу по январь зал", "20270131T235959Z"),
+    ("каждые 2 недели по будням до января зал", "20261231T235959Z"),
+])
+def test_recurrence_month_boundary_is_preserved_in_preview(text, ending):
+    now = datetime(2026, 11, 7, 1, 35, tzinfo=TZ)
+    parsed = parse(text, now)
+    assert f"UNTIL={ending}" in parsed.rrule
+    assert "до" in describe_rrule(parsed.rrule)
+    if "2 недели" in text:
+        assert "INTERVAL=2" in parsed.rrule and "2" in describe_rrule(parsed.rrule)
+    assert strip_spans(text, parsed.spans).strip() == "зал"
+
+
+@pytest.mark.parametrize("rule", [
+    "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TU,WE,TH,FR",
+    "FREQ=WEEKLY;INTERVAL=2;BYDAY=SA,SU",
+    "FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15",
+    "FREQ=YEARLY;INTERVAL=2",
+])
+def test_recurrence_labels_include_interval_in_both_languages(rule):
+    from app.core.lang import using
+
+    interval = dict(part.split("=") for part in rule.split(";"))["INTERVAL"]
+    for language in ("ru", "en"):
+        with using(language):
+            assert interval in describe_rrule(rule)

@@ -30,8 +30,9 @@ router = APIRouter(prefix="/api/blog", tags=["blog"])
 admin_router = APIRouter(prefix="/api/admin/blog", tags=["admin"])
 
 STATUSES = ("draft", "published")
-BLOCK_TYPES = {"heading", "paragraph", "image", "quote", "callout", "divider"}
+BLOCK_TYPES = {"heading", "paragraph", "image", "quote", "callout", "divider", "list"}
 MAX_BLOCKS = 300
+MAX_BLOCK_DEPTH = 10
 SLUG = re.compile(r"^[\w-]{1,120}$")
 # A picture is a link of the web or one uploaded here: never "javascript:" or "data:"
 PICTURE = re.compile(r"^(?:https?://\S+|/api/blog/images/[0-9a-f]{32}\.(?:png|jpe?g|webp|gif))$", re.I)
@@ -52,6 +53,8 @@ def images_dir() -> Path:
 
 
 def picture(value: str | None) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError("Картинка — ссылка https://… или загруженный файл")
     value = (value or "").strip()
     if not value:
         return None
@@ -112,20 +115,45 @@ class PostSave(BaseModel):
     @field_validator("blocks")
     @classmethod
     def clean_blocks(cls, value: list[dict]) -> list[dict]:
-        blocks = []
-        for block in value:
-            if block.get("type") not in BLOCK_TYPES:
-                raise ValueError(f"Неизвестный блок: {block.get('type')}")
-            clean = {key: (str(item)[:20000] if isinstance(item, str) else item) for key, item in block.items() if isinstance(item, str | int) and not isinstance(item, bool)}
-            clean["id"] = str(block.get("id") or uuid4().hex)[:64]
-            if block["type"] == "image":
-                clean["src"] = picture(block.get("src")) or ""
-            if block["type"] == "heading":
-                clean["level"] = block.get("level") if block.get("level") in (1, 2, 3) else 2
-            if block["type"] == "callout" and block.get("variant") not in ("info", "tip", "warning"):
-                clean["variant"] = "info"
-            blocks.append(clean)
-        return blocks
+        count = 0
+
+        def clean_tree(items: list, depth: int) -> list[dict]:
+            nonlocal count
+            if depth > MAX_BLOCK_DEPTH:
+                raise ValueError("Слишком много уровней вложенности блоков")
+            blocks = []
+            for block in items:
+                count += 1
+                if count > MAX_BLOCKS:
+                    raise ValueError("Слишком много блоков")
+                if not isinstance(block, dict) or not isinstance(block.get("type"), str) or block["type"] not in BLOCK_TYPES:
+                    raise ValueError("Неизвестный блок")
+                clean = {key: (item[:20000] if isinstance(item, str) else item) for key, item in block.items() if isinstance(item, str | int) and not isinstance(item, bool)}
+                clean["id"] = str(block.get("id") or uuid4().hex)[:64]
+                if block["type"] == "image":
+                    clean["src"] = picture(block.get("src")) or ""
+                if block["type"] == "heading":
+                    clean["level"] = block.get("level") if block.get("level") in (1, 2, 3) else 2
+                if block["type"] == "callout" and block.get("variant") not in ("info", "tip", "warning"):
+                    clean["variant"] = "info"
+                if block["type"] == "list":
+                    entries = block.get("items", [])
+                    if not isinstance(entries, list) or len(entries) > MAX_BLOCKS or any(not isinstance(entry, str) for entry in entries):
+                        raise ValueError("Список должен содержать текстовые пункты")
+                    ordered = block.get("ordered", False)
+                    if not isinstance(ordered, bool):
+                        raise ValueError("Тип списка — true или false")
+                    clean["ordered"] = ordered
+                    clean["items"] = [entry[:20000] for entry in entries]
+                if "children" in block:
+                    children = block["children"]
+                    if not isinstance(children, list):
+                        raise ValueError("Вложенные блоки должны быть списком")
+                    clean["children"] = clean_tree(children, depth + 1) if children else []
+                blocks.append(clean)
+            return blocks
+
+        return clean_tree(value, 1)
 
 
 class ViewStart(BaseModel):

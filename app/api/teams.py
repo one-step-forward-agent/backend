@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user
 from app.core.database import get_session
 from app.models.models import User
+from app.schemas import TeamTaskAcceptance
 from app.services import teams
 
 router = APIRouter(prefix="/api", tags=["teams"])
@@ -196,10 +197,10 @@ async def delete_task(team_id: int, task_id: int, user: User = Depends(get_curre
 
 @router.post("/team-tasks/{task_id}/{action}")
 async def task_action(
-    task_id: int, action: Literal["accept", "reject", "start", "done", "check_on", "check_off"], user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)
+    task_id: int, action: Literal["accept", "reject", "start", "done", "check_on", "check_off"], payload: TeamTaskAcceptance | None = None, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)
 ):
     """A button under a team's task card in a chat."""
-    return await answer(teams.act(session, user, task_id, action))
+    return await answer(teams.act(session, user, task_id, action, payload.day if payload else None, payload.start_time if payload else None, payload.day_offset if payload else None))
 
 
 @router.get("/teams/{team_id}/chat")

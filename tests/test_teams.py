@@ -118,12 +118,14 @@ async def test_missing_details_are_asked_with_ready_commands(client):
     assert what["kind"] == "answer" and "Что нужно сделать" in what["text"]
 
 
-async def test_automatic_acceptance_and_execution_control(client):
+async def test_legacy_auto_setting_still_requires_acceptance_and_execution_control(client):
     boss, ivan = await person(client, "Анна"), await person(client, "Иван")
     team = await team_of(client, boss, (ivan, "Иван"), task_confirm="auto")
     reply = await team_chat(client, boss, team, "Поручи Ивану созвон с клиентом завтра в 10:00")
-    assert reply["confirm"] == "accepted" and reply["actions"] == ["check_off"]
-    assert (await personal_cards(client, ivan))[-1]["event"] == "auto"
+    assert reply["confirm"] == "pending" and reply["actions"] == ["check_off"]
+    assert (await personal_cards(client, ivan))[-1]["event"] == "assigned"
+    accepted = await client.post(f"/api/team-tasks/{reply['task_id']}/accept", headers=ivan["headers"])
+    assert accepted.status_code == 200 and accepted.json()["confirm"] == "accepted"
     now = datetime.now(timezone.utc)
     async with session_factory() as session:
         await session.execute(update(TeamTask).where(TeamTask.id == reply["task_id"]).values(start_at=now - timedelta(minutes=1)))
@@ -176,6 +178,7 @@ async def test_projects_progress_reports_load_and_reallocation(client):
         assert reply["kind"] == "team_task", reply
     first = (await client.get(f"/api/teams/{team['id']}/tasks?project={project['id']}", headers=boss["headers"])).json()
     assert len(first) == 4 and all(task["project"] == "Сайт" for task in first)
+    assert (await client.post(f"/api/team-tasks/{first[0]['id']}/accept", headers=ivan["headers"])).status_code == 200
     done = await client.patch(f"/api/teams/{team['id']}/tasks/{first[0]['id']}", json={"status": "done"}, headers=ivan["headers"])
     assert done.json()["status"] == "done"
     [listed] = (await client.get(f"/api/teams/{team['id']}/projects", headers=boss["headers"])).json()
