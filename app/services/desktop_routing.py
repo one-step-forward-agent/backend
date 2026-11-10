@@ -64,7 +64,7 @@ def family(name):
         return "browser"
     if name.startswith("windows_") or name == "open_app":
         return "windows"
-    if name in {"list_folder", "find_files", "read_text_file", "write_text_file", "create_folder", "move_file", "open_path", "write_spreadsheet"}:
+    if name in {"list_folder", "find_files", "read_text_file", "write_text_file", "create_folder", "move_file", "open_path", "write_spreadsheet", "write_document", "export_document", "convert_document"}:
         return "files"
     return name
 

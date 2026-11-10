@@ -664,11 +664,19 @@ class GigaChatClient:
         payload = {"model": settings.llm_agent_model, "temperature": 0.2, "max_tokens": 1500}
         if settings.uses_openai:
             payload |= {"messages": openai_messages(messages), "tools": openai_tools(functions), "tool_choice": "auto"}
+            if purpose == "desktop":
+                choice = await self._desktop_choice(payload)
+                return {"truncated": True} if choice is None else gigachat_message(choice["message"])
             result = await self._complete(payload, purpose, timeout=60)
             return gigachat_message(result["choices"][0]["message"])
         payload |= {"messages": one_system_message(messages), "functions": functions, "function_call": "auto"}
-        result = await self._complete(payload, purpose, timeout=60)
-        message = result["choices"][0]["message"]
+        if purpose == "desktop":
+            choice = await self._desktop_choice(payload)
+            if choice is None:
+                return {"truncated": True}
+        else:
+            choice = (await self._complete(payload, purpose, timeout=60))["choices"][0]
+        message = choice["message"]
         call = message.get("function_call")
         if call and isinstance(call.get("arguments"), str):
             # Some model versions send the arguments as a JSON string
@@ -685,8 +693,29 @@ class GigaChatClient:
             payload["messages"] = openai_messages(messages)
         else:
             payload["messages"] = one_system_message(messages)
-        result = await self._complete(payload, "desktop", timeout=60)
-        return {"role": "assistant", "content": result["choices"][0]["message"].get("content") or ""}
+        choice = await self._desktop_choice(payload)
+        if choice is None:
+            return {"truncated": True}
+        return {"role": "assistant", "content": choice["message"].get("content") or ""}
+
+    async def _desktop_choice(self, payload: dict) -> dict | None:
+        """Regenerate once on a provider length stop; never return a partial answer or tool call."""
+        deadline = time.monotonic() + 75
+        for limit in (4096, 8192):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                async with asyncio.timeout(remaining):
+                    result = await self._complete({**payload, "max_tokens": limit}, "desktop", timeout=min(60, remaining))
+            except TimeoutError:
+                if limit == 4096:
+                    raise
+                return None
+            choice = result["choices"][0]
+            if choice.get("finish_reason") not in {"length", "max_tokens"}:
+                return choice
+        return None
 
     async def extract_events(self, text: str, timezone: str = "Europe/Moscow") -> list[dict]:
         return (await self.process_message(text, timezone))["events"]

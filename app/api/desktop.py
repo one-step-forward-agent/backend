@@ -43,7 +43,8 @@ MAX_ACTIONS = 32
 LEGACY_MAX_ACTIONS = 12
 MAX_MESSAGES = 2 * MAX_ACTIONS + 8
 # Pasted text and table rows can be long; the token budget limits the rest
-MAX_MESSAGE_CHARS = 12000
+MAX_MESSAGE_CHARS = 32000
+MAX_REPLY_CHARS = 24000
 STEPS_PER_MINUTE = 60
 STEPS_PER_HOUR = 300
 
@@ -179,6 +180,10 @@ RULES = (
     "Локальный клиент может уже передать извлечённый текст PDF/Word/Excel в сообщении. Используй этот текст для ответа, "
     "а не проси переносить вложение в Desktop. open_path только открывает окно; для анализа нужен read_text_file. "
     "Не называй открытие поиска выполненным поиском: прочитай результаты и источники, затем представь конкретные варианты и ссылки. "
+    "Для нового отчёта DOCX используй write_document: не используй write_text_file для DOCX и не открывай Word вместо сохранения. "
+    "Если задание требует PDF, после успешного сохранения DOCX используй export_document при наличии этого инструмента. "
+    "Не сокращай запрошенный листинг и не подставляй многоточия вместо кода. Сверь вариант и требования вложенного задания. "
+    "Если код не запускался, не утверждай, что он был выполнен или отлажен. "
     "Делай одно действие за шаг и смотри на его результат. Не выдумывай результат: если функция вернула ошибку, скажи об этом. "
     "Удалять файлы, запускать команды, скрипты и программы не из списка, менять настройки системы, входить в аккаунты, "
     "вводить пароли и платить ты не можешь — вежливо откажись и предложи, что пользователь сделает сам. "
@@ -322,8 +327,17 @@ async def step(payload: DesktopStepRequest, user: User = Depends(get_current_use
     except Exception:
         logger.exception("Desktop agent step failed")
         raise HTTPException(status_code=502, detail="Ассистент сейчас недоступен, попробуйте позже") from None
+    if answer.get("truncated"):
+        return DesktopStepResponse(content="Ответ не уместился даже после повторной генерации. Обрезанный текст и незавершённое действие не отправлены на компьютер. Попросите сначала закончить листинг, затем оформить отчёт.", actions_left=left)
     call = answer.get("function_call")
     arguments = call.get("arguments") if call and isinstance(call.get("arguments"), dict) else {}
+    if call and call.get("name") == "write_text_file" and str(arguments.get("path", "")).strip().lower().endswith(".docx"):
+        if "write_document" not in allowed:
+            return DesktopStepResponse(content="Для сохранения DOCX обновите клиент Deyla до версии 0.2.2 или новее. Файл не создан.", actions_left=left)
+        if arguments.get("append") is not False and "append" in arguments:
+            return DesktopStepResponse(content="Дописать в существующий DOCX нельзя. Укажите новое имя файла.", actions_left=left)
+        call = {"name": "write_document"}
+        arguments = {key: value for key, value in arguments.items() if key != "append"}
     spec = next((action for action in specs if call and action["name"] == call.get("name")), None)
     if spec and left and valid_arguments(arguments, spec["parameters"]) and len(json.dumps(arguments, ensure_ascii=False)) <= MAX_MESSAGE_CHARS:
         return DesktopStepResponse(
@@ -335,7 +349,9 @@ async def step(payload: DesktopStepRequest, user: User = Depends(get_current_use
     if call:
         return DesktopStepResponse(content="Ассистент предложил неподдерживаемое действие или неверные параметры. Ничего не выполнено.", actions_left=left)
     content = (answer.get("content") or "").strip() or "Не получилось понять задачу — опишите её иначе."
-    return DesktopStepResponse(content=content[:4000], actions_left=left)
+    if len(content) > MAX_REPLY_CHARS:
+        return DesktopStepResponse(content="Полный ответ превышает 24 000 символов. Разделите задачу на части, чтобы сохранить весь код без обрыва.", actions_left=left)
+    return DesktopStepResponse(content=content, actions_left=left)
 
 
 # ---------- signing the app in through the browser ----------

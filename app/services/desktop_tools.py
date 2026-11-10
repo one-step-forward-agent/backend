@@ -32,6 +32,9 @@ AUTOMATION_TOOLS = [
 ]
 
 DOCUMENT_TOOLS = [
+    tool("write_document", "Создать готовый отчёт Word (.docx), не запуская Word. Передай полный текст, заголовки #, таблицы Markdown и закрытые блоки кода ```; сохрани весь листинг и отступы. Новый файл, с подтверждением.",
+         {"path": TEXT, "content": {"type": "string", "maxLength": 24000}, "title": {"type": "string", "maxLength": 200}}, ("path", "content")),
+    tool("export_document", "Экспортировать готовый DOCX в новый PDF через установленный Microsoft Word. Исходный DOCX остаётся без изменений. С подтверждением.", {"path": TEXT, "destination": TEXT}, ("path",)),
     tool("convert_document", "Преобразовать старый Word .doc в настоящий новый .docx через установленный Microsoft Word. Источник может быть явно приложенным файлом вне папок пользователя. Не переименовывает расширение и не заменяет оригинал.", {"path": TEXT, "destination": TEXT}, ("path",)),
 ]
 

@@ -24,7 +24,9 @@ async def openai_api(monkeypatch):
     async def completions(request: web.Request) -> web.Response:
         received.append(await request.json())
         usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
-        return web.json_response({"model": "test-model", "choices": [{"index": 0, "message": answers.pop(0)}], "usage": usage})
+        answer = dict(answers.pop(0))
+        finish_reason = answer.pop("_finish_reason", "stop")
+        return web.json_response({"model": "test-model", "choices": [{"index": 0, "message": answer, "finish_reason": finish_reason}], "usage": usage})
 
     app = web.Application()
     app.router.add_post("/v1/chat/completions", completions)
@@ -51,6 +53,42 @@ async def openai_api(monkeypatch):
 
 def tool_call(name: str, arguments: dict) -> dict:
     return {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+
+
+async def test_desktop_regenerates_length_stopped_answer_without_clipping_code(client, user, openai_api):
+    headers, _ = user
+    complete = "```python\n" + "    # synthetic line with preserved indentation\n" * 130 + "    return result\n```"
+    received = openai_api([{"role": "assistant", "content": 'print("', "_finish_reason": "length"}, {"role": "assistant", "content": complete}])
+    response = await client.post("/api/desktop/step", json={"messages": [{"role": "user", "content": "Напиши полный код"}]}, headers=headers)
+    assert response.status_code == 200 and response.json()["content"] == complete
+    assert [request["max_tokens"] for request in received] == [4096, 8192]
+
+
+async def test_desktop_never_executes_a_length_stopped_document_call(client, user, openai_api):
+    headers, _ = user
+    broken = {**tool_call("write_document", {"path": "Desktop/report.docx", "content": "partial report"}), "_finish_reason": "length"}
+    received = openai_api([broken, broken])
+    payload = {"messages": [{"role": "user", "content": "Создай отчёт"}], "client_actions": ["write_document"]}
+    response = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["action"] is None and "не отправлены" in response.json()["content"]
+    assert len(received) == 2
+
+
+async def test_docx_uses_document_tool_and_confirmation_even_if_model_selects_text_writer(client, user, openai_api):
+    headers, _ = user
+    received = openai_api([tool_call("write_text_file", {"path": "Desktop/report.docx", "content": "# Synthetic report", "append": False})])
+    payload = {"messages": [{"role": "user", "content": "оформи докс отчёт"}], "client_actions": ["write_text_file", "write_document"]}
+    response = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["action"] == {"name": "write_document", "arguments": {"path": "Desktop/report.docx", "content": "# Synthetic report"}}
+    assert body["confirm"] is True
+    assert "write_document" in {tool["function"]["name"] for tool in received[0]["tools"]}
+    openai_api([tool_call("write_text_file", {"path": "Desktop/report.docx", "content": "# Synthetic report"})])
+    payload.pop("client_actions")
+    legacy = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert legacy.json()["action"] is None and "0.2.2" in legacy.json()["content"]
 
 
 async def test_step_returns_the_chosen_action(client, user, openai_api):
