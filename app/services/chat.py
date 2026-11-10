@@ -2130,7 +2130,7 @@ def simple_task(text: str, now: datetime) -> list[dict]:
     return local_items(text, now)
 
 
-async def handle_message(session: AsyncSession, user: User, text: str, attachment=None, voice: dict | None = None, channel: str = "web") -> dict:
+async def handle_message(session: AsyncSession, user: User, text: str, attachment=None, voice: dict | None = None, channel: str = "web", group_context: str | None = None) -> dict:
     """One message of the chat (the site's and Telegram's are the same). `attachment`: a file read by
     app.services.attachments; the chat shows its name with the caption, the assistant reads its text.
     `voice`: a recorded voice message ({"id", "duration"} of kept_files) — the chat shows it as audio, `text` is
@@ -2155,9 +2155,19 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     await prune_history(session, user.id)
     failed = False
     try:
-        wish = None if attachment else await research.resolve_wish(session, user, caption)
+        wish = None if attachment or group_context is not None else await research.resolve_wish(session, user, caption)
         if wish is not None:
             reply = wish
+        elif group_context is not None:
+            # Group quotes are data, never passed through immediate rule-based commands or pending edits.
+            from app.services import agent
+
+            if not settings.assistant_agent or not settings.llm_enabled:
+                raise AssistantUnavailable
+            try:
+                reply = await agent.run(session, user, caption, tz, group_context=group_context)
+            except agent.AgentFailed:
+                raise AssistantUnavailable from None
         elif not attachment and out_of_scope(caption):
             reply = {"kind": "answer", "text": tr(OUT_OF_SCOPE_ANSWER, OUT_OF_SCOPE_ANSWER_EN)}
         else:

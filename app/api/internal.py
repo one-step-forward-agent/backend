@@ -16,6 +16,7 @@ from app.models.models import Notification, User
 from app.schemas import (
     BotAckRequest,
     BotChatRequest,
+    BotGroupChatRequest,
     BotCheckinRequest,
     BotClaimRequest,
     BotCompleteRequest,
@@ -81,6 +82,17 @@ async def chat_message(chat_id: int, payload: BotChatRequest, session: AsyncSess
         await limit_assistant(session, user, payload.text)
     try:
         return await chat.handle_message(session, user, payload.text, channel="telegram")
+    except chat.AssistantUnavailable:
+        raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
+
+
+@router.post("/group-chat/{chat_id}")
+async def group_chat_message(chat_id: int, payload: BotGroupChatRequest, session: AsyncSession = Depends(get_session)):
+    # chat_id is the sender's private Telegram id, never the group's id or a mentioned username.
+    user = await _user_by_chat(session, chat_id)
+    await limit_assistant(session, user, payload.text)
+    try:
+        return await chat.handle_message(session, user, payload.text, channel="telegram", group_context=payload.context)
     except chat.AssistantUnavailable:
         raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
 

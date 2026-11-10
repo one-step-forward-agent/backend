@@ -420,6 +420,11 @@ class BotChatRequest(BaseModel):
     text: str = Field(min_length=1, max_length=50000)
 
 
+class BotGroupChatRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=10000)
+    context: str = Field(default="[]", max_length=24000)
+
+
 class BotUndoRequest(BaseModel):
     event_ids: list[int] = Field(min_length=1, max_length=50)
 
