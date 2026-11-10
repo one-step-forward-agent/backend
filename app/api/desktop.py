@@ -30,6 +30,8 @@ from app.core.database import get_session
 from app.models.models import User
 from app.schemas import TokenResponse
 from app.services import usage
+from app.services.desktop_tools import AUTOMATION_TOOLS, AUTOMATION_RULES, DOCUMENT_TOOLS
+from app.services.desktop_routing import direct_turn, relevant_tools, valid_arguments
 from services.gigachat import GigaChatClient
 
 logger = logging.getLogger(__name__)
@@ -37,11 +39,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/desktop", tags=["desktop"])
 
 # Actions in one task, then the model must answer with words
-MAX_ACTIONS = 12
+MAX_ACTIONS = 32
+LEGACY_MAX_ACTIONS = 12
 MAX_MESSAGES = 2 * MAX_ACTIONS + 8
 # Pasted text and table rows can be long; the token budget limits the rest
 MAX_MESSAGE_CHARS = 12000
-STEPS_PER_MINUTE = 20
+STEPS_PER_MINUTE = 60
 STEPS_PER_HOUR = 300
 
 # What the desktop app can do. Paths are checked again by the app: only the user's own folders
@@ -160,6 +163,8 @@ ACTIONS: list[dict] = [
         "confirm": True,
     },
 ]
+LEGACY_ACTION_NAMES = {action["name"] for action in ACTIONS}
+ACTIONS.extend(AUTOMATION_TOOLS + DOCUMENT_TOOLS)
 ACTION_NAMES = {action["name"] for action in ACTIONS}
 
 RULES = (
@@ -171,6 +176,9 @@ RULES = (
     "имя файла придумай по смыслу; не сказано, какие валюты, — основные (USD, EUR, CNY, GBP, JPY, CHF, TRY, KZT, BYN, AED). "
     "Спрашивай, только если без ответа задачу не сделать совсем. "
     "Файлы, которые пользователь приложил к сообщению, перечислены в нём как «Приложен файл: <путь>» — их можно читать read_text_file. "
+    "Локальный клиент может уже передать извлечённый текст PDF/Word/Excel в сообщении. Используй этот текст для ответа, "
+    "а не проси переносить вложение в Desktop. open_path только открывает окно; для анализа нужен read_text_file. "
+    "Не называй открытие поиска выполненным поиском: прочитай результаты и источники, затем представь конкретные варианты и ссылки. "
     "Делай одно действие за шаг и смотри на его результат. Не выдумывай результат: если функция вернула ошибку, скажи об этом. "
     "Удалять файлы, запускать команды, скрипты и программы не из списка, менять настройки системы, входить в аккаунты, "
     "вводить пароли и платить ты не можешь — вежливо откажись и предложи, что пользователь сделает сам. "
@@ -203,6 +211,15 @@ class DesktopStepRequest(BaseModel):
     client_version: str | None = Field(default=None, max_length=32)
     os: str | None = Field(default=None, max_length=120)
     local_time: str | None = Field(default=None, max_length=40)
+    # Absent: legacy client. An empty list deliberately offers no executable actions.
+    client_actions: list[str] | None = Field(default=None, max_length=80)
+
+    @field_validator("client_actions")
+    @classmethod
+    def bounded_capabilities(cls, value):
+        if value is not None and any(len(name) > 64 for name in value):
+            raise ValueError("capability name too long")
+        return value
 
 
 class DesktopStepResponse(BaseModel):
@@ -237,9 +254,6 @@ def _history(messages: list[DesktopMessage]) -> list[dict]:
 
 
 async def _limit(session: AsyncSession, user: User) -> None:
-    wait = await usage.blocked_for(session, user.id)
-    if wait:
-        raise HTTPException(status_code=429, detail="Лимит ассистента исчерпан, попробуйте позже", headers={"Retry-After": str(wait)})
     ratelimit.hit(f"desktop-minute:{user.id}", STEPS_PER_MINUTE, 60, "Слишком часто — подождите минуту")
     ratelimit.hit(f"desktop-hour:{user.id}", STEPS_PER_HOUR, 3600, "Слишком много действий за час, попробуйте позже")
 
@@ -256,16 +270,50 @@ async def actions(_: User = Depends(get_current_user)) -> dict:
 @router.post("/step", response_model=DesktopStepResponse)
 async def step(payload: DesktopStepRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)) -> DesktopStepResponse:
     """One step of a desktop task: the model answers or picks one action for the app to run."""
-    if not settings.desktop_agent or not settings.llm_enabled:
+    if not settings.desktop_agent:
         raise HTTPException(status_code=503, detail="Агент для компьютера сейчас выключен")
     history = _history(payload.messages)
+    allowed = set(payload.client_actions) & ACTION_NAMES if payload.client_actions is not None else LEGACY_ACTION_NAMES
+    if any(message.get("function_call", {}).get("name") not in allowed for message in history if message.get("function_call")):
+        raise HTTPException(status_code=422, detail="Клиент не поддерживает действие из истории")
     done = sum(1 for message in history if message.get("function_call"))
-    left = max(0, MAX_ACTIONS - done)
+    left = max(0, (MAX_ACTIONS if payload.client_actions is not None else LEGACY_MAX_ACTIONS) - done)
     await _limit(session, user)
+    if payload.client_actions is not None:
+        direct = direct_turn(history, allowed)
+        if direct is not None:
+            call = direct.get("action")
+            if call is None:
+                return DesktopStepResponse(content=direct["content"], actions_left=left)
+            if left:
+                logger.info("Desktop deterministic command; no model request")
+                return DesktopStepResponse(action=DesktopFunctionCall(**call), actions_left=left - 1)
+    if not settings.llm_enabled:
+        raise HTTPException(status_code=503, detail="Для этой задачи нужен настроенный ассистент")
+    wait = await usage.blocked_for(session, user.id)
+    if wait:
+        raise HTTPException(status_code=429, detail="Лимит ассистента исчерпан, попробуйте позже", headers={"Retry-After": str(wait)})
     messages = [{"role": "system", "content": RULES}, {"role": "system", "content": _context(payload, user)}, *history]
+    if allowed - LEGACY_ACTION_NAMES:
+        messages[0]["content"] += "\n\n" + AUTOMATION_RULES
     if not left:
         messages.append({"role": "system", "content": "Лимит действий для этой задачи исчерпан. Коротко скажи, что успел сделать и что осталось."})
-    functions = [{key: value for key, value in action.items() if key != "confirm"} for action in ACTIONS] if left else []
+    specs = [action for action in ACTIONS if action["name"] in allowed]
+    if payload.client_actions is not None:
+        import copy
+        specs = copy.deepcopy(specs)
+        for spec in specs:
+            if spec["name"] == "open_app":
+                spec["parameters"]["properties"]["app"]["enum"].extend(["word", "excel", "powerpoint"])
+            elif spec["name"] == "read_text_file" and "convert_document" in allowed:
+                spec["description"] = "Прочитать текст, PDF с текстовым слоем, Word .docx/.doc (старый .doc требует Word) или Excel .xlsx. Явно приложенные файлы доступны по полному пути вне Desktop. Для больших документов используй next_offset/offset, для нужного варианта — query. Сканы требуют OCR."
+                spec["parameters"]["properties"].update({"offset": {"type": "integer", "minimum": 0, "maximum": 200000}, "query": {"type": "string", "maxLength": 2000}})
+            elif spec["name"] == "read_web_page":
+                spec["description"] = "Прочитать страницу или результаты поиска. Новый клиент при блокировке обычного запроса попробует управляемый браузер, вернёт текст и ссылки; при CAPTCHA потребуется пользователь. Для исследования переходи по найденным ссылкам, не ограничивайся открытием поиска."
+                spec["confirm"] = True
+    if left and settings.desktop_semantic_tools:
+        specs = await relevant_tools(history, specs)
+    functions = [{key: value for key, value in action.items() if key != "confirm"} for action in specs] if left else []
     try:
         if functions:
             answer = await GigaChatClient().agent_step(messages, functions, purpose="desktop")
@@ -276,14 +324,16 @@ async def step(payload: DesktopStepRequest, user: User = Depends(get_current_use
         raise HTTPException(status_code=502, detail="Ассистент сейчас недоступен, попробуйте позже") from None
     call = answer.get("function_call")
     arguments = call.get("arguments") if call and isinstance(call.get("arguments"), dict) else {}
-    if call and call.get("name") in ACTION_NAMES and left and len(json.dumps(arguments, ensure_ascii=False)) <= MAX_MESSAGE_CHARS:
-        spec = next(action for action in ACTIONS if action["name"] == call["name"])
+    spec = next((action for action in specs if call and action["name"] == call.get("name")), None)
+    if spec and left and valid_arguments(arguments, spec["parameters"]) and len(json.dumps(arguments, ensure_ascii=False)) <= MAX_MESSAGE_CHARS:
         return DesktopStepResponse(
             content=(answer.get("content") or "")[:2000],
             action=DesktopFunctionCall(name=call["name"], arguments=arguments),
             confirm=bool(spec.get("confirm")),
             actions_left=left - 1,
         )
+    if call:
+        return DesktopStepResponse(content="Ассистент предложил неподдерживаемое действие или неверные параметры. Ничего не выполнено.", actions_left=left)
     content = (answer.get("content") or "").strip() or "Не получилось понять задачу — опишите её иначе."
     return DesktopStepResponse(content=content[:4000], actions_left=left)
 

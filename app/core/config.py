@@ -73,6 +73,11 @@ class Settings:
     assistant_agent: bool = _bool("ASSISTANT_AGENT", True)
     # The Windows desktop agent (app/api/desktop.py, desktop_agent/); off: /api/desktop/step answers 503
     desktop_agent: bool = _bool("DESKTOP_AGENT", True)
+    # Independent, optional embeddings endpoint (also supports self-hosted multilingual models).
+    embedding_base_url: str = os.getenv("EMBEDDING_BASE_URL", "").strip().rstrip("/")
+    embedding_api_key: str = os.getenv("EMBEDDING_API_KEY", "").strip()
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "").strip()
+    desktop_semantic_tools: bool = _bool("DESKTOP_SEMANTIC_TOOLS", False)
     gigachat_agent_model: str = os.getenv("GIGACHAT_AGENT_MODEL") or os.getenv("GIGACHAT_MODEL", "GigaChat")
     # Which service answers every model request: "gigachat" or "openai" (any OpenAI-compatible API at BASE_URL)
     llm_provider: str = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()

@@ -129,6 +129,53 @@ async def test_turned_off_and_anonymous(client, user, openai_api, monkeypatch):
     assert (await client.get("/api/desktop/actions", headers=headers)).json()["max_actions"] == desktop.MAX_ACTIONS
 
 
+async def test_capability_gating_and_schema_validation(client, user, openai_api):
+    headers, _ = user
+    received = openai_api([tool_call("browser_fill", {"element": "b1", "text": "test"})])
+    payload = {"messages": [{"role": "user", "content": "fill the website field"}], "client_actions": ["browser_fill", "browser_observe"]}
+    result = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert result.json()["action"]["name"] == "browser_fill" and result.json()["confirm"] is True
+    assert {tool["function"]["name"] for tool in received[0]["tools"]} == {"browser_fill", "browser_observe"}
+    openai_api([tool_call("browser_fill", {"element": "b1", "text": "test", "script": "forbidden"})])
+    assert (await client.post("/api/desktop/step", json=payload, headers=headers)).json()["action"] is None
+    openai_api([tool_call("browser_fill", {"element": "b1", "text": "test"})])
+    payload.pop("client_actions")
+    assert (await client.post("/api/desktop/step", json=payload, headers=headers)).json()["action"] is None
+
+
+async def test_direct_command_and_completion_make_no_llm_requests(client, user, openai_api):
+    headers, _ = user
+    received = openai_api([])
+    payload = {"messages": [{"role": "user", "content": "открой калькулятор"}], "client_actions": ["open_app"]}
+    first = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert first.status_code == 200
+    assert first.json()["action"] == {"name": "open_app", "arguments": {"app": "calculator"}}
+    payload["messages"] += [{"role": "assistant", "function_call": first.json()["action"]}, {"role": "function", "content": json.dumps({"ok": True, "started": "calculator"})}]
+    second = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert second.status_code == 200 and "calculator" in second.json()["content"]
+    assert received == []
+
+
+async def test_document_tools_are_capability_gated_and_support_pagination(client, user, openai_api):
+    headers, _ = user
+    received = openai_api([tool_call("read_text_file", {"path": "Desktop/lab.pdf", "query": "вариант 2", "offset": 4500})])
+    payload = {"messages": [{"role": "user", "content": "вариант 2"}], "client_actions": ["read_text_file", "convert_document"], "client_version": "0.2.1"}
+    first = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert first.status_code == 200 and first.json()["action"]["arguments"]["offset"] == 4500
+    specs = {tool["function"]["name"]: tool["function"] for tool in received[0]["tools"]}
+    assert "PDF" in specs["read_text_file"]["description"]
+    assert "convert_document" in specs
+    openai_api([tool_call("convert_document", {"path": "D:/fixture/lab.doc", "destination": "Desktop/lab.docx"})])
+    converted = await client.post("/api/desktop/step", json=payload, headers=headers)
+    assert converted.json()["confirm"] is True
+    received = openai_api([{"role": "assistant", "content": "legacy"}])
+    payload.pop("client_actions")
+    await client.post("/api/desktop/step", json=payload, headers=headers)
+    specs = {tool["function"]["name"]: tool["function"] for tool in received[0]["tools"]}
+    assert "convert_document" not in specs
+    assert "offset" not in specs["read_text_file"]["parameters"]["properties"]
+
+
 # ---------- signing the app in through the browser (accounts without a password: Google, Yandex) ----------
 
 import base64
