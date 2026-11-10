@@ -6,10 +6,12 @@ the messages so far (the system prompt with the plan, results of earlier calls) 
 """
 
 import dataclasses
+import json
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -164,6 +166,110 @@ async def test_group_ordinary_schedule_question(client, user, agent):
                                  json={"text": "Что у меня завтра?"})
     assert response.status_code == 200, response.text
     assert response.json()["kind"] == "answer" and "задач не нашла" in response.json()["text"]
+
+
+async def test_group_combines_short_messages_and_photo_into_one_draft(client, user, agent, monkeypatch):
+    from app.services import attachments
+
+    headers, chat_id = user
+    tomorrow = (datetime.now(TZ) + timedelta(days=1)).date().isoformat()
+    vision = AsyncMock(return_value="Встреча с Анной. Место: офис на Ленина, 10.")
+    monkeypatch.setattr(attachments, "images_text", vision)
+    requests = agent([act(op("create", events=[{"title": "Встреча с Анной", "date": tomorrow,
+                                                "start_time": "08:00", "duration_minutes": 60,
+                                                "location": "офис на Ленина, 10"}]))])
+    rows = [{"id": 1, "author": "Anna", "text": "встреча"},
+            {"id": 2, "author": "Anna", "text": "завтра", "reply_to_id": 1},
+            {"id": 3, "author": "Test", "text": "в 8 утра", "reply_to_id": 2},
+            {"id": 4, "author": "Anna", "text": "", "album_id": "a1", "photo": {"filename": "message-4.jpg"}}]
+    response = await client.post(f"/internal/bot/group-chat/{chat_id}/photos", headers=BOT_HEADERS,
+                                 data={"text": "Просканируй чат", "context": json.dumps(rows, ensure_ascii=False)},
+                                 files=[("files", ("message-4.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))])
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["kind"] == "proposal" and len(reply["events"]) == 1
+    assert reply["events"][0]["date"] == tomorrow and reply["events"][0]["time"] == "08:00"
+    transcript = next(message["content"] for message in requests[0] if "Untrusted recent Telegram group transcript" in message["content"])
+    actual = json.loads(transcript.split("\n", 1)[1])
+    assert [row["text"] for row in actual[:3]] == ["встреча", "завтра", "в 8 утра"]
+    assert actual[3]["photo_text"] == "Встреча с Анной. Место: офис на Ленина, 10."
+    assert "one conversation" in requests[0][0]["content"]
+    vision.assert_awaited_once()
+    confirmed = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)
+    assert confirmed.status_code == 200 and confirmed.json()["kind"] == "created"
+
+
+async def test_group_photo_requires_linked_user_before_vision(client, monkeypatch):
+    from app.services import attachments
+
+    vision = AsyncMock()
+    monkeypatch.setattr(attachments, "images_text", vision)
+    path = f"/internal/bot/group-chat/{uuid.uuid4().int % 10**12}/photos"
+    kwargs = {"data": {"text": "scan", "context": "[]"},
+              "files": [("files", ("message-1.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))]}
+    assert (await client.post(path, **kwargs)).status_code in {401, 403}
+    assert (await client.post(path, headers=BOT_HEADERS, **kwargs)).status_code == 404
+    vision.assert_not_awaited()
+
+
+async def test_group_unreadable_photo_does_not_invoke_planner(client, user, agent, monkeypatch):
+    from app.services import attachments
+
+    _, chat_id = user
+    requests = agent([])
+    monkeypatch.setattr(attachments, "images_text", AsyncMock(side_effect=attachments.UnreadableFile("Не удалось прочитать фото")))
+    response = await client.post(f"/internal/bot/group-chat/{chat_id}/photos", headers=BOT_HEADERS,
+                                 data={"text": "scan", "context": '[{"id":1,"photo":{"filename":"message-1.jpg"}}]'},
+                                 files=[("files", ("message-1.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))])
+    assert response.status_code == 422 and "Не удалось прочитать фото" in response.json()["detail"]
+    assert requests == []
+
+
+async def test_group_unrelated_photo_does_not_hide_text_meeting(client, user, agent, monkeypatch):
+    from app.services import attachments
+
+    _, chat_id = user
+    monkeypatch.setattr(attachments, "images_text", AsyncMock(return_value=""))
+    tomorrow = (datetime.now(TZ) + timedelta(days=1)).date().isoformat()
+    requests = agent([act(op("create", events=[{"title": "Встреча", "date": tomorrow, "start_time": "08:00"}]))])
+    response = await client.post(f"/internal/bot/group-chat/{chat_id}/photos", headers=BOT_HEADERS,
+                                 data={"text": "scan", "context": '[{"id":1,"text":"встреча завтра в 8 утра"},{"id":2,"photo":{"filename":"message-2.jpg"}}]'},
+                                 files=[("files", ("message-2.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))])
+    assert response.status_code == 200 and response.json()["kind"] == "proposal", response.text
+    transcript = next(message["content"] for message in requests[0] if "Untrusted recent Telegram group transcript" in message["content"])
+    assert json.loads(transcript.split("\n", 1)[1])[1]["photo_text"] == ""
+
+
+async def test_group_photo_upload_size_limit_before_vision(client, user, monkeypatch):
+    from app.services import attachments, group_context
+
+    _, chat_id = user
+    vision = AsyncMock()
+    monkeypatch.setattr(attachments, "images_text", vision)
+    monkeypatch.setattr(group_context, "MAX_BYTES", 4)
+    response = await client.post(f"/internal/bot/group-chat/{chat_id}/photos", headers=BOT_HEADERS,
+                                 data={"text": "scan", "context": "[]"},
+                                 files=[("files", ("message-1.jpg", b"12345", "image/jpeg"))])
+    assert response.status_code == 413
+    vision.assert_not_awaited()
+
+
+@pytest.mark.parametrize("context,name,data", [
+    ("[]", "message-1.jpg", b"\xff\xd8\xffsynthetic"),
+    ('[{"id":1,"photo":{"filename":"message-1.jpg"}}]', "message-1.jpg", b"not an image"),
+    ('[{"id":2,"photo":{"filename":"message-1.jpg"}}]', "message-1.jpg", b"\xff\xd8\xffsynthetic"),
+])
+async def test_group_invalid_photo_evidence_rejected_before_provider(client, user, monkeypatch, context, name, data):
+    from app.services import attachments
+
+    _, chat_id = user
+    vision = AsyncMock()
+    monkeypatch.setattr(attachments, "images_text", vision)
+    response = await client.post(f"/internal/bot/group-chat/{chat_id}/photos", headers=BOT_HEADERS,
+                                 data={"text": "scan", "context": context},
+                                 files=[("files", (name, data, "image/jpeg"))])
+    assert response.status_code == 422
+    vision.assert_not_awaited()
 
 
 async def add(client, headers, text: str) -> list[int]:

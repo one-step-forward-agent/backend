@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_bot
-from app.api.routes import chat_with_file, limit_assistant, save_question_answer
+from app.api.routes import chat_with_file, limit_assistant, limit_uploads, save_question_answer
 from app.core import lang
 from app.core.config import settings
 from app.core.database import get_session
@@ -93,6 +93,37 @@ async def group_chat_message(chat_id: int, payload: BotGroupChatRequest, session
     await limit_assistant(session, user, payload.text)
     try:
         return await chat.handle_message(session, user, payload.text, channel="telegram", group_context=payload.context)
+    except chat.AssistantUnavailable:
+        raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
+
+
+@router.post("/group-chat/{chat_id}/photos")
+async def group_chat_photos(
+    chat_id: int,
+    files: list[UploadFile] = File(..., min_length=1, max_length=6),
+    text: str = Form(..., min_length=1, max_length=10000),
+    context: str = Form(..., min_length=2, max_length=24000),
+    session: AsyncSession = Depends(get_session),
+):
+    from app.services import group_context
+
+    user = await _user_by_chat(session, chat_id)
+    limit_uploads(user)
+    await limit_assistant(session, user, text)
+    photos = []
+    remaining = group_context.MAX_BYTES
+    for file in files:
+        data = await file.read(remaining + 1)
+        remaining -= len(data)
+        if remaining < 0:
+            raise HTTPException(status_code=413, detail=lang.tr("Фото превышают 20 МБ", "Photos exceed 20 MB"))
+        photos.append((file.filename or "", data))
+    try:
+        enriched = await group_context.with_photos(context, photos)
+    except group_context.GroupPhotoError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    try:
+        return await chat.handle_message(session, user, text, channel="telegram", group_context=enriched)
     except chat.AssistantUnavailable:
         raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
 
