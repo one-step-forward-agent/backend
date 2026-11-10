@@ -594,10 +594,14 @@ def event_view(event: Event, tz: ZoneInfo, repeats: int = 0) -> dict:
     return view
 
 
-def group_by_day(events: list[Event], tz: ZoneInfo, today: date) -> list[dict]:
+def group_by_day(events: list[Event], tz: ZoneInfo, today: date, *, first: date | None = None) -> list[dict]:
+    """Group overlapping events no earlier than the first day of the requested period, if given."""
     days: dict[date, list[dict]] = {}
-    for event in sorted(events, key=lambda item: (item.start_at.astimezone(tz).date(), not item.all_day, item.start_at)):
-        days.setdefault(event.start_at.astimezone(tz).date(), []).append(event_view(event, tz))
+    for event in sorted(events, key=lambda item: (not item.all_day, item.start_at)):
+        day = event.start_at.astimezone(tz).date()
+        if first is not None:
+            day = max(day, first)
+        days.setdefault(day, []).append(event_view(event, tz))
     return [{"date": day.isoformat(), "label": day_label(day, today), "events": items} for day, items in sorted(days.items())]
 
 
@@ -965,16 +969,17 @@ async def agenda(session: AsyncSession, user: User, scope: str, mark: bool = Fal
     length = 7 if scope == "week" else 1
     start = datetime.combine(first, time.min, tz)
     events = await tasks.events_between(session, user, start, start + timedelta(days=length), limit=200)
+    days = group_by_day(events, tz, today, first=first)
     if mark and scope == "today":
         # Unmarked tasks of the last days come first: marked now, they count in the statistics
         from app.services.insights import OVERDUE_DAYS
 
         past = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=OVERDUE_DAYS), time.min, tz), start, limit=200)
-        events = [event for event in past if tasks.is_overdue(event, today, tz)] + events
+        days = group_by_day([event for event in past if tasks.is_overdue(event, today, tz)], tz, today) + days
     titles = (
         {"today": "Today", "tomorrow": "Tomorrow", "week": "Next 7 days"} if is_en() else {"today": "Сегодня", "tomorrow": "Завтра", "week": "Ближайшие 7 дней"}
     )
-    reply = {"kind": "agenda", "scope": scope, "title": titles.get(scope, tr("План", "Plan")), "date": first.isoformat(), "days": group_by_day(events, tz, today)}
+    reply = {"kind": "agenda", "scope": scope, "title": titles.get(scope, tr("План", "Plan")), "date": first.isoformat(), "days": days}
     return {**reply, "mark": True} if mark else reply
 
 
