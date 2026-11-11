@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import Column, Integer, MetaData, Table, delete
 
 from app.core import make_admin
 from app.api import admin
@@ -20,7 +20,7 @@ from tests.test_integrations import oauth_connect, services  # noqa: F401 - serv
 
 
 @pytest.mark.parametrize("table_name,email_column", [("users", "email"), ("integrations", "account_email")])
-async def test_dashboard_only_reveals_email(table_name, email_column):
+async def test_dashboard_only_reveals_email(table_name, email_column, monkeypatch):
     table = admin._tables()[table_name]
     # Exercise the response serializer without connecting to a database.
     record = {column.name: "private-value" for column in table.columns}
@@ -28,6 +28,7 @@ async def test_dashboard_only_reveals_email(table_name, email_column):
     result = Mock()
     result.mappings.return_value.all.return_value = [record]
     session = Mock(scalar=AsyncMock(return_value=1), execute=AsyncMock(return_value=result))
+    monkeypatch.setattr(admin, "_available_tables", AsyncMock(return_value={table_name: table}))
     sheet = await admin.read_table(table_name, session=session)
     row = dict(zip((column["name"] for column in sheet["columns"]), sheet["data"][0]))
     assert row[email_column] == "reader@example.com"
@@ -54,6 +55,20 @@ async def test_only_admins_open_the_dashboard(client):
         assert response.status_code == 403 and response.json()["detail"] == "Раздел только для администраторов"
     client.cookies.clear()
     assert (await client.get("/api/admin/tables")).status_code == 401
+
+
+async def test_dashboard_ignores_removed_tables_in_loaded_metadata(client, monkeypatch):
+    headers, _ = await account(client, "admin", admin=True)
+    tables = admin._tables()
+    # Simulate a worker whose metadata still includes a table dropped by a deployment.
+    tables["site_settings"] = Table("site_settings", MetaData(), Column("id", Integer, primary_key=True))
+    monkeypatch.setattr(admin, "_tables", lambda: tables)
+    response = await client.get("/api/admin/tables", headers=headers)
+    assert response.status_code == 200
+    names = {table["name"] for table in response.json()}
+    assert "users" in names and "site_settings" not in names
+    assert (await client.get("/api/admin/tables/site_settings", headers=headers)).status_code == 404
+    assert (await client.get("/api/admin/tables/users", headers=headers)).status_code == 200
 
 
 async def test_tables_are_depersonalized(client, services):

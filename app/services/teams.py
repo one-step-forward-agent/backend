@@ -19,7 +19,7 @@ import secrets
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -749,7 +749,7 @@ async def clear_calendar_copy(session: AsyncSession, task: TeamTask) -> None:
 
 async def update_task(session: AsyncSession, user: User, team_id: int, task_id: int, values: dict) -> dict:
     team, me = await member_of(session, user, team_id)
-    task = await session.get(TeamTask, task_id)
+    task = await session.get(TeamTask, task_id, with_for_update=True)
     if not task or task.team_id != team.id:
         raise LookupError(tr("Задача не найдена", "Task not found"))
     manager = task.created_by == user.id or me.role == "admin"
@@ -768,15 +768,20 @@ async def update_task(session: AsyncSession, user: User, team_id: int, task_id: 
                 raise LookupError(tr("Проект не найден", "Project not found"))
             setattr(task, key, value)
     if "assignee_id" in values and values["assignee_id"] != task.assignee_id:
+        require_admin(me)
+        if task.status == TeamTaskStatus.DONE:
+            raise TeamError(tr("Сначала верните выполненную задачу в работу", "Reopen the completed task first"))
         if values["assignee_id"] is None:
+            from app.models.models import TaskReassignment
+            await session.execute(update(TaskReassignment).where(TaskReassignment.task_id == task.id, TaskReassignment.status == "pending").values(status="cancelled"))
             await clear_calendar_copy(session, task)
             task.assignee_id, task.confirm = None, None
         else:
             assignee = await session.get(TeamMember, values["assignee_id"])
             if not assignee or assignee.team_id != team.id:
                 raise LookupError(tr("Участник не найден", "Member not found"))
-            await clear_calendar_copy(session, task)
-            await assign(session, team, task, assignee, user)
+            from app.services import reassignments
+            await reassignments.apply(session, user, team, task, assignee)
     if values.get("status"):
         await set_status(session, user, task, values["status"])
     await session.commit()

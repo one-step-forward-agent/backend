@@ -94,6 +94,12 @@ async def friend_schedule(friend_id: int, date_from: Date, date_to: Date, respon
     return await answer(schedule_sharing.schedule(session, user, friend_id, date_from, date_to))
 
 
+@router.get("/friends/{friend_id}/shared-schedule")
+async def shared_friend_schedule(friend_id: int, date_from: Date, date_to: Date, response: Response, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    response.headers["Cache-Control"] = "no-store"
+    return await answer(schedule_sharing.schedule(session, user, friend_id, date_from, date_to, mutual=True))
+
+
 @router.post("/friends/{friend_id}/tasks", status_code=201)
 async def create_friend_task(friend_id: int, payload: FriendTaskCreate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await answer(friends.create_task_draft(session, user, friend_id, payload.title, payload.date, payload.time, payload.reminder, payload.shared, payload.check))

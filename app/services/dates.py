@@ -30,6 +30,8 @@ WEEKDAY_FORMS = (
 ANY_WEEKDAY = "|".join(f"(?:{form})" for form in WEEKDAY_FORMS)
 MONTH_FORMS = r"январ[ьяе]|феврал[ьяе]|марта?|марте|апрел[ьяе]|ма[йяе]|июн[ьяе]|июл[ьяе]|августа?|августе|сентябр[ьяе]|октябр[ьяе]|ноябр[ьяе]|декабр[ьяе]"
 MONTH_PREFIXES = ("янв", "фев", "мар", "апр", "ма", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
+ENGLISH_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december")
+ENGLISH_MONTH_FORMS = "|".join(ENGLISH_MONTHS)
 NUMBER_WORDS = {
     "один": 1, "одну": 1, "одного": 1, "одной": 1, "два": 2, "две": 2, "двух": 2, "пару": 2, "пара": 2, "три": 3, "трёх": 3,
     "трех": 3, "четыре": 4, "четырёх": 4, "четырех": 4, "пять": 5, "пяти": 5, "шесть": 6, "шести": 6, "семь": 7, "семи": 7,
@@ -259,11 +261,25 @@ def _explicit_date(low: str, today: date, earliest: date | None = None) -> tuple
     earliest = earliest or today
     if match := re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", low):
         return _safe_date(int(match.group(1)), int(match.group(2)), int(match.group(3))), match.span()
-    if match := re.search(rf"\b(\d{{1,2}})(?:-?(?:го|ое|е|ого))?\s+({MONTH_FORMS})\b(?:\s+(\d{{4}})(?:\s*г(?:ода|\.)?)?)?", low):
-        found = _safe_date(int(match.group(3) or today.year), _month(match.group(2)), int(match.group(1)))
-        if found and not match.group(3) and found < earliest:
+    for pattern, month_index, day_index in (
+        (rf"\b({ENGLISH_MONTH_FORMS})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b", 1, 2),
+        (rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({ENGLISH_MONTH_FORMS})(?:,?\s+(\d{{4}}))?\b", 2, 1),
+    ):
+        if match := re.search(pattern, low):
+            year = int(match.group(3)) if match.group(3) else today.year
+            found = _safe_date(year, ENGLISH_MONTHS.index(match.group(month_index)) + 1, int(match.group(day_index)))
+            if found and not match.group(3) and found < earliest:
+                found = _safe_date(found.year + 1, found.month, found.day)
+            return found, match.span()
+    if match := re.search(rf"\b(\d{{1,2}})(?:-?(?:го|ое|е|ого))?\s+({MONTH_FORMS})\b(?:\s*,?\s*(?:в\s+)?(\d{{4}})(?:\s*г(?:ода|оду|\.)?)?)?", low):
+        contextual_year = re.search(r"\b(?:в|на)\s+((?:19|20|21)\d{2})\s+год(?:у|а)?\b", low)
+        following_year = re.match(r"\s+(?:следующего|будущего)\s+года\b", low[match.end():])
+        explicit_year = int(match.group(3)) if match.group(3) else int(contextual_year.group(1)) if contextual_year else today.year + 1 if following_year else None
+        found = _safe_date(explicit_year or today.year, _month(match.group(2)), int(match.group(1)))
+        if found and explicit_year is None and found < earliest:
             found = _safe_date(found.year + 1, found.month, found.day)
-        return found, match.span()
+        start = contextual_year.start() if contextual_year and contextual_year.end() <= match.start() and not low[contextual_year.end():match.start()].strip() else match.start()
+        return found, (start, match.end() + following_year.end() if following_year else match.end())
     if match := re.search(rf"\b{ORDINAL_DAY}\s+({MONTH_FORMS})\b(?:\s+(\d{{4}}))?", low):
         day = _ordinal(match.group(1), match.group(2))
         found = _safe_date(int(match.group(4) or today.year), _month(match.group(3)), day) if day else None
@@ -296,6 +312,12 @@ def _explicit_date(low: str, today: date, earliest: date | None = None) -> tuple
         if day and (match.group(1) or match.group(4)):
             return _month_day(day, today, earliest), match.span()
     return None, None
+
+
+def stated_year(text: str) -> int | None:
+    """A single explicit year is authoritative when a model shortens a date phrase."""
+    years = set(re.findall(r"(?<!\d)(?:19|20|21)\d{2}(?!\d)", text))
+    return int(next(iter(years))) if len(years) == 1 else None
 
 
 def invalid_explicit_date(text: str, today: date) -> bool:

@@ -66,6 +66,8 @@ def view(draft: SendDraft, user: User) -> dict:
         if payload.get("cancel_task"):
             head = tr(f"🗑 Отменить задачу у друга **{to}**?", f"🗑 Cancel the task for **{to}**?")
     lines = [head, f"**{payload['title'].replace('*', '')}**", f"🕒 {when}"]
+    if payload.get("description"):
+        lines.append(payload["description"])
     if draft.kind == SCHEDULE_SHARE:
         count = len(payload['events'])
         when = tr(f"Существующих задач: {count}", f"Existing tasks: {count}")
@@ -195,9 +197,9 @@ async def friend_reminder(session, user, friend: User, name: str, title: str, st
     return await _create(session, user, FRIEND_REMINDER, payload)
 
 
-async def team_task(session, user, team: Team, assignee: TeamMember, title: str, deadline: datetime | None, start: datetime | None, project_id: int | None, check: bool | None) -> dict:
+async def team_task(session, user, team: Team, assignee: TeamMember | None, title: str, deadline: datetime | None, start: datetime | None, project_id: int | None, check: bool | None, description: str | None = None) -> dict:
     payload = {
-        "team_id": team.id, "team": team.tag, "assignee_id": assignee.id, "to": assignee.name, "title": title[:MAX_TITLE],
+        "team_id": team.id, "team": team.tag, "assignee_id": assignee.id if assignee else None, "to": assignee.name if assignee else team.name, "title": title[:MAX_TITLE], "description": description,
         "deadline": deadline.isoformat() if deadline else None, "start": start.isoformat() if start else None,
         "project_id": project_id, "check": check, "all_day": False,
     }
@@ -311,11 +313,11 @@ async def send(session: AsyncSession, user: User, draft_id: int) -> dict:
             result = await friends.delegate(session, user, friend, payload["title"], start, end, bool(payload.get("all_day")), bool(payload.get("shared")), payload.get("check"))
     else:
         team, _ = await teams.member_of(session, user, payload["team_id"])
-        assignee = await session.get(TeamMember, payload["assignee_id"])
-        if not assignee or assignee.team_id != team.id:
+        assignee = await session.get(TeamMember, payload["assignee_id"]) if payload.get("assignee_id") else None
+        if payload.get("assignee_id") and (not assignee or assignee.team_id != team.id):
             raise DraftError(tr("Этого участника больше нет в команде", "This member is no longer in the team"))
         deadline, start = _local(payload.get("deadline"), tz), _local(payload.get("start"), tz)
-        task = await teams.create_task(session, user, team, payload["title"], assignee, deadline, start, payload.get("project_id"), check=payload.get("check"))
+        task = await teams.create_task(session, user, team, payload["title"], assignee, deadline, start, payload.get("project_id"), description=payload.get("description"), check=payload.get("check"))
         result = await teams.card_for(session, task, user, "created")
         draft = await own(session, user, draft_id)
     if result.get("kind") == "answer":
@@ -330,6 +332,11 @@ async def send(session: AsyncSession, user: User, draft_id: int) -> dict:
 
 async def refresh(session: AsyncSession, user: User, items: list[dict]) -> list[dict]:
     """History items whose reply is a draft show it as it is now."""
+    for item in items:
+        reply = item.get("reply")
+        if isinstance(reply, dict) and reply.get("kind") == "send_drafts":
+            children = await refresh(session, user, [{"reply": card} for card in reply.get("drafts", [])])
+            item["reply"] = {**reply, "drafts": [child["reply"] for child in children]}
     ids = [item["reply"]["draft_id"] for item in items if isinstance(item.get("reply"), dict) and item["reply"].get("kind") == CARD]
     if not ids:
         return items

@@ -378,6 +378,8 @@ async def delete_tasks(session: AsyncSession, user: User, events: list[Event], s
             doomed |= {event.id: event for event in await session.scalars(select(Event).where(*conditions))}
             if scope == "following":
                 await session.execute(update(Event).where(Event.user_id == user.id, Event.series_id == series_id).values(recurrence_rule=None))
+    from app.services import completion
+    await completion.cleanup(session, event_ids=list(doomed))
     await delete_from_calendars(session, user.id, list(doomed.values()), whole_series=scope == "all")
     for event in doomed.values():
         await session.delete(event)

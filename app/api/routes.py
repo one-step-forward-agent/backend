@@ -170,6 +170,8 @@ async def delete_current_user(user: User = Depends(get_current_user), session: A
         except Exception:
             logger.exception("Could not revoke Google access while deleting user %s", user.id)
     event_ids = list(await session.scalars(select(Event.id).where(Event.user_id == user.id)))
+    from app.services import completion
+    await completion.cleanup(session, event_ids=event_ids)
     user_id = user.id
     await session.execute(delete(User).where(User.id == user.id))
     await session.commit()

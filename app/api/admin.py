@@ -16,7 +16,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Integer, Numeric, SmallInteger, Table, Time, func, or_, select, update
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Integer, Numeric, SmallInteger, Table, Time, func, inspect, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +65,14 @@ async def get_admin(user: User = Depends(get_current_user)) -> User:
 
 def _tables() -> dict[str, Table]:
     return {table.name: table for table in Base.metadata.sorted_tables if table.name not in HIDDEN_TABLES}
+
+
+async def _available_tables(session: AsyncSession) -> dict[str, Table]:
+    # A deployment can remove a table while an existing worker still has its model loaded.
+    # Intersect with live schema names; never expose unregistered database tables.
+    connection = await session.connection()
+    existing = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
+    return {name: table for name, table in _tables().items() if name in existing}
 
 
 def _kind(column) -> str:
@@ -130,7 +138,7 @@ def _plain(value: Any) -> Any:
 @router.get("/tables")
 async def list_tables(_: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
     result = []
-    for table in _tables().values():
+    for table in (await _available_tables(session)).values():
         count = await session.scalar(select(func.count()).select_from(table))
         result.append(_describe(table, count or 0))
     return result
@@ -138,7 +146,7 @@ async def list_tables(_: User = Depends(get_admin), session: AsyncSession = Depe
 
 @router.get("/tables/{name}")
 async def read_table(name: str, _: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
-    table = _tables().get(name)
+    table = (await _available_tables(session)).get(name)
     if table is None:
         raise HTTPException(status_code=404, detail="Таблица не найдена")
     columns = _columns(table)

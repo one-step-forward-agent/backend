@@ -1183,7 +1183,8 @@ def normalize_item(raw: dict, text: str, now: datetime, single: bool) -> dict | 
         local_deadline, rest = take_deadline(text, now)
         deadline = deadline or local_deadline
         whole = dates.parse(rest, now)
-        parsed.date = parsed.date or whole.date
+        # The original request may contain a year omitted by the model's date_phrase.
+        parsed.date = whole.date if whole.date and (dates.stated_year(rest) == whole.date.year or re.search(r"(?:следующего|будущего)\s+года", rest, re.I)) else parsed.date or whole.date
         parsed.end_date = parsed.end_date or whole.end_date
         parsed.rrule = parsed.rrule or whole.rrule
         if parsed.time is None:
@@ -2278,6 +2279,14 @@ def prefer_ai(text: str) -> bool:
 async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict:
     """Recognized actions run here and never depend on what the model writes about them. `attachment`: the file
     sent with the message, which a reminder set in it delivers ("пришли этот файл в 21:00")."""
+    from app.services import agent as distribution_agent
+    if distribution_agent.wants_distribution(text):
+        if settings.assistant_agent and settings.llm_enabled:
+            try:
+                return await distribution_agent.run(session, user, text, tz, attachment)
+            except distribution_agent.AgentFailed:
+                pass
+        return {"kind": "answer", "text": tr("Сейчас не удалось подготовить распределение. Ничего не создано и не отправлено; повторите запрос позже.", "Task distribution is unavailable right now. Nothing was created or sent; please retry later.")}
     if attachment is None:
         from app.services import send_drafts
 

@@ -73,5 +73,7 @@ async def remove(session: AsyncSession, user: User, team_id: int, task_id: int, 
 
 
 async def remove_task_contents(session: AsyncSession, task_ids: list[int]) -> None:
+    from app.services import completion
+    await completion.cleanup(session, task_ids=task_ids)
     for record in await session.scalars(select(TeamTaskFile).where(TeamTaskFile.task_id.in_(task_ids))):
         await asyncio.to_thread(file_path(record).unlink, missing_ok=True)

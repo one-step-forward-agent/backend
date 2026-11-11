@@ -99,21 +99,24 @@ async def visibility_values(session: AsyncSession, user: User, values: dict, eve
     values["visibility"], values["shared_friend_ids"] = visibility, ids
 
 
-async def schedule(session: AsyncSession, viewer: User, friend_id: int, first: date, last: date) -> dict:
+async def schedule(session: AsyncSession, viewer: User, friend_id: int, first: date, last: date, *, mutual: bool = False) -> dict:
     mine, theirs = await friends.pair(session, viewer.id, friend_id)
     owner = await session.get(User, friend_id)
     if not mine or not theirs or mine.status != FriendStatus.ACCEPTED or theirs.status != FriendStatus.ACCEPTED or not owner or not owner.is_active:
         raise LookupError(tr("Друг не найден", "Friend not found"))
     if last < first or (last - first).days > 92:
         raise friends.FriendError(tr("Выберите период не больше 93 дней", "Choose a period of at most 93 days"))
-    tz = tasks.local_tz(owner)
+    tz = tasks.local_tz(viewer if mutual else owner)
     start = datetime.combine(first, time.min, tz)
     end = datetime.combine(last + timedelta(days=1), time.min, tz)
     # Filter in SQL before encrypted titles are loaded. No hidden counts or busy markers.
     events = list(await session.scalars(
         select(Event).where(
-            Event.user_id == owner.id, Event.start_at < end, Event.end_at > start,
-            or_(Event.visibility == "friends", and_(Event.visibility == "selected", viewer.id == any_(Event.shared_friend_ids))),
+            Event.start_at < end, Event.end_at > start,
+            or_(
+                and_(Event.user_id == owner.id, or_(Event.visibility == "friends", and_(Event.visibility == "selected", viewer.id == any_(Event.shared_friend_ids)))),
+                and_(Event.user_id == viewer.id, or_(Event.visibility == "friends", and_(Event.visibility == "selected", owner.id == any_(Event.shared_friend_ids)))) if mutual else False,
+            ),
         ).order_by(Event.start_at, Event.id).limit(1001)
     ))
     return {
@@ -126,5 +129,6 @@ async def schedule(session: AsyncSession, viewer: User, friend_id: int, first: d
             "last_day": (event.end_at.astimezone(tz) - timedelta(microseconds=1)).date().isoformat(),
             "all_day": event.all_day, "completed": event.completed_at is not None,
             "deadline_at": event.deadline_at.astimezone(tz).isoformat() if event.deadline_at else None,
+            **({"role": "sender" if event.user_id == viewer.id else "performer", "owned": event.user_id == viewer.id} if mutual else {}),
         } for event in events[:1000]],
     }

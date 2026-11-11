@@ -16,7 +16,7 @@ def mailbox(monkeypatch):
     async def send_email(to, subject, text, html=None):
         letters.append({"to": to, "subject": subject, "text": text})
 
-    monkeypatch.setattr(auth, "settings", dataclasses.replace(settings, smtp_user="robot@yandex.ru", smtp_password="app-password"))
+    monkeypatch.setattr(auth, "settings", dataclasses.replace(settings, email_verification_enabled=True, smtp_user="robot@yandex.ru", smtp_password="app-password"))
     monkeypatch.setattr(auth, "send_email", send_email)
     return letters
 

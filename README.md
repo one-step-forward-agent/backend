@@ -4,7 +4,17 @@ Backend for Focus Day, a calendar assistant built on FastAPI. It stores users, c
 
 ## Features
 
+Email confirmation is disabled by default. `EMAIL_VERIFICATION_ENABLED=false` skips confirmation while retaining SMTP credentials for other email features. Set it to `true` and restart the backend to require confirmation with configured SMTP credentials. There is no dashboard switch or settings API. No verification marker is stored on user accounts or shown in dashboard user sheets. Migration `0058_remove_site_settings` drops the obsolete settings table and its data; downgrade recreates an empty table with defaults.
+
 Team execution follows acceptance → “Started execution” → “Done”. Completing a team task through the calendar, bot, or assistant also requires it to be in progress first.
+
+Completion is independent of the optional report. `GET/PUT /api/events/{id}/completion-report` and `GET/PUT /api/teams/{team_id}/tasks/{task_id}/completion-report` address the same report for a team task. Reports store encrypted tools, conclusions and notes. POST to the report's `/files` endpoint attaches a result (up to 20 PDF/Word/Excel/image files, each bounded by `MAX_FILE_SIZE_MB`). `/api/completion-files/{id}` downloads or deletes a result. Event reports require ownership; team reads require current membership and edits require the current performer (or the creator/admin of an unassigned task). Shared calendar visibility never grants report access.
+
+`GET /api/friends/{id}/shared-schedule` supplies a read-only, mutual schedule of explicitly shared personal tasks. It returns limited calendar fields in the viewer's timezone and keeps descriptions, reports and files private.
+
+Team reassignment uses `POST /api/teams/{team_id}/tasks/{task_id}/reassign` with `assignee_id` and optional `force`. Only admins can force. Members may transfer their own task or volunteer to take one; `/api/teams/{team_id}/reassignments` lists requests and `/{request_id}/accept|reject|cancel` handles them. The recipient approves a transfer, the current performer approves a takeover, and an admin approves a volunteer for an unassigned task. Reassignment resets execution and moves the calendar copy. Completed tasks must be reopened first.
+
+Text/document distribution uses multiple `delegate` operations in one assistant turn (up to 10 tasks). A `send_drafts` reply contains separate, owner-scoped `send_draft` cards. Missing recipients/dates or model-detected specification gaps produce numbered questions, with no partial draft creation or sending. The sending confirmation and recipient's acceptance remain separate. Extraction and suggestions require the configured LLM; tests use a scripted provider. Migrations `0055_completion_reports` and `0056_task_reassignments` must be applied before using these endpoints.
 
 - **Events and calendars**: CRUD for events, including reminders and recurrence, plus file attachments (PDF, DOC/DOCX, XLS/XLSX, PNG/JPG).
 - **AI assistant**: natural-language requests (in Russian) are parsed by GigaChat into proposed events, which the user confirms before they are saved.

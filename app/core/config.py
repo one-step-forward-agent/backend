@@ -115,7 +115,8 @@ class Settings:
     cors_origins: tuple[str, ...] = _list("CORS_ORIGINS")
     public_app_url: str = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
     # Mail for sign-up codes (Yandex: smtp.yandex.ru:465 over SSL, the password is an app password from id.yandex.ru).
-    # With SMTP_USER and SMTP_PASSWORD set, a password sign-up needs the code sent to the email
+    # Confirmation is opt-in and independent of SMTP credentials.
+    email_verification_enabled: bool = _bool("EMAIL_VERIFICATION_ENABLED", False)
     smtp_host: str = os.getenv("SMTP_HOST", "smtp.yandex.ru").strip()
     smtp_port: int = int(os.getenv("SMTP_PORT", "465"))
     smtp_user: str = os.getenv("SMTP_USER", "").strip()
@@ -124,7 +125,7 @@ class Settings:
 
     @property
     def email_verification(self) -> bool:
-        return bool(self.smtp_user and self.smtp_password)
+        return self.email_verification_enabled and bool(self.smtp_user and self.smtp_password)
 
     @property
     def uses_openai(self) -> bool:

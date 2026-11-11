@@ -462,6 +462,17 @@ class OnboardingProfile(BaseModel):
         return self
 
 
+class CompletionReportWrite(BaseModel):
+    tools: str = Field(default="", max_length=4000)
+    conclusions: str = Field(default="", max_length=10000)
+    note: str = Field(default="", max_length=10000)
+
+    @field_validator("tools", "conclusions", "note")
+    @classmethod
+    def trim_report_text(cls, value: str) -> str:
+        return value.strip()
+
+
 class CompleteRequest(BaseModel):
     completed: bool = True
 

@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
@@ -204,6 +204,27 @@ class EventFile(Base):
     mime_type: Mapped[str] = mapped_column(String(100))
     file_size: Mapped[int] = mapped_column(Integer)
     storage_path: Mapped[str] = mapped_column(String(1000))
+
+
+class CompletionReport(Base):
+    __tablename__ = "completion_reports"
+    __table_args__ = (CheckConstraint("(event_id IS NOT NULL) <> (team_task_id IS NOT NULL)", name="ck_completion_report_target"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), unique=True)
+    team_task_id: Mapped[int | None] = mapped_column(ForeignKey("team_tasks.id", ondelete="CASCADE"), unique=True)
+    details: Mapped[dict] = mapped_column(EncryptedJSON("completion_reports.details"), default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CompletionFile(Base):
+    __tablename__ = "completion_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("completion_reports.id", ondelete="CASCADE"), index=True)
+    original_filename: Mapped[str] = mapped_column(EncryptedText("completion_files.original_filename"))
+    stored_filename: Mapped[str] = mapped_column(String(255), unique=True)
+    file_size: Mapped[int] = mapped_column(Integer)
 
 
 class Integration(Base):
@@ -470,6 +491,19 @@ class TeamTask(Base):
     event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class TaskReassignment(Base):
+    __tablename__ = "task_reassignments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("team_tasks.id", ondelete="CASCADE"), index=True)
+    requester_id: Mapped[int] = mapped_column(ForeignKey("team_members.id", ondelete="CASCADE"))
+    proposed_id: Mapped[int] = mapped_column(ForeignKey("team_members.id", ondelete="CASCADE"))
+    previous_id: Mapped[int | None] = mapped_column(Integer)
+    approver_id: Mapped[int | None] = mapped_column(ForeignKey("team_members.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class TeamTaskFile(Base):

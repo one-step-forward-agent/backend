@@ -114,6 +114,9 @@ async def disconnect_integration(slug: str, purge: bool = False, user: User = De
     integration = await _require_integration(session, user, slug)
     if purge:
         calendar_ids = select(Calendar.id).where(Calendar.user_id == user.id, Calendar.provider == slug)
+        from app.services import completion
+        event_ids = list(await session.scalars(select(Event.id).where(Event.user_id == user.id, Event.calendar_id.in_(calendar_ids))))
+        await completion.cleanup(session, event_ids=event_ids)
         await session.execute(delete(Event).where(Event.user_id == user.id, Event.calendar_id.in_(calendar_ids)))
         await session.execute(delete(Calendar).where(Calendar.id.in_(calendar_ids)))
     if slug == "google":
