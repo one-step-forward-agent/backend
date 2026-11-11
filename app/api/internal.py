@@ -281,7 +281,9 @@ async def complete(chat_id: int, event_id: int, payload: BotCompleteRequest, ses
         raise HTTPException(status_code=409, detail=str(error)) from None
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
-    return chat.event_view(event, tasks.local_tz(user))
+    result = chat.event_view(event, tasks.local_tz(user))
+    result["team_task"] = (await tasks.team_execution(session, user, [event])).get(event.id)
+    return result
 
 
 @router.get("/chat/{chat_id}/stats")

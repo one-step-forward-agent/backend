@@ -1,4 +1,4 @@
-"""Completion evidence follows event ownership or current team membership, never calendar visibility."""
+"""Completion evidence belongs only to Team Development tasks and current team members."""
 import asyncio
 from pathlib import Path
 from uuid import uuid4
@@ -22,8 +22,9 @@ async def target(session: AsyncSession, user: User, *, event_id: int | None = No
         if not event or event.user_id != user.id:
             raise LookupError(tr("Задача не найдена", "Task not found"))
         task = await session.scalar(select(TeamTask).where(TeamTask.event_id == event.id))
-        if task:
-            team_id, task_id = task.team_id, task.id
+        if not task:
+            raise LookupError(tr("Отчёт доступен только для командных задач", "Reports are only available for team tasks"))
+        team_id, task_id = task.team_id, task.id
     if task_id is not None:
         _, member = await teams.member_of(session, user, team_id)
         task = await session.get(TeamTask, task_id, with_for_update=write)
@@ -34,13 +35,7 @@ async def target(session: AsyncSession, user: User, *, event_id: int | None = No
         condition = CompletionReport.team_task_id == task.id
         values = {"team_task_id": task.id}
     else:
-        if event is not None and write:
-            event = await session.get(Event, event.id, with_for_update=True, populate_existing=True)
-        if event is None:
-            raise LookupError(tr("Задача не найдена", "Task not found"))
-        can_edit, completed = True, event.completed_at is not None
-        condition = CompletionReport.event_id == event.id
-        values = {"event_id": event.id}
+        raise LookupError(tr("Задача не найдена", "Task not found"))
     if write and not can_edit:
         raise PermissionError(tr("Отчёт заполняет исполнитель задачи", "Only the task performer can edit the report"))
     if write and not completed:

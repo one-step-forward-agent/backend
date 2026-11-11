@@ -1,51 +1,61 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 from sqlalchemy import text
 
 from app.core.database import session_factory
 from app.services import completion
+from tests.conftest import BOT_HEADERS
 from tests.test_friends import person
 from tests.test_schedule_sharing import create
 from tests.test_team_execution import accepted_task
 from tests.test_teams import member_id
 
 
-async def test_personal_report_is_optional_private_encrypted_and_kept_on_reopen(client):
-    owner, stranger = await person(client, "Owner"), await person(client, "Stranger")
+@pytest.mark.parametrize("write", [False, True])
+async def test_report_scope_rejects_non_team_events(write):
+    session = AsyncMock()
+    session.get.return_value = SimpleNamespace(id=7, user_id=1, completed_at=True)
+    session.scalar.return_value = None
+    with pytest.raises(LookupError):
+        await completion.target(session, SimpleNamespace(id=1), event_id=7, write=write)
+
+
+@pytest.mark.parametrize("write", [False, True])
+async def test_report_scope_resolves_calendar_copy_to_team_task(monkeypatch, write):
+    session = AsyncMock()
+    event = SimpleNamespace(id=7, user_id=1)
+    task = SimpleNamespace(id=5, team_id=3, assignee_id=2, status="done")
+    report = SimpleNamespace(id=9)
+    session.get.side_effect = [event, task]
+    session.scalar.side_effect = [task, report]
+    monkeypatch.setattr(completion.teams, "member_of", AsyncMock(return_value=(None, SimpleNamespace(id=2))))
+    result, values, can_edit = await completion.target(session, SimpleNamespace(id=1), event_id=7, write=write)
+    assert result is report and values == {"team_task_id": 5} and can_edit
+
+
+async def test_personal_task_completes_without_report_and_rejects_report_endpoints(client):
+    owner = await person(client, "Owner")
     event = await create(client, owner)
     url = f"/api/events/{event['id']}/completion-report"
-    body = {"tools": "Excel", "conclusions": "Costs reduced", "note": "Method explained"}
-    assert (await client.put(url, headers=owner["headers"], json=body)).status_code == 409
-    assert (await client.post(f"/api/events/{event['id']}/complete", headers=owner["headers"], json={"completed": True})).status_code == 200
-    empty = (await client.get(url, headers=owner["headers"])).json()
-    assert empty["tools"] == "" and empty["files"] == []
-    saved = await client.put(url, headers=owner["headers"], json=body)
-    assert saved.status_code == 200, saved.text
-    uploaded = await client.post(f"{url}/files", headers=owner["headers"], files={"file": ("Итоги.pdf", b"%PDF result", "application/pdf")})
-    assert uploaded.status_code == 201, uploaded.text
-    [file] = uploaded.json()["files"]
-    download_url = f"/api/completion-files/{file['id']}"
-    download = await client.get(download_url, headers=owner["headers"])
-    assert download.content == b"%PDF result" and download.headers["cache-control"] == "no-store"
-    assert download.headers["content-disposition"].startswith("attachment;")
-    for method, path in (("GET", url), ("PUT", url), ("GET", download_url), ("DELETE", download_url)):
-        response = await client.request(method, path, headers=stranger["headers"], **({"json": body} if method == "PUT" else {}))
-        assert response.status_code == 404
-    async with session_factory() as session:
-        details = await session.scalar(text("select details from completion_reports where event_id=:id"), {"id": event["id"]})
-        filename = await session.scalar(text("select original_filename from completion_files where id=:id"), {"id": file["id"]})
-        assert details.startswith("enc:v1:") and filename.startswith("enc:v1:")
-        record = await session.get(completion.CompletionFile, file["id"])
-        path = completion.file_path(record)
-    await client.post(f"/api/events/{event['id']}/complete", headers=owner["headers"], json={"completed": False})
-    reopened = (await client.get(url, headers=owner["headers"])).json()
-    assert reopened["note"] == body["note"] and not reopened["can_edit"]
-    assert (await client.delete(f"/api/events/{event['id']}", headers=owner["headers"])).status_code == 204
-    assert not path.exists()
+    for completed in (True, False, True):
+        response = await client.post(f"/api/events/{event['id']}/complete", headers=owner["headers"], json={"completed": completed})
+        assert response.status_code == 200, response.text
+        assert response.json()["team_task"] is None
+        assert bool(response.json()["completed_at"]) == completed
+    assert (await client.get(url, headers=owner["headers"])).status_code == 404
+    assert (await client.put(url, headers=owner["headers"], json={"note": "Personal"})).status_code == 404
+    assert (await client.post(f"{url}/files", headers=owner["headers"], files={"file": ("result.pdf", b"synthetic")})).status_code == 404
+    bot_done = await client.post(f"/internal/bot/chat/{owner['chat_id']}/events/{event['id']}/complete", headers=BOT_HEADERS, json={"completed": True})
+    assert bot_done.status_code == 200 and bot_done.json()["team_task"] is None
 
 
 async def test_team_report_is_shared_between_calendar_and_team_but_only_performer_edits(client):
     boss, worker, team, task, event = await accepted_task(client)
     await client.post(f"/api/team-tasks/{task['id']}/start", headers=worker["headers"])
-    await client.post(f"/api/team-tasks/{task['id']}/done", headers=worker["headers"])
+    done = await client.post(f"/internal/bot/chat/{worker['chat_id']}/events/{event.id}/complete", headers=BOT_HEADERS, json={"completed": True})
+    assert done.status_code == 200 and done.json()["team_task"] == {"task_id": task["id"], "status": "done"}
     own = f"/api/events/{event.id}/completion-report"
     shared = f"/api/teams/{team['id']}/tasks/{task['id']}/completion-report"
     saved = await client.put(own, headers=worker["headers"], json={"note": "Worker result"})
@@ -57,6 +67,13 @@ async def test_team_report_is_shared_between_calendar_and_team_but_only_performe
     assert upload.status_code == 201, upload.text
     [file] = upload.json()["files"]
     assert (await client.get(f"/api/completion-files/{file['id']}", headers=boss["headers"])).status_code == 200
+    async with session_factory() as session:
+        details = await session.scalar(text("select details from completion_reports where team_task_id=:id"), {"id": task["id"]})
+        filename = await session.scalar(text("select original_filename from completion_files where id=:id"), {"id": file["id"]})
+        assert details.startswith("enc:v1:") and filename.startswith("enc:v1:")
+    await client.post(f"/api/events/{event.id}/complete", headers=worker["headers"], json={"completed": False})
+    reopened = (await client.get(own, headers=worker["headers"])).json()
+    assert reopened["note"] == "Worker result" and not reopened["can_edit"]
     assert (await client.get(own, headers=boss["headers"])).status_code == 404
     removed = await client.delete(f"/api/teams/{team['id']}/members/{member_id(team, 'Иван')}", headers=boss["headers"])
     assert removed.status_code == 204, removed.text
@@ -65,10 +82,10 @@ async def test_team_report_is_shared_between_calendar_and_team_but_only_performe
 
 
 async def test_report_validates_text_and_upload_bounds(client, monkeypatch):
-    owner = await person(client, "Owner")
-    event = await create(client, owner)
-    await client.post(f"/api/events/{event['id']}/complete", headers=owner["headers"], json={"completed": True})
-    url = f"/api/events/{event['id']}/completion-report"
+    _, owner, _, task, event = await accepted_task(client)
+    await client.post(f"/api/team-tasks/{task['id']}/start", headers=owner["headers"])
+    await client.post(f"/api/team-tasks/{task['id']}/done", headers=owner["headers"])
+    url = f"/api/events/{event.id}/completion-report"
     assert (await client.put(url, headers=owner["headers"], json={"tools": "x" * 4001})).status_code == 422
     assert (await client.post(f"{url}/files", headers=owner["headers"], files={"file": ("bad.exe", b"invalid")})).status_code == 409
     monkeypatch.setattr(completion, "MAX_FILES", 1)
