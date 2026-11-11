@@ -1,8 +1,8 @@
 """The admin dashboard (dayla.tech/dashboard): every table of the database as a sheet, and the admins' shared note.
 
 Only users with users.is_admin. Sorting, filters, column functions, combining sheets and CSV export happen in the
-browser. What reaches it is depersonalized: secrets are never sent, and every personal or content value (names,
-emails, task titles, reminders, chat messages, account ids…) becomes a pseudonym — the same value always gives the
+browser. Email addresses are readable by admins. Secrets are never sent, and every other personal or content
+value (names, task titles, reminders, chat messages, account ids…) becomes a pseudonym — the same value always gives the
 same one, so COUNT DISTINCT, UNIQUE and joins still work, but it cannot be turned back into the value.
 """
 
@@ -36,8 +36,10 @@ HIDDEN_COLUMNS = {
     "refresh_tokens": {"jti"},
     "blog_views": {"key"},
 }
-# Shown as pseudonyms: everything stored encrypted, and the plain ids that point at a person or their accounts
-PERSONAL = {(table, column) for table, column, _kind in ENCRYPTED_COLUMNS} | {
+# Email addresses are the only encrypted fields shown in plain text to admins.
+EMAILS = {("users", "email"), ("integrations", "account_email")}
+# Shown as pseudonyms: other encrypted fields, and plain ids pointing at a person or their accounts
+PERSONAL = ({(table, column) for table, column, _kind in ENCRYPTED_COLUMNS} - EMAILS) | {
     ("users", "telegram_chat_id"),
     ("user_identities", "subject"),
     ("calendars", "external_id"),
@@ -47,8 +49,6 @@ PERSONAL = {(table, column) for table, column, _kind in ENCRYPTED_COLUMNS} | {
     ("event_files", "stored_filename"),
     ("event_files", "storage_path"),
 }
-# The mail provider stays: gmail.com or yandex.ru is analytics, the mailbox is a person
-EMAILS = {("users", "email"), ("integrations", "account_email")}
 PSEUDONYM_KEY = hashlib.sha256(f"dayla-admin-pseudonym:{settings.secret_key}".encode()).digest()
 # A sheet is held in the browser: more rows than this are cut, and the sheet says so
 MAX_ROWS = 20000
@@ -85,14 +85,11 @@ def _kind(column) -> str:
     return "text"
 
 
-def pseudonym(value: Any, email: bool = False) -> str:
+def pseudonym(value: Any) -> str:
     """A keyed hash: equal values give equal pseudonyms, and without the server's key they cannot be guessed back
     even for short values (a name, a chat id)."""
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
-    token = "◆" + hmac.new(PSEUDONYM_KEY, text.strip().lower().encode() if email else text.encode(), hashlib.sha256).hexdigest()[:10]
-    if email and "@" in text:
-        return f"{token}@{text.rsplit('@', 1)[1].strip().lower()}"
-    return token
+    return "◆" + hmac.new(PSEUDONYM_KEY, text.encode(), hashlib.sha256).hexdigest()[:10]
 
 
 def _columns(table: Table) -> list:
@@ -153,7 +150,7 @@ async def read_table(name: str, _: User = Depends(get_admin), session: AsyncSess
     for record in records:
         rows.append(
             [
-                pseudonym(record[column.name], email=(name, column.name) in EMAILS)
+                pseudonym(record[column.name])
                 if column.name in masked and record[column.name] not in (None, "", {}, [])
                 else _plain(record[column.name])
                 for column in columns

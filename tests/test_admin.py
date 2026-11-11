@@ -4,16 +4,37 @@ that one admin at a time edits after locking it."""
 import uuid
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
+from unittest.mock import AsyncMock, Mock
 
+import pytest
 from sqlalchemy import delete
 
 from app.core import make_admin
+from app.api import admin
 from app.api.admin import pseudonym
 from app.core.database import session_factory
 from app.models.models import Notification, ReminderSettings
 from app.services import reminders
 from tests.conftest import BOT_HEADERS
 from tests.test_integrations import oauth_connect, services  # noqa: F401 - services is a fixture
+
+
+@pytest.mark.parametrize("table_name,email_column", [("users", "email"), ("integrations", "account_email")])
+async def test_dashboard_only_reveals_email(table_name, email_column):
+    table = admin._tables()[table_name]
+    # Exercise the response serializer without connecting to a database.
+    record = {column.name: "private-value" for column in table.columns}
+    record[email_column] = "reader@example.com"
+    result = Mock()
+    result.mappings.return_value.all.return_value = [record]
+    session = Mock(scalar=AsyncMock(return_value=1), execute=AsyncMock(return_value=result))
+    sheet = await admin.read_table(table_name, session=session)
+    row = dict(zip((column["name"] for column in sheet["columns"]), sheet["data"][0]))
+    assert row[email_column] == "reader@example.com"
+    for column in admin._columns(table):
+        if (table_name, column.name) in admin.PERSONAL:
+            assert row[column.name] == pseudonym("private-value")
+    assert not admin.HIDDEN_COLUMNS[table_name] & row.keys()
 
 
 async def account(client, name: str, admin: bool) -> tuple[dict, str]:
@@ -50,13 +71,13 @@ async def test_tables_are_depersonalized(client, services):
     assert "credentials_encrypted" not in {column["name"] for column in tables["integrations"]["columns"]}
     assert {"column": "user_id", "table": "users", "target": "id"} in tables["events"]["foreign_keys"]
 
-    # Names, emails and chat ids are pseudonyms; the mail provider stays
+    # Emails are readable; names and chat ids remain pseudonyms
     assert users["email"] == "text" and users["telegram_chat_id"] == "text"
     sheet = (await client.get("/api/admin/tables/users", headers=headers)).json()
     names = [column["name"] for column in sheet["columns"]]
     me = (await client.get("/api/me", headers=headers)).json()["id"]
     row = next(row for row in sheet["data"] if row[names.index("id")] == me)
-    assert row[names.index("email")] == pseudonym(email, email=True) and row[names.index("email")].endswith("@example.com")
+    assert row[names.index("email")] == email
     assert row[names.index("name")] == pseudonym("admin") and "admin" not in row[names.index("name")]
     assert sheet["truncated"] is False
 
