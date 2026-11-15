@@ -340,12 +340,12 @@ def following(latest: Event, first_start: datetime, until: datetime) -> list[dat
     return found
 
 
-async def change_series(session: AsyncSession, user: User, event: Event, rule: str | None) -> list[Event]:
+async def change_series(session: AsyncSession, user: User, event: Event, rule: str | None, *, previous_start: datetime | None = None) -> list[Event]:
     """A new repeat from this occurrence on: the later ones of the old series go, this one starts the new series
     (or stays alone when `rule` is None). The earlier ones stay as they were, no longer repeating."""
     if event.series_id:
         later = list(await session.scalars(
-            select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at > event.start_at, Event.id != event.id)
+            select(Event).where(Event.user_id == user.id, Event.series_id == event.series_id, Event.start_at > (previous_start or event.start_at), Event.id != event.id)
         ))
         await delete_from_calendars(session, user.id, later)
         for item in later:

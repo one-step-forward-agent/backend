@@ -442,6 +442,13 @@ def parse(text: str, now: datetime) -> Parsed:
         result.spans.append(span)
         low = low[: span[0]] + " " * (span[1] - span[0]) + low[span[1]:]
 
+    if result.rrule and "UNTIL=" not in result.rrule and (count := re.search(rf"\b({NUMBER})\s+раз(?:а)?\b", low)):
+        amount = _number(count.group(1))
+        if amount > 0:
+            result.rrule += f";COUNT={min(amount, MAX_COUNT)}"
+            result.spans.append(count.span())
+            low = low[:count.start()] + " " * (count.end() - count.start()) + low[count.end():]
+
     relative = re.search(r"\b(?:через\s+полтора\s+часа|in\s+(?:an?\s+)?hour\s+and\s+a\s+half)\b", low)
     english = re.search(r"\bin\s+(\d+(?:\.\d+)?|an?|one|two|three|half)\s+(minutes?|hours?)\b", low)
     if relative or english:

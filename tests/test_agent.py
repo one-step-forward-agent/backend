@@ -278,6 +278,150 @@ async def add(client, headers, text: str) -> list[int]:
     return (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()["event_ids"]
 
 
+async def test_clarification_buttons_preserve_original_operation(client, user, agent):
+    headers, _ = user
+    ids = await add(client, headers, "подготовить отчёт завтра")
+    requests = agent([act(op("ask", question="Какие задачи?", options=["Две задачи", "Все задачи"])),
+                      act(op("ask", question="Какой отчёт?", options=["Годовой", "Квартальный"])),
+                      lambda messages: act(op("delete", filter={"ids": [plan_id(messages, "Подготовить отчёт")]}))])
+    first = await say(client, headers, "удали ненужные отчёты")
+    assert first["clarification_request"] == "удали ненужные отчёты"
+    await say(client, headers, first["replies"][0])
+    last = await say(client, headers, "Годовой")
+    assert last["kind"] == "delete_proposal" and last["count"] == 1
+    assert "удали ненужные отчёты\nДве задачи" in requests[-1][0]["content"]
+    async with session_factory() as session:
+        assert await session.get(Event, ids[0])  # the draft does not delete anything
+
+
+async def test_history_keeps_request_before_several_clarifications(client, user, agent):
+    headers, _ = user
+    requests = agent([act(op("ask", question="Уточните задачи", options=["Две задачи", "Все задачи"]))] * 5 + ["Хорошо"])
+    original = "Составь план подготовки материалов к конференции, учитывая доклад и презентацию"
+    await say(client, headers, original)
+    for text in ("Две задачи", "Доклад", "Презентация", "Обе"):
+        await say(client, headers, text)
+    await say(client, headers, "Продолжай")
+    assert any(original in message["content"] for message in requests[-1][1:])
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_recurring_edit_waits_for_confirmation_and_replaces_future(client, user, agent, stop):
+    headers, _ = user
+    ids = await add(client, headers, "зарядка каждый день 5 раз в 9:00")
+    async with session_factory() as session:
+        original = await session.get(Event, ids[0])
+        series = original.series_id
+        old = list(await session.scalars(select(Event).where(Event.series_id == series).order_by(Event.start_at)))
+        anchor = old[1].id
+        anchor_start = old[1].start_at
+        first = old[0].id
+        old_rule = original.recurrence_rule
+    def edit(messages):
+        # Pick the second occurrence, preserving the earlier one.
+        matches = re.findall(r"\[id (\d+)\][^\n]*Зарядка", messages[0]["content"])
+        return act(op("change", filter={"ids": [int(matches[1])]},
+                      **({"remove_repeat": True} if stop else {"new_repeat": "FREQ=WEEKLY;COUNT=3", "shift_days": 2})))
+    agent([edit])
+    reply = await say(client, headers, "прекрати повторять зарядку" if stop else "сдвинь зарядку на 2 дня и измени повтор на каждую неделю 3 раза")
+    assert reply["kind"] == "proposal", reply
+    assert reply["events"][0]["recurrence_change"]
+    async with session_factory() as session:
+        assert (await session.get(Event, anchor)).recurrence_rule == old_rule
+        assert len(list(await session.scalars(select(Event).where(Event.series_id == series)))) == len(old)
+    edited = [{**item, "title": "Утренняя зарядка"} for item in reply["events"]]
+    saved = await client.put(f"/api/assistant/drafts/{reply['draft_id']}", json={"items": edited}, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["events"][0]["recurrence_change"]
+    assert saved.json()["events"][0]["rrule"] == (None if stop else "FREQ=WEEKLY;COUNT=3")
+    result = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)
+    assert result.status_code == 200, result.text
+    async with session_factory() as session:
+        assert await session.get(Event, first)
+        updated = await session.get(Event, anchor)
+        assert updated.title == "Утренняя зарядка"
+        assert updated.start_at == anchor_start + (timedelta() if stop else timedelta(days=2))
+        assert updated.recurrence_rule == (None if stop else "FREQ=WEEKLY;COUNT=3")
+        remaining = list(await session.scalars(select(Event).where(Event.user_id == updated.user_id)))
+        assert len(remaining) == (2 if stop else 4)
+
+
+def test_english_deletion_is_available():
+    assert "delete" in agent_service.offered("delete both tasks", "")
+
+
+async def test_creation_keeps_day_from_request_after_time_clarification(client, user, agent):
+    headers, _ = user
+    tomorrow = (datetime.now(TZ).date() + timedelta(days=1)).isoformat()
+    agent([act(op("ask", question="Во сколько начать?", options=["В 15:00", "В 16:00"])),
+           act(op("create", events=[{"title": "Доклад", "date": tomorrow, "start_time": "15:00"}]))])
+    await say(client, headers, "Подбери время для доклада завтра")
+    reply = await say(client, headers, "В 15:00")
+    assert reply["kind"] == "proposal" and reply["events"][0]["date"] == tomorrow
+    assert reply["events"][0]["time"] == "15:00"
+
+
+async def test_command_button_keeps_pending_request(client, user, agent):
+    headers, _ = user
+    requests = agent([act(op("ask", question="Когда перенести?", options=["Перенеси на завтра", "Перенеси на пятницу"])), "Уточнение принято"])
+    await say(client, headers, "Перенеси встречу с Анной")
+    await say(client, headers, "Перенеси на завтра")
+    assert "ИСХОДНАЯ ПРОСЬБА" in requests[-1][0]["content"]
+    assert "Перенеси встречу с Анной" in requests[-1][0]["content"]
+
+
+async def test_moving_one_repeat_keeps_other_occurrences(client, user, agent):
+    headers, _ = user
+    ids = await add(client, headers, "зарядка каждый день 5 раз в 9:00")
+    async with session_factory() as session:
+        source = await session.get(Event, ids[0])
+        series = source.series_id
+        before = {event.id: event.start_at for event in await session.scalars(select(Event).where(Event.series_id == series))}
+    agent([lambda messages: act(op("change", filter={"ids": [plan_id(messages, "Зарядка")]}, shift_minutes=60))])
+    reply = await say(client, headers, "Сдвинь эту зарядку на час позже")
+    assert reply["kind"] == "proposal" and len(reply["events"]) == 1
+    assert not reply["events"][0].get("recurrence_change")
+    response = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)
+    assert response.status_code == 200, response.text
+    async with session_factory() as session:
+        after = list(await session.scalars(select(Event).where(Event.series_id == series)))
+        assert len(after) == len(before)
+        for event in after:
+            assert event.start_at == before[event.id] + (timedelta(hours=1) if event.id == ids[0] else timedelta())
+
+
+async def test_telegram_repeat_edit_uses_existing_rule_and_survives_date_edit(client, user, agent):
+    headers, chat_id = user
+    ids = await add(client, headers, "зарядка каждый день 5 раз в 9:00")
+    agent([lambda messages: act(op("change", filter={"ids": [plan_id(messages, "Зарядка")]}, shift_minutes=60))])
+    draft = await say(client, headers, "Сдвинь эту зарядку на час позже")
+    url = f"/internal/bot/chat/{chat_id}/drafts/{draft['draft_id']}"
+    response = await client.post(f"{url}/edit", json={"index": 0, "field": "repeat"}, headers=BOT_HEADERS)
+    assert response.status_code == 200
+    response = await client.post(f"/internal/bot/chat/{chat_id}", json={"text": "3 раза"}, headers=BOT_HEADERS)
+    assert response.status_code == 200, response.text
+    edited = response.json()
+    assert edited["events"][0]["rrule"] == "FREQ=DAILY;COUNT=3"
+    assert edited["events"][0]["recurrence_change"]
+    assert "предыдущие события сохранятся" in edited["note"]
+    response = await client.post(f"{url}/edit", json={"index": 0, "field": "date"}, headers=BOT_HEADERS)
+    assert response.status_code == 200
+    response = await client.post(f"/internal/bot/chat/{chat_id}", json={"text": "через 2 дня"}, headers=BOT_HEADERS)
+    assert response.status_code == 200, response.text
+    assert response.json()["events"][0]["rrule"] == "FREQ=DAILY;COUNT=3"
+    async with session_factory() as session:
+        assert (await session.get(Event, ids[0])).recurrence_rule == "FREQ=DAILY;COUNT=5"
+    assert (await client.post(f"{url}/confirm")).status_code == 401
+    confirmed = await client.post(f"{url}/confirm", headers=BOT_HEADERS)
+    assert confirmed.status_code == 200, confirmed.text
+    async with session_factory() as session:
+        anchor = await session.get(Event, ids[0])
+        assert anchor.recurrence_rule == "FREQ=DAILY;COUNT=3"
+        assert anchor.start_at.astimezone(TZ).date() == datetime.now(TZ).date() + timedelta(days=2)
+        assert anchor.start_at.astimezone(TZ).hour == 10
+        assert len(list(await session.scalars(select(Event).where(Event.series_id == anchor.series_id)))) == 3
+
+
 async def test_reminder_in_ten_minutes_is_sent_by_the_bot(client, user, agent):
     headers, chat_id = user
     agent([act(op("remind", text="помыть посуду", in_minutes=10))])
@@ -344,7 +488,7 @@ async def test_agent_moves_a_task_after_confirmation(client, user, agent):
     reply = await say(client, headers, "перенеси созвон с Олегом на понедельник в 11")
     assert reply["kind"] == "proposal"
     # What will change is said by the app, not by the model
-    assert reply["answer"].startswith("Изменю «Созвон с Олегом»: понедельник") and "11:00" in reply["answer"]
+    assert reply["answer"].startswith("Изменю «Созвон с Олегом»:") and "понедельник" in reply["answer"] and "11:00" in reply["answer"]
     [item] = reply["events"]
     assert item["event_id"] == event_id and item["date"] == monday.isoformat() and item["time"] == "11:00" and item["end_time"] == "12:00"
     async with session_factory() as session:

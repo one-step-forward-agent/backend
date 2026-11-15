@@ -1298,6 +1298,9 @@ def proposal(draft: AssistantDraft, tz: ZoneInfo, answer: str | None = None, not
             "series": bool(item.get("series")),
             "answer": answer,
         }
+    if any(item.get("recurrence_change") for item in draft.items):
+        note = join_text(note, tr("Повтор изменится с выбранного события и далее; предыдущие события сохранятся.",
+                                  "The repeat changes from the selected occurrence onward; earlier occurrences stay."))
     return {
         "kind": "proposal",
         "draft_id": draft.id,
@@ -1374,11 +1377,14 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
             current_time = parsed.time
         if parsed.rrule:
             item["rrule"] = parsed.rrule
+            if item.get("event_id"):
+                item["recurrence_change"] = True
             item["end_date"] = None
             first = dates.first_occurrence(parsed.rrule, datetime.combine(parsed.date or now.date(), current_time or time.min, now.tzinfo), now)
             item["date"] = (first.date() if first else parsed.date or now.date()).isoformat()
         else:
-            item["rrule"] = None
+            if not item.get("recurrence_change"):
+                item["rrule"] = None
             old_day, old_last = date.fromisoformat(item["date"]), _iso_date(item.get("end_date"))
             item["date"] = parsed.date.isoformat()
             if parsed.end_date:
@@ -1437,6 +1443,8 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
 
 def edit_repeat(item: dict, value: str, now: datetime) -> tuple[dict | None, str | None]:
     """The repeat of a draft item from words: a new rule, the same rule with a count or an end, or none."""
+    if item.get("event_id"):
+        item["recurrence_change"] = True
     if NO_REPEAT_WORDS.match(value):
         item["rrule"] = None
         return item, None
@@ -1492,7 +1500,12 @@ async def apply_edit_text(session: AsyncSession, user: User, draft: AssistantDra
         draft.awaiting = None
         await session.commit()
         return proposal(draft, tz)
-    item, error = edit_item(draft.items[index], field, text, datetime.now(tz))
+    source = dict(draft.items[index])
+    if field == "repeat" and source.get("event_id") and not source.get("recurrence_change"):
+        event = await session.get(Event, source["event_id"])
+        if event and event.user_id == user.id:
+            source["rrule"] = event.recurrence_rule
+    item, error = edit_item(source, field, text, datetime.now(tz))
     if error:
         return {"kind": "edit_error", "text": error, "draft_id": draft.id, "awaiting": awaiting}
     items = list(draft.items)
@@ -1516,6 +1529,8 @@ def validate_item(raw: dict, now: datetime, originals: dict[int, dict] | None = 
     except (TypeError, ValueError):
         return None
     parsed = dates.Parsed(date=day, time=start, end_time=end, rrule=dates.valid_rrule(raw.get("rrule")), end_date=last)
+    if raw.get("rrule") and not parsed.rrule:
+        return None
     item = build_item(str(raw.get("title") or ""), parsed, now, raw, deadline=clean_deadline(raw.get("deadline")), fixed=raw.get("fixed") is True)
     if item and not raw.get("rrule"):
         item["date"] = day.isoformat()  # an explicit date from the form is kept even if it is in the past
@@ -1527,6 +1542,8 @@ def validate_item(raw: dict, now: datetime, originals: dict[int, dict] | None = 
         return None  # a change of an event that is not in this draft
     if item and original:
         item.update(event_id=original["event_id"], before=original.get("before"), rrule=None)
+        if original.get("recurrence_change"):
+            item.update(rrule=dates.valid_rrule(raw.get("rrule")), recurrence_change=True)
         for key in ("team_task_id", "team_id", "project_id"):
             if key in original:
                 item[key] = original[key]
@@ -1649,6 +1666,7 @@ async def apply_changes(session: AsyncSession, user: User, items: list[dict], tz
             )
         except (KeyError, TypeError, ValueError):
             continue
+        previous_start = event.start_at
         event.title = str(item.get("title") or event.title).strip()[:300] or event.title
         event.start_at, event.end_at, event.all_day = start, end, all_day
         if item.get("team_task_id"):
@@ -1663,6 +1681,8 @@ async def apply_changes(session: AsyncSession, user: User, items: list[dict], tz
             event.tag_ids = await tasks.owned_tag_ids(session, user, item["tag_ids"])
         if "deadline" in item:
             event.deadline_at = tasks.deadline_moment(item.get("deadline"), tz)
+        if item.get("recurrence_change"):
+            await tasks.change_series(session, user, event, dates.valid_rrule(item.get("rrule")), previous_start=previous_start)
         if event.external_id:
             event.sync_status = "pending"
         changed.append(event)

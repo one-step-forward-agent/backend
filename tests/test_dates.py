@@ -9,6 +9,19 @@ TZ = ZoneInfo("Europe/Moscow")
 NOW = datetime(2026, 10, 6, 10, 0, tzinfo=TZ)  # Tuesday
 
 
+@pytest.mark.parametrize("phrase, rule", [
+    ("зарядка каждый день 5 раз в 9:00", "FREQ=DAILY;COUNT=5"),
+    ("зарядка каждый день пять раз в 9:00", "FREQ=DAILY;COUNT=5"),
+    ("зарядка каждые два дня 3 раза в 9:00", "FREQ=DAILY;INTERVAL=2;COUNT=3"),
+    ("зарядка раз в две недели по чт 4 раза в 9:00", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TH;COUNT=4"),
+])
+def test_recurrence_keeps_occurrence_count(phrase, rule):
+    parsed = parse(phrase, NOW)
+    assert parsed.rrule == rule
+    assert parsed.time == time(9)
+    assert "раз" not in strip_spans(phrase, parsed.spans)
+
+
 @pytest.mark.parametrize(
     "text, expected",
     [

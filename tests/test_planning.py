@@ -279,12 +279,14 @@ async def test_calendar_recommendations_and_chat_topic(client, user):
     headers, _ = user
     for text in ["разобрать документы завтра", "встреча с юристом завтра в 12:00, нельзя переносить"]:
         await confirm(client, headers, await chat(client, headers, text))
-    week = (await client.get(f"/api/recommendations?scope=week&day={today().isoformat()}", headers=headers)).json()["items"]
+    # The fixtures are tomorrow; on Sundays they belong to the following calendar week.
+    anchor = (today() + timedelta(days=1)).isoformat()
+    week = (await client.get(f"/api/recommendations?scope=week&day={anchor}", headers=headers)).json()["items"]
     month = (await client.get("/api/recommendations?scope=month", headers=headers)).json()["items"]
     assert 1 <= len(week) <= 3 and 1 <= len(month) <= 3
     assert any("нельзя переносить" in item["text"] for item in week)
     # The second request is served from the cache
-    assert (await client.get(f"/api/recommendations?scope=week&day={today().isoformat()}", headers=headers)).json()["items"] == week
+    assert (await client.get(f"/api/recommendations?scope=week&day={anchor}", headers=headers)).json()["items"] == week
     assert len((await client.get("/api/recommendations", headers=headers)).json()["items"]) <= 2
 
     topic = {"title": week[0]["title"], "text": week[0]["text"]}

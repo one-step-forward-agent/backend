@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import select
 
 from app.core.database import session_factory
@@ -12,6 +13,84 @@ from tests.test_friends import person, befriend, say, events_of
 from tests.test_teams import team_of, member_id
 
 TZ = ZoneInfo("Europe/Moscow")
+
+
+@pytest.mark.parametrize("transport", ["website", "telegram"])
+@pytest.mark.parametrize("initial", ["Перенеси проект на завтра", "Перенеси все задачи проекта на завтра"])
+@pytest.mark.parametrize("count", [2, 3])
+async def test_project_tasks_can_be_chosen_across_buttons(client, transport, initial, count):
+    boss, worker = await person(client, "Анна"), await person(client, "Иван")
+    team = await team_of(client, boss, (worker, "Иван"))
+    project = (await client.post(f"/api/teams/{team['id']}/projects", json={"name": "Сайт"}, headers=boss["headers"])).json()
+    if "все" in initial:
+        assert (await client.post(f"/api/teams/{team['id']}/projects", json={"name": "Блог"}, headers=boss["headers"])).status_code == 201
+    source = (datetime.now(TZ).date() + timedelta(days=3)).isoformat()
+    titles = ("Макет", "Вёрстка", "Тексты", "Проверка")
+    for title in titles:
+        task = await client.post(f"/api/teams/{team['id']}/tasks", json={"title": title, "project_id": project["id"],
+                                "assignee_id": member_id(team, "Иван")}, headers=boss["headers"])
+        assert task.status_code == 201, task.text
+        accepted = await client.post(f"/api/team-tasks/{task.json()['id']}/accept", json={"day": source}, headers=worker["headers"])
+        assert accepted.status_code == 200, accepted.text
+    path, headers = ("/api/assistant/chat", worker["headers"]) if transport == "website" else (f"/internal/bot/chat/{worker['chat_id']}", BOT_HEADERS)
+    async def send(text):
+        response = await client.post(path, json={"text": text}, headers=headers)
+        assert response.status_code == 200, response.text
+        return response.json()
+    first = await send(initial)
+    assert first["kind"] == "answer" and first.get("planning_scope")
+    second = await send("Две задачи" if count == 2 else "Три задачи")
+    if "все" in initial:
+        corrected_day = await send("Послезавтра")
+        assert corrected_day["planning_scope"]["requested_count"] == count
+        second = await send("Проект «Сайт»")
+    assert second["kind"] == "answer" and "«Макет»" in second["replies"]
+    third = await send("«Макет»")
+    assert third["kind"] == "answer" and len(third["planning_scope"]["selected_event_ids"]) == 1
+    final = await send("«Вёрстка»")
+    if count == 3:
+        assert final["kind"] == "answer" and len(final["planning_scope"]["selected_event_ids"]) == 2
+        final = await send("«Тексты»")
+    assert final["kind"] == "proposal", final
+    assert {item["title"] for item in final["events"]} == set(titles[:count])
+    assert all(event.start_at.astimezone(TZ).date().isoformat() == source for event in await events_of(worker["id"]))
+    confirmed = await client.post(f"/api/assistant/drafts/{final['draft_id']}/confirm", headers=worker["headers"])
+    assert confirmed.status_code == 200, confirmed.text
+    tomorrow = (datetime.now(TZ).date() + timedelta(days=2 if "все" in initial else 1)).isoformat()
+    for event in await events_of(worker["id"]):
+        assert event.start_at.astimezone(TZ).date().isoformat() == (tomorrow if event.title in titles[:count] else source)
+    # A new request must replace the old selection; already-scheduled tasks do not cause a clarification loop.
+    again = await send(f'Перенеси задачи проекта «Сайт» «Макет» и «Вёрстка» на {tomorrow}')
+    assert again["kind"] == "answer" and "planning_scope" not in again, again
+
+
+async def test_move_project_tasks_infers_unique_scope_and_keeps_other_tasks(client):
+    boss, worker = await person(client, "Анна"), await person(client, "Иван")
+    team = await team_of(client, boss, (worker, "Иван"))
+    project = (await client.post(f"/api/teams/{team['id']}/projects", json={"name": "Сайт"}, headers=boss["headers"])).json()
+    source = (datetime.now(TZ).date() + timedelta(days=3)).isoformat()
+    for title, project_id in (("Макет", project["id"]), ("Вёрстка", project["id"]), ("Другая задача", None)):
+        task = await client.post(f"/api/teams/{team['id']}/tasks", json={"title": title, "project_id": project_id,
+                                "assignee_id": member_id(team, "Иван")}, headers=boss["headers"])
+        assert task.status_code == 201, task.text
+        accepted = await client.post(f"/api/team-tasks/{task.json()['id']}/accept", json={"day": source}, headers=worker["headers"])
+        assert accepted.status_code == 200, accepted.text
+    before = await events_of(worker["id"])
+    reply = await say(client, worker, "Перенеси задачи проекта на завтра")
+    assert reply["kind"] == "proposal", reply
+    assert {event["title"] for event in reply["events"]} == {"Макет", "Вёрстка"}
+    assert all(event.all_day and event.start_at.astimezone(TZ).date().isoformat() == source for event in await events_of(worker["id"]))
+    confirmed = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=worker["headers"])
+    assert confirmed.status_code == 200, confirmed.text
+    after = await events_of(worker["id"])
+    tomorrow = datetime.now(TZ).date() + timedelta(days=1)
+    assert len(after) == len(before) == 3
+    for event in after:
+        assert event.start_at.astimezone(TZ).date().isoformat() == (source if event.title == "Другая задача" else tomorrow.isoformat())
+    unknown = await say(client, worker, 'Перенеси задачи проекта «Несуществующий» на завтра')
+    assert unknown["kind"] == "answer" and unknown.get("planning_scope"), unknown
+    resolved = await say(client, worker, 'Проект «Сайт»')
+    assert resolved["kind"] == "answer" and "уже запланированы" in resolved["text"], resolved
 
 
 async def assignment(client, boss, worker, **values):
