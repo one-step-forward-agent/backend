@@ -13,8 +13,10 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
+from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import BigInteger, Boolean, Date, DateTime, Integer, Numeric, SmallInteger, Table, Time, func, inspect, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
@@ -23,9 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import Base, get_session
+from app.core.errors import said
 from app.core.dataenc import ENCRYPTED_COLUMNS, EncryptedJSON
 from app.models.models import AdminNote, Notification, ResearchAnswer, ResearchQuestion, User
 from app.services import reminders
+from app.services import admin_analytics
+from app.analytics_schemas import AnalyticsResponse
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -165,6 +170,30 @@ async def read_table(name: str, _: User = Depends(get_admin), session: AsyncSess
             ]
         )
     return {**_describe(table, total), "data": rows, "truncated": total > len(rows)}
+
+
+@router.get("/analytics", response_model=AnalyticsResponse)
+async def read_analytics(
+    request: Request,
+    response: Response,
+    start_date: date,
+    end_date: date,
+    timezone_name: str = Query(default="Europe/Berlin", alias="timezone", max_length=80),
+    definition: Literal["combined", "charts", "report"] = "combined",
+    model: list[str] = Query(default=[], max_length=30),
+    _: User = Depends(get_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        ZoneInfo(timezone_name)
+        admin_analytics.bounds(start_date, end_date, timezone_name)
+    except (ValueError, ZoneInfoNotFoundError, OverflowError):
+        raise HTTPException(status_code=422, detail=said(request, "Проверьте часовой пояс и период (не более 731 дня)")) from None
+    response.headers["Cache-Control"] = "no-store"
+    # Bound database work per statement; only fixed, parameterized aggregate queries run.
+    await session.execute(select(func.set_config("statement_timeout", "15000", True)))
+    return await admin_analytics.metrics(session, await _available_tables(session), start_date, end_date,
+                                         timezone_name, definition, model)
 
 
 # ─── The shared note ──────────────────────────────────────────────────────────

@@ -35,6 +35,7 @@ ENGLISH = {
     CHECK_INPUT: "Please check what you entered.",
     "Пароль должен быть не короче 8 символов.": "The password must be at least 8 characters.",
     "Проверьте email.": "Please check the email.",
+    "Проверьте часовой пояс и период (не более 731 дня)": "Check the timezone and date range (up to 731 days).",
 }
 CALLBACK_PATH = re.compile(r"^/auth/[a-z]+/callback$")
 

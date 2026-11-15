@@ -1,0 +1,17 @@
+# Admin analytics
+
+`GET /api/admin/analytics` is used by the website at `/dashboard/analytics`. It requires the existing authenticated administrator dependency and returns aggregates only, with `Cache-Control: no-store`. It has no relationship to the bot contract and needs no schema migration.
+
+Required query parameters: ISO `start_date` and `end_date` (inclusive local dates). Optional `timezone` (IANA name, defaults to Europe/Berlin), `definition` (`combined`, `charts`, `report`), and repeated `model` filters (up to 30). The maximum range is 731 days. Invalid ranges, timezones and definitions return 422; unauthenticated requests return 401; non-admins return 403. Fixed parameterized aggregate queries have a 15-second per-statement timeout. No submitted Python or SQL ever reaches a production database executor.
+
+The response contains `daily`, `model_daily`, `goals`, `goals_daily`, `purposes`, `coverage`, `excluded`, `models`, `summary`, and `generated_at`, as specified in `app/analytics_schemas.py` and the frontend's `analyticsTypes.ts`. It uses all rows, independent of the admin table viewer's 20,000-row cap.
+
+- DAU is distinct users performing the notebook's mapped actions per local day. Product DAU excludes site auto-goals. `charts` reproduces cell 0's action set, `report` cell 1's action set, and `combined` uses their union. LLM system calls without a user count as requests, but never add an active user. Model filters apply to LLM metrics only.
+- Users are cumulative through each day's end, including registrations before the selected range. The snapshot cannot recover deleted accounts or deleted event records.
+- Model usage includes prompt, completion, cached prompt and total tokens. Cached input is part of the prompt total and is not added twice. Values are the recorded token counters, not a monetary cost or an estimate of usage the provider did not report.
+- Profile/event/settings `updated_at` captures only the most recent update. Refresh-token creation is a proxy for login, not a historical login ledger. Feature wishes retain the notebook's `form_submit` mapping; this is a proxy, not independently instrumented web-form traffic.
+- Goals without instrumentation are listed as unavailable. In particular, `event_files` and `integrations` have no creation timestamp in the current schema. Event dates and integer IDs are never substituted for missing timestamps.
+
+Dates are converted to UTC bounds from the selected timezone, including DST changes, and the upper bound is the next local midnight. Empty days are zero-filled for available measurements; unavailable datasets return null. The complete notebook goal catalog and excluded actions are included, so missing coverage is visible.
+
+For integration tests, provision a **new, empty disposable PostgreSQL database**, migrate it, set the test environment as described in `tests/README.md` and `../codex-setup/commands.md`, then explicitly set `ANALYTICS_DISPOSABLE_DB=1` before running `python -m pytest tests/test_admin_analytics.py -q`. The fixture uses fixed synthetic IDs and rolls back each test. Do not use a populated development or production database. Coverage includes admin/anonymous authorization, local end-of-day, DST, distinct DAU, null-user calls, cumulative users, definitions, model filters, missing sources, and more than 20,000 request rows.
