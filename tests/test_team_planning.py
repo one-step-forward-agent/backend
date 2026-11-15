@@ -93,6 +93,27 @@ async def test_move_project_tasks_infers_unique_scope_and_keeps_other_tasks(clie
     assert resolved["kind"] == "answer" and "уже запланированы" in resolved["text"], resolved
 
 
+@pytest.mark.parametrize("phrase", ["перенеси задачи разработки на завтра", "перенеси задачи команды Разработка на завтра"])
+async def test_inflected_team_name_moves_only_accepted_team_tasks(client, phrase):
+    boss, worker = await person(client, "Анна"), await person(client, "Иван")
+    team = await team_of(client, boss, (worker, "Иван"), name="Разработка")
+    source = (datetime.now(TZ).date() + timedelta(days=3)).isoformat()
+    for title in ("Аналитическая панель", "Конструктор для лендинга", "Доделать десктопного агента"):
+        task = await client.post(f"/api/teams/{team['id']}/tasks", json={"title": title, "assignee_id": member_id(team, "Иван")}, headers=boss["headers"])
+        assert task.status_code == 201, task.text
+        assert (await client.post(f"/api/team-tasks/{task.json()['id']}/accept", json={"day": source}, headers=worker["headers"])).status_code == 200
+    personal = await say(client, worker, "Мужская стрижка через 4 дня в 18:30")
+    assert personal["kind"] == "proposal"
+    assert (await client.post(f"/api/assistant/drafts/{personal['draft_id']}/confirm", headers=worker["headers"])).status_code == 200
+    result = await say(client, worker, phrase)
+    assert result["kind"] == "proposal" and len(result["events"]) == 3, result
+    assert all(item["team_id"] == team["id"] and "стрижка" not in item["title"] for item in result["events"])
+    assert (await client.post(f"/api/assistant/drafts/{result['draft_id']}/confirm", headers=worker["headers"])).status_code == 200
+    tomorrow = (datetime.now(TZ).date() + timedelta(days=1)).isoformat()
+    team_tasks = (await client.get(f"/api/teams/{team['id']}/tasks", headers=worker["headers"])).json()
+    assert all(task["scheduled_day"] == tomorrow for task in team_tasks)
+
+
 async def assignment(client, boss, worker, **values):
     team = await team_of(client, boss, (worker, worker["name"]))
     # Simulate an existing team's saved legacy preference, not just an updated setting.

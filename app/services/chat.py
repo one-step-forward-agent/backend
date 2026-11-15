@@ -2209,6 +2209,9 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     if not failed:
         reply = await with_buttons(session, user, text, reply, tz)
         reply = await research.attach(session, user, reply)
+        from app.services import assistant_context
+
+        reply = await assistant_context.bind_reply(session, user, reply, caption)
     await remember(session, user.id, "user", text, shown)
     message = await remember(session, user.id, "assistant", summarize(reply), reply)
     await session.commit()
@@ -2323,7 +2326,11 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, atta
             sharing = {"kind": "answer", "text": str(error)}
         if sharing is not None:
             return sharing
-        from app.services import planning_scope
+        from app.services import assistant_context, planning_scope
+
+        contextual = await assistant_context.respond(session, user, text, tz)
+        if contextual is not None:
+            return contextual
 
         scoped = await planning_scope.reschedule(session, user, text, tz)
         if scoped is not None:
@@ -2798,7 +2805,9 @@ def plural_head(words: list[str]) -> bool:
 
 def reply_event_ids(reply: dict) -> list[int]:
     kind = reply.get("kind")
-    if kind in ("created", "completed") and reply.get("event_ids"):
+    if kind in ("answer", "not_found") and isinstance(reply.get("task_context"), dict):
+        values = reply["task_context"].get("event_ids", [])
+    elif kind in ("created", "completed") and reply.get("event_ids"):
         values = reply["event_ids"]
     elif kind in ("created", "updated", "completed", "proposal", "delete_proposal"):
         values = [event.get("id") or event.get("event_id") for event in reply.get("events") or [] if isinstance(event, dict)]

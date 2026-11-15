@@ -22,6 +22,19 @@ def named(text, value):
     return bool(value and re.search(r"(?<!\w)" + re.escape(value.casefold()) + r"(?!\w)", text.casefold()))
 
 
+def entity_spans(text, name):
+    """Compare complete word stems so «задачи разработки» identifies «Разработка»."""
+    from app.services import chat
+
+    words = list(re.finditer(r"[^\W\d_]+", text.casefold().replace("ё", "е")))
+    expected = [chat._stemmer.stemWord(word) for word in re.findall(r"[^\W\d_]+", name.casefold().replace("ё", "е"))]
+    if not expected:
+        return []
+    stems = [chat._stemmer.stemWord(word.group()) for word in words]
+    return [(words[index].start(), words[index + len(expected) - 1].end()) for index in range(len(words) - len(expected) + 1)
+            if stems[index:index + len(expected)] == expected]
+
+
 def parsed_day(text, now):
     parsed = dates.parse(text, now).date
     if parsed:
@@ -48,7 +61,12 @@ async def reschedule(session, user, text, tz, team_id=None):
     continuing = bool(pending and not personal and not NEW_REQUEST.search(text) and (MOVE.search(text) or len(text) < 180))
     if MOVE.search(text) and SCOPE.search(text) and re.search(r"\b(?:задач\w*|tasks)\b", text, re.I):
         continuing = False  # A complete scoped request replaces an older clarification.
-    if not continuing and not (MOVE.search(text) and (SCOPE.search(text) or team_id)):
+    available = None
+    implicit_scope = False
+    if not personal and MOVE.search(text) and not SCOPE.search(text) and re.search(r"\b(?:задачи|задач|tasks)\b", text, re.I):
+        available = list(await session.scalars(select(Team).join(TeamMember, TeamMember.team_id == Team.id).where(TeamMember.user_id == user.id)))
+        implicit_scope = any(named(text, team.tag) or entity_spans(text, team.name) for team in available)
+    if not continuing and not (MOVE.search(text) and (SCOPE.search(text) or team_id or implicit_scope)):
         return None
     if personal:
         return None
@@ -101,8 +119,9 @@ async def reschedule(session, user, text, tz, team_id=None):
             parsed = parsed_day(message, now)
             if parsed:
                 state["target_day"] = parsed.isoformat()
-    available = list(await session.scalars(select(Team).join(TeamMember, TeamMember.team_id == Team.id).where(TeamMember.user_id == user.id)))
-    candidates = [team for team in available if named(text, team.tag) or named(text, team.name)]
+    if available is None:
+        available = list(await session.scalars(select(Team).join(TeamMember, TeamMember.team_id == Team.id).where(TeamMember.user_id == user.id)))
+    candidates = [team for team in available if named(text, team.tag) or entity_spans(text, team.name)]
     if not candidates and not state.get("team_id") and not team_id:
         # A uniquely named project already identifies its team. A sole team needs no clarification.
         accessible_projects = list(await session.scalars(select(Project).where(Project.team_id.in_([team.id for team in available]))))
@@ -166,6 +185,10 @@ async def reschedule(session, user, text, tz, team_id=None):
             return ask("Не нашла все названные задачи в этом проекте. Уточните названия.", "I could not find all named tasks in this project. Please clarify their titles.")
         rows = [(task, event) for task, event in rows if any(name.casefold() in event.title.casefold() for name in quoted)]
     description = re.sub(r'(?:проект\w*|команд\w*|project|team)\s+[«"“][^»"”]+[»"”]', " ", TASK_COUNT.sub(" ", MOVE.sub(" ", state["request"])), flags=re.I)
+    for name in (team.name, project.name if project else None):
+        if name:
+            for first, last in reversed(entity_spans(description, name)):
+                description = description[:first] + " " * (last - first) + description[last:]
     for name in quoted:
         description = description.replace(name, " ")
     for name in (team.name, team.tag, project.name if project else None):
