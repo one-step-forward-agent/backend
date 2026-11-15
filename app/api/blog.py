@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api/blog", tags=["blog"])
 admin_router = APIRouter(prefix="/api/admin/blog", tags=["admin"])
 
 STATUSES = ("draft", "published")
-BLOCK_TYPES = {"heading", "paragraph", "image", "quote", "callout", "divider", "list"}
+BLOCK_TYPES = {"heading", "paragraph", "image", "quote", "callout", "divider", "list", "cta"}
 MAX_BLOCKS = 300
 MAX_BLOCK_DEPTH = 10
 SLUG = re.compile(r"^[\w-]{1,120}$")
@@ -63,6 +63,22 @@ def picture(value: str | None) -> str | None:
     return value
 
 
+class LandingCard(BaseModel):
+    enabled: bool = False
+    position: int = Field(default=0, ge=0, le=10000)
+    title: str = Field(default="", max_length=300)
+    description: str = Field(default="", max_length=2000)
+    caption: str = Field(default="", max_length=120)
+    image: str | None = None
+    imageAlt: str = Field(default="", max_length=300)
+    linkText: str = Field(default="", max_length=120)
+
+    @field_validator("image")
+    @classmethod
+    def valid_image(cls, value: str | None) -> str | None:
+        return picture(value)
+
+
 class PostSave(BaseModel):
     """A post as the editor sends it: the same fields as the site's BlogPost type."""
 
@@ -76,6 +92,7 @@ class PostSave(BaseModel):
     author: str | None = Field(default=None, max_length=120)
     seo: dict = Field(default_factory=dict)
     blocks: list[dict] = Field(default_factory=list, max_length=MAX_BLOCKS)
+    landing: LandingCard = Field(default_factory=LandingCard)
 
     @field_validator("slug")
     @classmethod
@@ -145,6 +162,31 @@ class PostSave(BaseModel):
                         raise ValueError("Тип списка — true или false")
                     clean["ordered"] = ordered
                     clean["items"] = [entry[:20000] for entry in entries]
+                if block["type"] == "cta":
+                    href = block.get("href", "")
+                    if not isinstance(href, str) or (href and not re.fullmatch(r"(?:https?://[^\s\\]+|/(?!/)[^\s\\]*|#[^\s\\]*)", href, re.I)):
+                        raise ValueError("Ссылка кнопки — https://…, /путь или #якорь")
+                    clean["href"] = href
+                    mode = block.get("bgMode")
+                    if mode is not None and mode not in ("none", "custom", "gradient-blur", "gradient-fade"):
+                        raise ValueError("Неизвестный фон кнопки")
+                    if "bgImage" in block:
+                        clean["bgImage"] = picture(block["bgImage"]) or ""
+                    for key in ("bgColor", "textColor"):
+                        color = block.get(key)
+                        if color and (not isinstance(color, str) or not re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", color)):
+                            raise ValueError("Цвет кнопки — HEX (#ffffff)")
+                    for key in ("buttonWidth", "buttonHeight"):
+                        size = block.get(key)
+                        if size is not None:
+                            if isinstance(size, bool) or not isinstance(size, int | float) or not 0 <= size <= 2000:
+                                raise ValueError("Размер кнопки — от 0 до 2000 px")
+                            clean[key] = size
+                    if "icons" in block:
+                        icons = block["icons"]
+                        if not isinstance(icons, list) or len(icons) > 30 or any(not isinstance(icon, str) for icon in icons):
+                            raise ValueError("Иконки — список изображений")
+                        clean["icons"] = [picture(icon) or "" for icon in icons]
                 if "children" in block:
                     children = block["children"]
                     if not isinstance(children, list):
@@ -180,6 +222,7 @@ def post_view(post: BlogPost) -> dict:
         "author": post.author,
         "seo": dict(post.seo or {}),
         "blocks": list(post.blocks or []),
+        "landing": LandingCard(**(post.landing or {})).model_dump(),
         "publishedAt": post.published_at.isoformat() if post.published_at else None,
         "createdAt": post.created_at.isoformat() if post.created_at else None,
         "updatedAt": post.updated_at.isoformat() if post.updated_at else None,
@@ -203,6 +246,16 @@ async def published_posts(session: AsyncSession = Depends(get_session)):
     posts = await session.scalars(select(BlogPost).where(BlogPost.status == "published").order_by(BlogPost.published_at.desc()))
     # The list needs no bodies
     return [{**post_view(post), "blocks": []} for post in posts]
+
+
+@router.get("/landing")
+async def landing_posts(session: AsyncSession = Depends(get_session)):
+    posts = await session.scalars(select(BlogPost).where(
+        BlogPost.status == "published", BlogPost.landing["enabled"].as_boolean().is_(True),
+    ))
+    return [{**post_view(post), "blocks": []} for post in sorted(
+        posts, key=lambda post: ((post.landing or {}).get("position", 0), post.id),
+    )]
 
 
 @router.get("/posts/{slug}")
@@ -270,6 +323,7 @@ def apply(post: BlogPost, payload: PostSave) -> None:
     post.slug, post.title, post.excerpt = payload.slug, payload.title.strip(), payload.excerpt.strip()
     post.cover_image, post.cover_alt, post.author = payload.coverImage, payload.coverAlt, payload.author
     post.tags, post.seo, post.blocks = payload.tags, payload.seo, payload.blocks
+    post.landing = payload.landing.model_dump()
     if payload.status == "published" and post.status != "published":
         post.published_at = post.published_at or now
     post.status = payload.status

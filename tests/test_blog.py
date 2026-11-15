@@ -19,6 +19,88 @@ POST = {
 }
 READER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/130"}
 
+CTA = {"id": "cta", "type": "cta", "text": "Начать", "href": "/register", "bgMode": "custom",
+       "bgColor": "#2563eb", "bgImage": "https://example.com/bg.png", "textColor": "#ffffff",
+       "buttonWidth": 240.5, "buttonHeight": 56, "icons": ["https://example.com/icon.png"],
+       "children": [{"id": "nested", "type": "list", "ordered": True, "items": ["**Один**"]}]}
+
+
+def test_cta_fields_survive_validation():
+    assert PostSave(**{**POST, "blocks": [CTA]}).blocks == [CTA]
+
+
+@pytest.mark.parametrize("patch", [
+    {"href": "javascript:alert(1)"}, {"href": "//evil.example"}, {"href": "/\\evil.example"},
+    {"href": "data:text/html,test"}, {"bgImage": "data:image/png;base64,AA"},
+    {"icons": ["javascript:alert(1)"]}, {"icons": "bad"}, {"bgMode": "bad"},
+    {"buttonWidth": True}, {"buttonHeight": -1}, {"buttonWidth": 2001},
+    {"textColor": "url(https://example.com)"}, {"bgColor": "#12345"},
+])
+def test_cta_refuses_unsafe_or_invalid_settings(patch):
+    with pytest.raises(ValidationError):
+        PostSave(**{**POST, "blocks": [{**CTA, **patch}]})
+
+
+async def test_editor_roundtrip_and_landing_selection(client):
+    admin, _ = await account(client, "admin", admin=True)
+    slug = f"builder-{uuid.uuid4().hex[:8]}"
+    landing = {"enabled": True, "position": 2, "title": "Карточка", "description": "Описание",
+               "caption": "5 минут", "image": "https://example.com/card.png", "imageAlt": "Карточка",
+               "linkText": "Читать"}
+    blocks = [*POST["blocks"], CTA, {"id": "quote", "type": "quote", "text": "Цитата", "author": "Автор"},
+              {"id": "img", "type": "image", "src": "https://example.com/image.png", "alt": "Фото", "caption": "Подпись"},
+              {"id": "callout", "type": "callout", "variant": "warning", "title": "Совет", "text": "Текст"},
+              {"id": "divider", "type": "divider"}]
+    body = {**POST, "slug": slug, "landing": landing, "blocks": blocks, "author": "Автор",
+            "coverImage": "https://example.com/cover.png", "coverAlt": "Обложка",
+            "seo": {"title": "SEO", "description": "Описание", "ogImage": "https://example.com/og.png", "canonical": "https://example.com/blog"}}
+    created = await client.post("/api/admin/blog/posts", json=body, headers=admin)
+    assert created.status_code == 201, created.text
+    post_id = created.json()["id"]
+    assert post_id not in [p["id"] for p in (await client.get("/api/blog/landing")).json()]
+    updated = await client.put(f"/api/admin/blog/posts/{post_id}", json={**body, "status": "published"}, headers=admin)
+    assert updated.status_code == 200, updated.text
+    # Fresh reads prove storage, rather than merely echoing a request.
+    for path in (f"/api/admin/blog/posts/{post_id}", f"/api/blog/posts/{slug}"):
+        saved = (await client.get(path, headers=admin)).json()
+        for key in ("landing", "blocks", "seo", "author", "coverImage", "coverAlt", "title", "excerpt"):
+            assert saved[key] == body[key]
+    cards = (await client.get("/api/blog/landing")).json()
+    assert next(p for p in cards if p["id"] == post_id)["landing"] == landing
+    assert all(not p["blocks"] for p in cards)
+    copy = (await client.post(f"/api/admin/blog/posts/{post_id}/duplicate", headers=admin)).json()
+    assert not copy["landing"]["enabled"]
+    await client.put(f"/api/admin/blog/posts/{post_id}", json={**body, "status": "published", "landing": {**landing, "enabled": False}}, headers=admin)
+    assert post_id not in [p["id"] for p in (await client.get("/api/blog/landing")).json()]
+    await client.put(f"/api/admin/blog/posts/{post_id}", json={**body, "status": "draft"}, headers=admin)
+    assert post_id not in [p["id"] for p in (await client.get("/api/blog/landing")).json()]
+
+
+@pytest.mark.parametrize("landing", [{"image": "javascript:alert(1)"}, {"position": -1}, {"position": 10001}])
+def test_landing_card_validation(landing):
+    with pytest.raises(ValidationError):
+        PostSave(**{**POST, "landing": landing})
+
+
+async def test_landing_order_access_and_deletion(client):
+    admin, _ = await account(client, "admin", admin=True)
+    ids = []
+    for position in (9, 1, 1):
+        response = await client.post("/api/admin/blog/posts", headers=admin, json={
+            **POST, "slug": f"card-{uuid.uuid4().hex[:8]}", "status": "published",
+            "landing": {"enabled": True, "position": position},
+        })
+        assert response.status_code == 201, response.text
+        ids.append(response.json()["id"])
+    user, _ = await account(client, "user", admin=False)
+    assert (await client.put(f"/api/admin/blog/posts/{ids[0]}", headers=user, json=POST)).status_code == 403
+    client.cookies.clear()
+    cards = (await client.get("/api/blog/landing")).json()
+    assert [p["id"] for p in cards if p["id"] in ids] == [ids[1], ids[2], ids[0]]
+    assert (await client.get(f"/api/admin/blog/posts/{ids[0]}")).status_code == 401
+    assert (await client.delete(f"/api/admin/blog/posts/{ids[1]}", headers=admin)).status_code == 204
+    assert ids[1] not in [p["id"] for p in (await client.get("/api/blog/landing")).json()]
+
 
 def test_nested_lists_and_markdown_survive_validation():
     blocks = [{"id": "list", "type": "list", "ordered": True, "items": ["**Первый**", "[Второй](https://example.com)"], "children": [

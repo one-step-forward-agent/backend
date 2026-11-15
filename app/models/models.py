@@ -730,6 +730,7 @@ class BlogPost(Base):
     # {"title", "description", "ogImage", "canonical"}
     seo: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     blocks: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
+    landing: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

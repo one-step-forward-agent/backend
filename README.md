@@ -194,6 +194,8 @@ See `tests/README.md`: `tests/test_dates.py` runs without a database, the rest n
 
 ## Migrations
 
+Blog migration `0059_blog_landing` adds a non-null JSONB `blog_posts.landing` column. Existing articles default to `{}` (unselected). The editor's `landing` object persists selection, position and card overrides through the existing admin post create/update endpoints. `GET /api/blog/landing` anonymously returns selected published articles ordered by position, then id. Admin authorization remains required for all edits and image uploads. CTA blocks persist all appearance fields, dimensions, icons and nested content; unsafe destinations and image URLs are rejected. Downgrading this migration removes card settings while retaining articles and their bodies.
+
 ```bash
 alembic revision -m "description"   # create a new migration in alembic/versions
 alembic upgrade head                # apply all migrations
