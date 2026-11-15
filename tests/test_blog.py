@@ -19,6 +19,12 @@ POST = {
 }
 READER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/130"}
 
+
+def test_article_title_cannot_be_only_whitespace():
+    with pytest.raises(ValidationError):
+        PostSave(**{**POST, "title": " \t\n "})
+    assert PostSave(**{**POST, "title": "  Заголовок  "}).title == "Заголовок"
+
 CTA = {"id": "cta", "type": "cta", "text": "Начать", "href": "/register", "bgMode": "custom",
        "bgColor": "#2563eb", "bgImage": "https://example.com/bg.png", "textColor": "#ffffff",
        "buttonWidth": 240.5, "buttonHeight": 56, "icons": ["https://example.com/icon.png"],

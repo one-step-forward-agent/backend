@@ -94,6 +94,14 @@ class PostSave(BaseModel):
     blocks: list[dict] = Field(default_factory=list, max_length=MAX_BLOCKS)
     landing: LandingCard = Field(default_factory=LandingCard)
 
+    @field_validator("title")
+    @classmethod
+    def nonempty_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Укажите заголовок статьи")
+        return value
+
     @field_validator("slug")
     @classmethod
     def plain_slug(cls, value: str) -> str:
