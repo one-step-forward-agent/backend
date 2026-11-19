@@ -35,6 +35,9 @@ def _database_url() -> str:
 
 @dataclass(frozen=True)
 class Settings:
+    metrics_token: str = os.getenv("METRICS_TOKEN", "").strip()
+    metrics_startup_id: str = os.getenv("METRICS_STARTUP_ID", "deyla").strip()
+    metrics_excluded_user_ids: tuple[str, ...] = _list("METRICS_EXCLUDED_USER_IDS")
     app_env: str = os.getenv("APP_ENV", "development").strip().lower()
     database_url: str = _database_url()
     secret_key: str = os.getenv("SECRET_KEY", "change-me")
@@ -147,6 +150,13 @@ class Settings:
         return self.openai_agent_model if self.uses_openai else self.gigachat_agent_model
 
     def validate(self) -> None:
+        if self.metrics_token and (len(self.metrics_token) < 32 or self.metrics_token in {
+            self.secret_key, self.bot_api_token, self.openai_api_key, self.gigachat_credentials,
+            self.telegram_bot_token, self.integrations_encryption_key, self.data_encryption_key,
+        }):
+            raise RuntimeError("METRICS_TOKEN must be a separate secret of at least 32 characters")
+        if any(not value.isdecimal() for value in self.metrics_excluded_user_ids):
+            raise RuntimeError("METRICS_EXCLUDED_USER_IDS must contain integer account IDs")
         if self.llm_provider not in {"gigachat", "openai"}:
             raise RuntimeError(f"LLM_PROVIDER must be gigachat or openai, not {self.llm_provider!r}")
         if self.uses_openai and not self.llm_enabled:

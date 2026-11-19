@@ -45,7 +45,7 @@ async def _user_by_chat(session: AsyncSession, chat_id: int) -> User:
     user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
     if not user:
         raise HTTPException(status_code=404, detail="Telegram chat is not linked")
-    usage.current_user_id.set(user.id)
+    usage.identify(user.id)
     # The bot speaks the language chosen on the site
     lang.current.set(user.language or "ru")
     return user

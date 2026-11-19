@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func, event
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
@@ -615,6 +615,8 @@ class LlmUsage(Base):
     """Tokens spent on one language model request: who asked, for what and how much (see app.services.usage)."""
 
     __tablename__ = "llm_usage"
+    user_initiated: Mapped[bool | None] = mapped_column(Boolean)
+    metrics_user_id: Mapped[int | None] = mapped_column(Integer)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # None for requests made outside a user's session
@@ -629,6 +631,36 @@ class LlmUsage(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ProductActivity(Base):
+    """Content-free successful target actions and agent function completions."""
+
+    __tablename__ = "product_activity"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    kind: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class MetricRegistration(Base):
+    """Registration ledger survives account deletion; contains no contact or content data."""
+
+    __tablename__ = "metric_registrations"
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class MetricCollection(Base):
+    __tablename__ = "metric_collection"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+@event.listens_for(User, "after_insert")
+def _metric_registration(_mapper, connection, user):
+    connection.execute(MetricRegistration.__table__.insert().values(
+        user_id=user.id, created_at=user.created_at))
 
 
 class AdminNote(Base):

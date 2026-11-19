@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import admin, blog, completion, desktop, friends, integrations, internal, reassignments, reminders, teams
+from app.api import admin, blog, completion, desktop, friends, integrations, internal, metrics, reassignments, reminders, teams
 from app.api.auth import google_router, yandex_router, apple_router, notion_router, jira_router, obsidian_router,  session_router
 from app.api.routes import router
 from app.core import errors, ratelimit
@@ -15,6 +15,7 @@ from app.core.database import engine
 from app.core.make_admin import grant_listed
 from app.models import models  # noqa: F401
 from app.services.events import google_catch_up_loop
+from app.services import product_metrics, usage
 
 settings.validate()
 
@@ -42,6 +43,24 @@ async def lifespan(_: FastAPI):
 docs = {} if settings.enable_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
 app = FastAPI(title="Deyla API", version="0.1.0", lifespan=lifespan, **docs)
 errors.install(app)
+
+
+@app.middleware("http")
+async def track_product_actions(request: Request, call_next):
+    # A shared request-local container survives Starlette's middleware task boundary.
+    actor = {"scope": request.scope}
+    context = usage.request_actor.set(actor)
+    user_context = usage.current_user_id.set(None)
+    try:
+        response = await call_next(request)
+        endpoint = request.scope.get("endpoint")
+        name = getattr(endpoint, "__name__", "")
+        if 200 <= response.status_code < 300 and actor.get("user_id") and name in product_metrics.TARGET_ROUTES:
+            await product_metrics.record_activity(actor["user_id"], name)
+        return response
+    finally:
+        usage.request_actor.reset(context)
+        usage.current_user_id.reset(user_context)
 
 
 @app.middleware("http")
@@ -112,6 +131,7 @@ app.include_router(completion.router)
 app.include_router(reassignments.router)
 app.include_router(internal.router)
 app.include_router(admin.router)
+app.include_router(metrics.router)
 app.include_router(blog.router)
 app.include_router(blog.admin_router)
 

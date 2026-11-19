@@ -13,10 +13,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import session_factory
 from app.models.models import LlmUsage
+from app.services.product_metrics import TARGET_ROUTES
 
 logger = logging.getLogger(__name__)
 
 current_user_id: ContextVar[int | None] = ContextVar("llm_usage_user_id", default=None)
+request_actor: ContextVar[dict | None] = ContextVar("metrics_request_actor", default=None)
+
+
+def identify(user_id: int) -> None:
+    current_user_id.set(user_id)
+    actor = request_actor.get()
+    if actor is not None:
+        actor["user_id"] = user_id
 
 
 def _tokens(usage: dict, key: str) -> int:
@@ -27,10 +36,15 @@ def _tokens(usage: dict, key: str) -> int:
 async def record(purpose: str, model: str | None, usage: dict | None, duration_ms: int | None = None) -> None:
     """Store one request's token counts; accounting never breaks the answer itself."""
     usage = usage if isinstance(usage, dict) else {}
+    actor = request_actor.get()
+    endpoint = (actor or {}).get("scope", {}).get("endpoint")
+    initiated = getattr(endpoint, "__name__", "") in TARGET_ROUTES
     try:
         async with session_factory() as session:
             session.add(
                 LlmUsage(
+                    user_initiated=initiated,
+                    metrics_user_id=current_user_id.get(),
                     user_id=current_user_id.get(),
                     purpose=purpose[:64],
                     model=str(model or "")[:64],

@@ -39,7 +39,7 @@ async def get_current_user(
     if not user or not user.is_active:
         raise _unauthorized("Пользователь не найден или отключён")
     # Language model tokens spent in this request are counted for this user
-    usage.current_user_id.set(user.id)
+    usage.identify(user.id)
     # The assistant answers in the site's language; the bot and the notifications follow the site's choice
     language = lang.from_header(accept_language) if accept_language else user.language
     lang.current.set(language)

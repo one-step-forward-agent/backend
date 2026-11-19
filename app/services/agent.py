@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.models import ConversationMessage, Event, FriendTask, SendDraft, Tag, TeamMessage, User
-from app.services import attachments, chat, dates, insights, reminders, research, tasks
+from app.services import attachments, chat, dates, insights, product_metrics, reminders, research, tasks
 from app.core.lang import is_en, tr
 from app.services.ru import MONTHS, WEEKDAYS, WEEKDAYS_SHORT, day_label, plural
 
@@ -2126,6 +2126,8 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attach
         if name != "act" and isinstance(args.get("operations"), list | dict):
             name = "act"
         result = await act(turn, args) if name == "act" else {"results": [{"error": "Есть только функция act."}]}
+        if name == "act" and product_metrics.successful_tool(result):
+            await product_metrics.record_activity(turn.user.id, "tool_request")
         logger.info("Agent operations %s: %s errors", [item.get("action") for item in result["results"]], sum(bool(item.get("error")) for item in result["results"]))
         messages.append({"role": "assistant", "content": message.get("content") or "", "function_call": {"name": "act", "arguments": args}, **({"functions_state_id": message["functions_state_id"]} if message.get("functions_state_id") else {})})
         messages.append({"role": "function", "name": "act", "content": json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))})
