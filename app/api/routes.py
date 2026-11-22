@@ -649,6 +649,15 @@ async def list_event_files(event_id: int, user: User = Depends(get_current_user)
     return [{"id": item.id, "filename": item.original_filename, "size": item.file_size, "mime_type": item.mime_type} for item in records]
 
 
+@router.get("/files/{file_id}")
+async def download_event_file(file_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    record = await _owned_file(session, user, file_id)
+    path = Path(record.storage_path)
+    if not await run_in_threadpool(path.is_file):
+        raise HTTPException(status_code=404, detail=tr("Файл не найден", "File not found"))
+    return FileResponse(path, filename=record.original_filename, media_type="application/octet-stream", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
 @router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_file(file_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     record = await _owned_file(session, user, file_id)
