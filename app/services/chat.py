@@ -2129,9 +2129,8 @@ ASKING_KINDS = ("answer", "not_found", "edit_error")
 
 
 async def with_buttons(session: AsyncSession, user: User, text: str, reply: dict, tz: ZoneInfo) -> dict:
-    """A reply that asks the user something always comes with ready answers: if neither the model nor the app gave
-    any, the model writes them for this question, so the user taps instead of typing."""
-    if reply.get("replies") or reply.get("kind") not in ASKING_KINDS or not settings.llm_enabled:
+    """Suggest replies for legacy questions. An explicit replies list, including [], is authoritative."""
+    if "replies" in reply or reply.get("kind") not in ASKING_KINDS or not settings.llm_enabled:
         return reply
     question = str(reply.get("text") or "")
     if not ASKS_USER.search(question):

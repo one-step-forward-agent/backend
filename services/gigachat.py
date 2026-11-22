@@ -440,14 +440,16 @@ class GigaChatClient:
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
     async def suggest_replies(self, message: str, question: str, calendar: str = "", timezone: str = "Europe/Moscow") -> list[str]:
-        """2–4 ready answers to the assistant's question, shown as buttons: the user taps one instead of typing."""
+        """Optional distinct answers to a question; an empty list is better than filler buttons."""
         now = datetime.now(ZoneInfo(timezone))
         prompt = (
-            "Ассистент по планированию задал пользователю вопрос. Предложи 2–4 готовых ответа, которые пользователь нажмёт "
+            "Ассистент по планированию задал пользователю вопрос. Предложи до 4 разных по смыслу ответов, которые пользователь нажмёт "
             "кнопкой вместо того, чтобы печатать. Каждый ответ — от лица пользователя, до 40 знаков, сразу командой, "
             "которую ассистент поймёт без контекста: с названием задачи из расписания, днём и временем "
             "(«Перенеси созвон с Олей на завтра в 10:00», «Удали «Купить хлеб» на пятницу»). Последний вариант может быть "
-            "отказом («Ничего не менять»). Верни только JSON-массив строк без markdown.\n\n"
+            "отказом («Ничего не менять»), только если это уместно. Не заполняй список ради количества, не перефразируй один "
+            "ответ несколько раз и не меняй известные детали просьбы. Если полезного выбора нет, верни []. "
+            "Верни только JSON-массив строк без markdown.\n\n"
             f"Сейчас {now:%d.%m.%Y %H:%M}.\n"
             f"Расписание пользователя:\n{calendar or '(нет данных)'}\n\n"
             f"Сообщение пользователя: {message[:1500]}\n"
