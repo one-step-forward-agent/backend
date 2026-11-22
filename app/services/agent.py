@@ -1146,7 +1146,7 @@ def named_weekday(text: str) -> int | None:
 
 async def create_reminder(turn: Turn, args: dict) -> dict:
     text = args.get("text") if isinstance(args.get("text"), str) else ""
-    attachment = turn.attachment if turn.attachment is not None and turn.attachment.data else None
+    attachment = turn.attachment if turn.attachment is not None and (turn.attachment.data or getattr(turn.attachment, "parts", None)) else None
     if attachment and not text.strip():
         text = attachment.name
     # The repeat comes from what the user said, never from the text of an attached file
@@ -1178,10 +1178,15 @@ async def create_reminder(turn: Turn, args: dict) -> dict:
         if "Telegram" in str(error):
             turn.blocked = tr(NO_TELEGRAM, NO_TELEGRAM_EN)
         return {"error": str(error)}
-    if attachment:
-        reminders.attach_file(notification, turn.user, attachment)
+    attached_files = (getattr(attachment, "parts", None) or [attachment]) if attachment else []
+    if attached_files:
+        reminders.attach_file(notification, turn.user, attached_files[0])
     view = reminders.custom_view(notification, turn.tz)
     turn.reminders.append(view)
+    for attached_file in attached_files[1:]:
+        extra = await reminders.create_custom(turn.session, turn.user, text, moment.astimezone(timezone.utc), repeat, every)
+        reminders.attach_file(extra, turn.user, attached_file)
+        turn.reminders.append(reminders.custom_view(extra, turn.tz))
     return {
         "status": "Напоминание поставлено, бот пришлёт его в Telegram" + (" вместе с файлом." if attachment else "."),
         "reminder_id": notification.id,

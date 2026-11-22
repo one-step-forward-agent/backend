@@ -47,6 +47,7 @@ class Attachment:
     text: str
     # The file itself, while the message is answered: a reminder set in it keeps a copy (see kept_files)
     data: bytes = field(default=b"", repr=False)
+    parts: list["Attachment"] = field(default_factory=list, repr=False)
 
     def meta(self) -> dict:
         return {"name": self.name, "mime": self.mime, "size": self.size}
@@ -151,5 +152,24 @@ async def read(name: str, data: bytes) -> Attachment:
 
 def message_text(caption: str, attachment: Attachment) -> str:
     """What the assistant reads: the user's words and the file's text (a file kept only to be sent back: its name)."""
-    body = f"📎 {attachment.name}:\n{attachment.text}" if attachment.text else f"📎 {attachment.name} (файл приложен, его текст не прочитан)"
+    if attachment.parts:
+        body = "\n\n".join(message_text("", part) for part in attachment.parts)
+    else:
+        body = f"📎 {attachment.name}:\n{attachment.text}" if attachment.text else f"📎 {attachment.name} (файл приложен, его текст не прочитан)"
     return f"{caption}\n\n{body}" if caption else body
+
+
+async def read_uploads(files, caption: str) -> Attachment:
+    """Read a bounded selection before invoking the assistant once for the whole message."""
+    remaining = MAX_CHAT_FILE_MB * 1024 * 1024
+    selected = []
+    for upload in files:
+        data = await upload.read(remaining + 1)
+        remaining -= len(data)
+        if remaining < 0:
+            raise UnreadableFile(tr("Общий размер файлов превышает 20 МБ", "Total attachment size exceeds 20 MB"))
+        selected.append((upload.filename or "file", data))
+    parts = [await read_for(name, data, caption) for name, data in selected]
+    if len(parts) == 1:
+        return parts[0]
+    return Attachment(", ".join(part.name for part in parts), "multipart/mixed", sum(part.size for part in parts), "", parts=parts)

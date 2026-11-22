@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -248,3 +248,18 @@ async def chat_history(team_id: int, user: User = Depends(get_current_user), ses
 @router.post("/teams/{team_id}/chat")
 async def chat_message(team_id: int, payload: TeamChat, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return await answer(teams.chat(session, user, team_id, payload.text))
+
+
+@router.post("/teams/{team_id}/chat/files")
+async def chat_files(team_id: int, files: list[UploadFile] = File(..., min_length=1, max_length=6), text: str = Form(default="", max_length=4000), user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    from app.api.routes import limit_assistant, limit_uploads
+    from app.services import attachments
+
+    await answer(teams.member_of(session, user, team_id))
+    limit_uploads(user)
+    await limit_assistant(session, user, None)
+    try:
+        attachment = await attachments.read_uploads(files, text)
+    except attachments.UnreadableFile as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return await answer(teams.chat(session, user, team_id, text, attachment))

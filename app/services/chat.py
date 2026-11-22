@@ -2169,9 +2169,13 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     tz = tasks.local_tz(user)
     caption = text.strip()[:50000]
     shown = {"kind": "file", "caption": caption, "file": attachment.meta()} if attachment else None
+    if attachment and getattr(attachment, "parts", None):
+        shown["files"] = [part.meta() for part in attachment.parts]
     if voice:
         # A voice message may carry a file too ("пришли этот файл в 21:00" said aloud): both are shown
         shown = {"kind": "voice", "voice": voice, "transcript": caption, **({"file": attachment.meta()} if attachment else {})}
+    if voice and attachment and getattr(attachment, "parts", None):
+        shown["files"] = [part.meta() for part in attachment.parts]
     if attachment:
         from app.services.attachments import message_text
 

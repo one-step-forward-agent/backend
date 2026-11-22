@@ -1196,13 +1196,13 @@ HELP_EN = (
 )
 
 
-async def free_answer(session: AsyncSession, user: User, team: Team, people: list[TeamMember], text: str, tz: ZoneInfo) -> dict:
+async def free_answer(session: AsyncSession, user: User, team: Team, people: list[TeamMember], text: str, tz: ZoneInfo, attachment=None) -> dict:
     """A question the rules do not cover: the model answers from the team's data, or the help when it cannot."""
     if settings.llm_enabled and settings.assistant_agent:
         from app.services import agent
 
         try:
-            return await agent.run(session, user, text, tz, team_scope=team.id)
+            return await agent.run(session, user, text, tz, attachment=attachment, team_scope=team.id)
         except agent.AgentFailed:
             pass
     if settings.llm_enabled:
@@ -1217,12 +1217,18 @@ async def free_answer(session: AsyncSession, user: User, team: Team, people: lis
     return {"kind": "answer", "text": tr(HELP_RU, HELP_EN), "replies": [tr("Отчёт о прогрессе", "Progress report"), tr("Кто сколько загружен?", "Who is busy?")]}
 
 
-async def chat(session: AsyncSession, user: User, team_id: int, text: str) -> dict:
+async def chat(session: AsyncSession, user: User, team_id: int, text: str, attachment=None) -> dict:
     """The team page's chat: the message and the reply are kept for this member."""
     team, _ = await member_of(session, user, team_id)
     text = text.strip()[:4000]
     try:
-        reply = await assistant(session, user, team, text)
+        if attachment:
+            from app.services.attachments import message_text
+
+            reply = await free_answer(session, user, team, await members(session, team.id), message_text(text, attachment), tasks.local_tz(user), attachment)
+            text = f"{text}\n📎 {attachment.name}".strip()
+        else:
+            reply = await assistant(session, user, team, text)
     except (TeamError, LookupError) as error:
         reply = {"kind": "answer", "text": str(error)}
     now = datetime.now(timezone.utc)

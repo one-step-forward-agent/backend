@@ -873,6 +873,7 @@ async def assistant_chat_voice(
     audio: UploadFile = File(...),
     duration: float = Form(default=0, ge=0, le=3600),
     file: UploadFile | None = File(default=None),
+    files: list[UploadFile] = File(default=[], max_length=6),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
@@ -882,11 +883,18 @@ async def assistant_chat_voice(
 
     limit_uploads(user)
     await limit_assistant(session, user, None)
+    if files and file is not None:
+        raise HTTPException(status_code=422, detail=tr("Выберите один способ передачи файлов", "Choose one attachment field"))
     suffix, content = await read_audio(audio)
     text = await transcribe(content, suffix)
     if not text.strip():
         raise HTTPException(status_code=422, detail="Не удалось разобрать речь — попробуйте ещё раз")
     attachment = None
+    if files:
+        try:
+            attachment = await attachments.read_uploads(files, text)
+        except attachments.UnreadableFile as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
     if file is not None:
         # Read after the speech: what was said decides whether a file that cannot be read is kept to be sent back
         data = await file.read(attachments.MAX_CHAT_FILE_MB * 1024 * 1024 + 1)
@@ -944,6 +952,28 @@ async def assistant_chat_file(
     """A message with a file — a PDF, Word, Excel, CSV, text or photo is read here and answered like any message;
     any file up to 20 MB is taken when the message asks to send it back ("пришли этот файл в 21:00")."""
     return await chat_with_file(session, user, file, text)
+
+
+@router.post("/assistant/chat/files")
+async def assistant_chat_files(
+    files: list[UploadFile] = File(..., min_length=1, max_length=6),
+    text: str = Form(default="", max_length=50000),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """One prompt with up to six attachments totaling at most 20 MB."""
+    from app.services import attachments
+
+    limit_uploads(user)
+    await limit_assistant(session, user, None)
+    try:
+        attachment = await attachments.read_uploads(files, text)
+    except attachments.UnreadableFile as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    try:
+        return await chat.handle_message(session, user, text, attachment)
+    except chat.AssistantUnavailable:
+        raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
 
 
 async def chat_with_file(session: AsyncSession, user: User, file: UploadFile, text: str, channel: str = "web") -> dict:
