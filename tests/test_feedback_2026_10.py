@@ -31,15 +31,16 @@ async def test_night_shift_ends_the_next_morning(client, user):
 
 async def test_cleared_chat_is_hidden_but_kept(client, user):
     headers, _ = user
+    initial = len((await client.get("/api/assistant/history", headers=headers)).json())
     await say(client, headers, "Сегодня")
-    assert len((await client.get("/api/assistant/history", headers=headers)).json()) == 2
+    assert len((await client.get("/api/assistant/history", headers=headers)).json()) == initial + 2
     cleared = await client.delete("/api/assistant/history", headers=headers)
-    assert cleared.status_code == 200 and cleared.json()["cleared"] == 2
+    assert cleared.status_code == 200 and cleared.json()["cleared"] == initial + 2
     assert (await client.get("/api/assistant/history", headers=headers)).json() == []
     async with session_factory() as session:
         me = await session.scalar(select(User).order_by(User.id.desc()).limit(1))
         rows = list(await session.scalars(select(ConversationMessage).where(ConversationMessage.user_id == me.id)))
-        assert len(rows) == 2 and all(row.hidden_at for row in rows)
+        assert len(rows) == initial + 2 and all(row.hidden_at for row in rows)
     # New messages show as usual
     await say(client, headers, "Завтра")
     assert len((await client.get("/api/assistant/history", headers=headers)).json()) == 2

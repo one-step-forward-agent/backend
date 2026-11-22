@@ -120,12 +120,30 @@ async def test_login_with_a_new_email_creates_the_account(browser, services, goo
     assert path == "/register" and "ещё нет" in params["error"]
     # The login page says that logging in accepts them: the account is made and onboarding starts
     response = await callback(browser, await start(browser, "login", consent=True, timezone="Asia/Yekaterinburg"))
-    assert response.headers["location"] == "/onboarding/field-of-activity"
+    assert response.headers["location"] == "/app/assistant"
     me = (await browser.get("/api/me", headers=session_headers(response))).json()
     assert me["email"] == google_account and me["timezone"] == "Asia/Yekaterinburg"
     # The next login is an ordinary one
     response = await callback(browser, await start(browser, "login"))
     assert response.headers["location"] == "/app"
+
+
+async def test_campaign_attribution_survives_oauth_redirect(browser, services, google_account):
+    from datetime import datetime, timedelta, timezone
+
+    touch = {"utm_source": "yandex", "utm_medium": "cpc", "utm_group": "oauth-study", "utm_term": "планировщик учебы",
+             "landed_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+             "landing_url": "https://deyla.tech/?utm_source=yandex&utm_group=oauth-study"}
+    browser.headers["Accept-Language"] = "en"
+    query = await start(browser, "signup", consent=True, attribution={"first_touch": touch, "last_touch": touch})
+    response = await callback(browser, query)
+    headers = session_headers(response)
+    me = (await browser.get("/api/me", headers=headers)).json()
+    assert me["profile"]["campaign_attribution"]["first_touch"]["utm_group"] == "oauth-study"
+    assert response.headers["location"] == "/app/assistant"
+    history = (await browser.get("/api/assistant/history", headers=headers)).json()
+    assert len(history) == 1 and history[0]["reply"]["dialogue_question_id"]
+    assert history[0]["text"].startswith("Hi! I'm Deyla.")
 
 
 async def test_unverified_google_email_does_not_create_an_account(browser, services, google_account):

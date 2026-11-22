@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from app.api import admin, blog, completion, desktop, friends, integrations, internal, metrics, reassignments, reminders, teams
 from app.api.auth import google_router, yandex_router, apple_router, notion_router, jira_router, obsidian_router,  session_router
 from app.api.routes import router
+from app.api import proactivity as proactivity_api
 from app.core import errors, ratelimit
 from app.core.config import settings
 from app.core.database import engine
@@ -16,6 +17,7 @@ from app.core.make_admin import grant_listed
 from app.models import models  # noqa: F401
 from app.services.events import google_catch_up_loop
 from app.services import product_metrics, usage
+from app.services import proactivity
 
 settings.validate()
 
@@ -34,7 +36,10 @@ async def lifespan(_: FastAPI):
     settings.storage_path.mkdir(parents=True, exist_ok=True)
     await grant_listed(settings.admin_emails)
     catch_up = asyncio.create_task(google_catch_up_loop()) if settings.google_client_id else None
+    proactive = asyncio.create_task(proactivity.run_loop())
     yield
+    proactive.cancel()
+    await asyncio.gather(proactive, return_exceptions=True)
     if catch_up:
         catch_up.cancel()
     await engine.dispose()
@@ -114,6 +119,7 @@ if settings.cors_origins:
 
 
 app.include_router(router)
+app.include_router(proactivity_api.router)
 app.include_router(desktop.router)
 app.include_router(desktop.auth_router)
 app.include_router(google_router)

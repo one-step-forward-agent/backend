@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from app.models.models import Priority, Provider, plain_priority
+from app.services.attribution import CampaignAttribution
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -53,6 +54,7 @@ class Credentials(EmailAddress):
 
 
 class RegisterRequest(Credentials):
+    attribution: CampaignAttribution | None = None
     password: str = Field(min_length=8, max_length=128)
     name: str | None = Field(default=None, max_length=200)
     timezone: str | None = None
@@ -94,6 +96,7 @@ class OAuthStart(BaseModel):
     timezone: str | None = None
     # Personal data consent and the terms of use, as the checkboxes of the registration form
     consent: bool = False
+    attribution: CampaignAttribution | None = None
 
     @field_validator("timezone")
     @classmethod

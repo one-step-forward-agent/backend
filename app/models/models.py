@@ -92,6 +92,14 @@ class User(Base):
         self.email_hash = email_index(value)
         return value
 
+    @property
+    def attribution(self) -> dict:
+        return (self.profile or {}).get("campaign_attribution") or {}
+
+    @attribution.setter
+    def attribution(self, value: dict) -> None:
+        self.profile = {**(self.profile or {}), "campaign_attribution": value}
+
 
 class UserIdentity(Base):
     """A Google or Yandex account the user signs in with: the provider's stable account id, not the email,
@@ -558,7 +566,33 @@ class ConversationMessage(Base):
     rated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # "Очистить историю": the user no longer sees the message and the assistant no longer reads it; it stays for analysis
     hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ProactivityQuestion(Base):
+    __tablename__ = "proactivity_questions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text: Mapped[str] = mapped_column(Text)
+    text_en: Mapped[str | None] = mapped_column(Text)
+    prompts: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
+    prompts_en: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
+    group_id: Mapped[str | None] = mapped_column(String(200), index=True)
+    scenario: Mapped[str | None] = mapped_column(String(30))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    position: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
+class ProactivityDelivery(Base):
+    __tablename__ = "proactivity_deliveries"
+    __table_args__ = (UniqueConstraint("user_id", "key", name="uq_proactivity_delivery"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    key: Mapped[str] = mapped_column(String(200))
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("conversation_messages.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class AssistantDraft(Base):

@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from app.core.database import session_factory
-from app.models.models import LlmUsage
+from app.models.models import ConversationMessage, LlmUsage, User
 from app.services import chat as chat_service
 from app.services import insights, usage
 
@@ -45,7 +45,7 @@ async def days_of(client, headers) -> dict[str, str]:
 
 
 @pytest.fixture
-def night(monkeypatch):
+async def night(monkeypatch, user):
     """The chat thinks it is 01:12 today."""
     frozen = datetime.combine(today(), time(1, 12), TZ)
 
@@ -55,6 +55,12 @@ def night(monkeypatch):
             return frozen.astimezone(tz) if tz else frozen.replace(tzinfo=None)
 
     monkeypatch.setattr(chat_service, "datetime", Night)
+    # Keep the registration welcome before this conversation when only chat's clock is frozen.
+    async with session_factory() as session:
+        owner = await session.scalar(select(User.id).where(User.telegram_chat_id == user[1]))
+        for message in await session.scalars(select(ConversationMessage).where(ConversationMessage.user_id == owner)):
+            message.created_at = frozen - timedelta(seconds=1)
+        await session.commit()
     return frozen
 
 

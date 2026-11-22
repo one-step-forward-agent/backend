@@ -230,6 +230,11 @@ async def register(payload: RegisterRequest, request: Request, session: AsyncSes
         is_active=True,
     )
     session.add(user)
+    from app.services import attribution, proactivity
+
+    attribution.save(user, payload.attribution)
+    await session.flush()
+    await proactivity.welcome(session, user, language=request.headers.get("accept-language"))
     await session.commit()
     response = await _token_response(session, user.id)
     response.status_code = status.HTTP_201_CREATED
@@ -327,14 +332,18 @@ def safe_return_path(path: str | None) -> str | None:
     return path
 
 
-def _oauth_state(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
+def _oauth_state(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False, attribution: dict | None = None, language: str = "ru") -> str:
     """user_id is 0 when signing up or logging in: the callback finds or creates the user.
     consent: the user accepted the terms before leaving, so a login may create the account too."""
     data = {"user_id": user_id, "expires": int(datetime.now(timezone.utc).timestamp()) + 600}
     if mode != "connect":
+        data["language"] = language
+    if mode != "connect":
         data["mode"] = mode
     if consent:
         data["consent"] = 1
+    if attribution and mode != "connect":
+        data["attribution"] = attribution
     if tz:
         data["tz"] = tz
     if safe_return_path(return_to):
@@ -363,12 +372,14 @@ def _state_data(state: str) -> dict:
             "mode": mode,
             "tz": data.get("tz"),
             "consent": data.get("consent") == 1 or mode == "signup",
+            "attribution": data.get("attribution"),
+            "language": "en" if data.get("language") == "en" else "ru",
         }
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state") from None
 
 
-def google_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
+def google_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False, attribution: dict | None = None, language: str = "ru") -> str:
     if not settings.google_client_id:
         raise HTTPException(status_code=503, detail="Google OAuth is not configured")
     params = {
@@ -378,7 +389,7 @@ def google_authorization_url(user_id: int, return_to: str | None = None, mode: s
         "scope": " ".join(("openid", "email", "profile", *CALENDAR_SCOPES)),
         "access_type": "offline",
         "prompt": "select_account consent",
-        "state": _oauth_state(user_id, return_to, mode, tz, consent),
+        "state": _oauth_state(user_id, return_to, mode, tz, consent, attribution, language),
     }
     if mode != "connect":
         # Signing up and logging in ask only for the account (name, email, profile): these scopes need no Google
@@ -388,7 +399,7 @@ def google_authorization_url(user_id: int, return_to: str | None = None, mode: s
     query = urlencode(params)
     return f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
 
-def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False) -> str:
+def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None, consent: bool = False, attribution: dict | None = None, language: str = "ru") -> str:
     """Формирует ссылку на страницу авторизации Яндекс ID."""
     if not settings.yandex_client_id:
         raise HTTPException(status_code=503, detail="Yandex OAuth is not configured")
@@ -399,7 +410,7 @@ def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: s
             "redirect_uri": settings.yandex_redirect_uri,
             "response_type": "code",
             "scope": "login:email" if mode == "login" else "calendar:all login:email",
-            "state": _oauth_state(user_id, return_to, mode, tz, consent),
+            "state": _oauth_state(user_id, return_to, mode, tz, consent, attribution, language),
         }
     )
     return f"https://oauth.yandex.ru/authorize?{query}"
@@ -480,7 +491,9 @@ async def oauth_start(provider: str, payload: OAuthStart, request: Request):
     if payload.mode == "signup" and not payload.consent:
         raise HTTPException(status_code=400, detail="Для регистрации примите пользовательское соглашение и дайте согласие на обработку персональных данных")
     ratelimit.hit(f"oauth-start:{ratelimit.client_ip(request)}", OAUTH_START_MAX_PER_IP, REGISTER_WINDOW_SECONDS, "Слишком много попыток, попробуйте позже")
-    return {"authorization_url": builder(0, payload.return_to, payload.mode, payload.timezone, payload.consent)}
+    # Keep attribution in the signed OAuth state through the provider redirect.
+    state_attribution = payload.attribution.model_dump(mode="json") if payload.attribution else None
+    return {"authorization_url": builder(0, payload.return_to, payload.mode, payload.timezone, payload.consent, state_attribution, lang.from_header(request.headers.get("accept-language")))}
 
 
 class SignInRefused(Exception):
@@ -553,9 +566,16 @@ async def _callback_user(session: AsyncSession, entry: dict, provider: str, subj
     if not entry["consent"]:
         raise SignInRefused(f"Аккаунта {email} ещё нет. Зарегистрируйтесь — это займёт минуту.", "/register", None)
     user = User(email=email, name=(name or "").strip()[:200] or None, timezone=entry["tz"] or settings.default_timezone, is_active=True)
+    user.language = entry.get("language", "ru")
+    from app.services import attribution
+
+    attribution.save(user, attribution.CampaignAttribution.model_validate(entry["attribution"]) if entry.get("attribution") else None)
     session.add(user)
     await session.flush()
     session.add(UserIdentity(user_id=user.id, provider=provider, subject=subject))
+    from app.services import proactivity
+
+    await proactivity.welcome(session, user)
     # A new account goes through onboarding first
     entry["created"] = True
     return user
@@ -567,15 +587,20 @@ async def _finish_callback(
     """The redirect back to the site; signing up or logging in also starts the Deyla session.
     `error`: the account is there, but the service was not connected — the page shows why.
     connected=False: only the account (Google sign-up), the page connects the services it was asked to."""
+    if entry.get("attribution") and entry["mode"] != "connect":
+        from app.services import attribution
+
+        person = await session.get(User, user_id)
+        attribution.save(person, attribution.CampaignAttribution.model_validate(entry["attribution"]))
     return_to = entry["return_to"]
     result = urlencode({"error": error}) if error else f"connected={provider}" if connected else ""
     if entry["mode"] == "login":
-        response = RedirectResponse(url="/onboarding/field-of-activity" if entry.get("created") else return_to or "/app", status_code=303)
+        response = RedirectResponse(url="/app/assistant" if entry.get("created") else return_to or "/app", status_code=303)
     elif return_to:
         separator = "&" if "?" in return_to else "?"
         response = RedirectResponse(url=f"{return_to}{separator}{result}" if result else return_to, status_code=303)
     else:
-        response = RedirectResponse(url=f"/?{result}" if result else "/", status_code=303)
+        response = RedirectResponse(url="/app/assistant" if entry.get("created") else f"/?{result}" if result else "/", status_code=303)
     if entry["mode"] != "connect":
         _set_session_cookies(response, await _issue_tokens(session, user_id))
     return response

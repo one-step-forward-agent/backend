@@ -146,11 +146,20 @@ async def list_tables(_: User = Depends(get_admin), session: AsyncSession = Depe
     for table in (await _available_tables(session)).values():
         count = await session.scalar(select(func.count()).select_from(table))
         result.append(_describe(table, count or 0))
+    from app.services.attribution import campaign_table
+
+    result.append(campaign_table(await session.scalar(select(func.count()).select_from(User)) or 0))
     return result
 
 
 @router.get("/tables/{name}")
 async def read_table(name: str, _: User = Depends(get_admin), session: AsyncSession = Depends(get_session)):
+    if name == "campaign_attribution":
+        from app.services.attribution import analytics_row, campaign_table
+
+        total = await session.scalar(select(func.count()).select_from(User)) or 0
+        people = list(await session.scalars(select(User).order_by(User.id).limit(MAX_ROWS)))
+        return {**campaign_table(total), "data": [analytics_row(person) for person in people], "truncated": total > len(people)}
     table = (await _available_tables(session)).get(name)
     if table is None:
         raise HTTPException(status_code=404, detail="Таблица не найдена")

@@ -1558,6 +1558,8 @@ async def replace_items(session: AsyncSession, user: User, draft_id: int, items:
     cleaned = [item for item in (validate_item(raw, now, originals) for raw in items[:MAX_DRAFT_ITEMS]) if item]
     if not cleaned:
         raise ValueError(tr("Нужна хотя бы одна задача с названием и датой", "At least one task with a title and a date is needed"))
+    if len(draft.items) == len(cleaned) == 1 and draft.items[0].get("proactivity_source"):
+        cleaned[0]["proactivity_source"] = draft.items[0]["proactivity_source"]
     draft.items = cleaned
     draft.awaiting = None
     reply = proposal(draft, tz)
@@ -1697,6 +1699,10 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int, scope:
     draft = await get_draft(session, user, draft_id)
     tz = tasks.local_tz(user)
     items = list(draft.items)
+    from app.services import proactivity
+
+    if not await proactivity.validate_draft(session, user, items):
+        return {"kind": "answer", "text": tr("План изменился: предложенное время больше не подходит. Ничего не добавлено — проверьте календарь.", "Your plan has changed and the suggested time no longer fits. Nothing was added; please check the calendar.")}
     calendars = draft.calendars
     from app.models.models import TeamMember, TeamTask
 
@@ -2185,8 +2191,13 @@ async def handle_message(session: AsyncSession, user: User, text: str, attachmen
     await prune_history(session, user.id)
     failed = False
     try:
-        wish = None if attachment or group_context is not None else await research.resolve_wish(session, user, caption)
-        if wish is not None:
+        from app.services import proactivity
+
+        dialogue = None if attachment or group_context is not None else await proactivity.dialogue_reply(session, user, caption)
+        wish = None if dialogue or attachment or group_context is not None else await research.resolve_wish(session, user, caption)
+        if dialogue is not None:
+            reply = dialogue
+        elif wish is not None:
             reply = wish
         elif group_context is not None:
             # Group quotes are data, never passed through immediate rule-based commands or pending edits.
