@@ -271,6 +271,8 @@ async def list_events(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
+    from app.services import reminders
+    await reminders.ensure_custom_events(session, user)
     query = select(Event).where(Event.user_id == user.id).order_by(Event.start_at).limit(min(max(limit, 1), 1000))
     if start is not None:
         query = query.where(Event.end_at >= start)

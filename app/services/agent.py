@@ -211,7 +211,7 @@ ADVICE_REQUEST = re.compile(
     re.I,
 )
 TIMED_HINT = re.compile(r"врем|весь\s+день|целый\s+день|встреч|созвон", re.I)
-REMINDER_WORDS = re.compile(r"напомн|напомин|будильник", re.I)
+REMINDER_WORDS = re.compile(r"напомн|напомин|будильник|\bremind(?:er|ers)?\b", re.I)
 TASK_CORRECTION = re.compile(r"\bне\s+напоминани[ея]\b|\bnot\s+(?:a\s+)?reminder\b", re.I)
 # "Пришли мне этот файл в Telegram в 21:00" with a file attached: a reminder that brings the file
 SEND_WORDS = attachments.SEND_INTENT
@@ -1160,6 +1160,12 @@ async def create_reminder(turn: Turn, args: dict) -> dict:
         text = attachment.name
     # The repeat comes from what the user said, never from the text of an attached file
     said = own_words(turn.text) if attachment else turn.text
+    requested = reminder_dates(said, turn.now)
+    if requested.date and not requested.time and not attachment:
+        # The user's day without a clock must stay untimed, even if the model invents a time.
+        return await create_events(turn, {"events": [{
+            "title": text, "date": requested.date.isoformat(), "repeat": requested.rrule,
+        }]})
     repeat, every = repeat_of(said)
     if repeat is None and every is None:
         repeat = args.get("repeat") if args.get("repeat") in reminders.REPEATS else None
@@ -1213,7 +1219,7 @@ NO_TELEGRAM_EN = (
     "Reminders come from the Deyla Telegram bot, and it isn't connected yet. "
     "Connect it in Integrations and ask again — the reminder will arrive on time."
 )
-REMINDER_VERB = re.compile(r"(?:поставь(?:те)?\s+)?(?:напомни(?:те)?|напоминай(?:те)?|напоминание)(?:\s+(?:мне|нам))?", re.I)
+REMINDER_VERB = re.compile(r"(?:поставь(?:те)?\s+)?(?:напомни(?:те)?|напоминай(?:те)?|напоминание)(?:\s+(?:мне|нам))?|\b(?:(?:add|set|create)\s+(?:a\s+)?reminder(?:\s+to)?|remind\s+me(?:\s+to)?)\b", re.I)
 WHAT_LEAD = re.compile(r"^(?:о|об|про|что|чтобы|что\s+надо|что\s+нужно)\s+", re.I)
 
 
@@ -1231,6 +1237,25 @@ SEND_FILE_VERB = re.compile(
 )
 
 
+def reminder_dates(text: str, now: datetime) -> dates.Parsed:
+    # Keep offsets for title extraction; translate only the day token for the Russian date parser.
+    parsed = dates.parse(text, now)
+    for word, offset in (("tomorrow", 1), ("today", 0)):
+        if match := re.search(rf"\b{word}\b", text, re.I):
+            parsed.date = now.date() + timedelta(days=offset)
+            parsed.spans.append(match.span())
+            break
+    if match := re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", text, re.I):
+        hour, minute = int(match[1]), int(match[2] or 0)
+        period = (match[3] or "").lower()
+        if period and 1 <= hour <= 12:
+            hour = hour % 12 + (12 if period == "pm" else 0)
+        if hour < 24 and minute < 60:
+            parsed.time = time(hour, minute)
+            parsed.spans.append(match.span())
+    return parsed
+
+
 async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: ZoneInfo, attachment=None) -> dict | None:
     """"напомни …" / "напоминай …" set without the model: when it is down or answered without calling create_reminder.
     The time, the repeat and what to remind of come from the user's words. With a file, "пришли этот файл в 21:00"
@@ -1242,7 +1267,7 @@ async def reminder_by_rules(session: AsyncSession, user: User, text: str, tz: Zo
     if not (REMINDER_VERB.search(text) or sending) or re.search(r"напоминани[яей]\b.*\?|какие\s+у\s+меня|отмени", text, re.I):
         return None
     now = datetime.now(tz)
-    parsed = dates.parse(text, now)
+    parsed = reminder_dates(text, now)
     if sending and not parsed.time and not REMINDER_VERB.search(text):
         # "Пришли файл" without a time is not a reminder
         return None
@@ -1882,7 +1907,8 @@ def system_prompt() -> str:
         "передай deadline, а не start_time; если ставишь время, дело должно закончиться к сроку, а не начаться в него. "
         "«5 p.m.», «5pm», «в 5 вечера» — 17:00. Час без «утра» от 1 до 7 («завтра в 5 Игорь», «в 3 созвон») — это день или вечер "
         "(17:00, 15:00), если по смыслу дело не утреннее.\n"
-        "4. «Напомни через N минут / в 18:00 / завтра в 9 <что-то>» без слов о встрече или деле в календаре — это remind. "
+        "4. «Напомни завтра сходить в зал» без времени — create, задача без start_time; не уточняй время и не выдумывай его. "
+        "«Напомни через N минут / в 18:00 / завтра в 9 <что-то>» — это remind, напоминание также видно в Сегодня и календаре. "
         "Если пользователь планирует дело и просит напомнить заранее («встреча завтра в 15, напомни за 30 минут») — create "
         "с reminder_minutes. Само повторение не означает напоминание: «каждое 3е число месяца оплатить ChatGPT повтор три раза» "
         "— create без start_time, repeat=FREQ=MONTHLY;BYMONTHDAY=3;COUNT=3. Начало — ближайшее подходящее число, "

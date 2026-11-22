@@ -29,7 +29,7 @@ DEADLINE_STAGES = (4320, 1440, 120)
 CLAIM_TIMEOUT = timedelta(minutes=5)
 MAX_ATTEMPTS = 3
 LINK_CODE_LIFETIME = timedelta(minutes=15)
-# A reminder the user asked for ("напомни помыть посуду через 10 минут"): not tied to a task
+# A reminder the user asked for, linked to its task in Today and the calendar.
 CUSTOM_KIND = "custom"
 # A custom reminder is still worth sending this long after its time (the bot was down, quiet hours of Telegram)
 CUSTOM_GRACE = timedelta(hours=12)
@@ -235,6 +235,8 @@ async def queue_for_user(session: AsyncSession, user: User, reminder_settings: R
             and_(Event.reminder_minutes.is_not(None), Event.start_at <= now + timedelta(minutes=MAX_LEAD_MINUTES)),
         )
     )
+    # Custom reminders have their own delivery queue; do not also send task lead-time notifications.
+    conditions.append(~select(Notification.id).where(Notification.event_id == Event.id, Notification.kind == CUSTOM_KIND).exists())
     if not reminder_settings.enabled:
         conditions.append(friend_reminder)
     elif reminder_settings.sources:
@@ -652,9 +654,11 @@ async def queue_next(session: AsyncSession, notification: Notification, user: Us
     key = f"custom:{user.id}:{payload.get('series')}:{int(moment.timestamp())}"
     if await session.scalar(select(Notification.id).where(Notification.dedupe_key == key)):
         return
+    event = await custom_event(session, user, payload.get("text") or notification.text, moment)
     session.add(
         Notification(
             user_id=user.id,
+            event_id=event.id,
             kind=CUSTOM_KIND,
             dedupe_key=key,
             text=notification.text,
@@ -665,6 +669,32 @@ async def queue_next(session: AsyncSession, notification: Notification, user: Us
             attempts=0,
         )
     )
+
+
+async def custom_event(session: AsyncSession, user: User, title: str, moment: datetime) -> Event:
+    tz = user_timezone(user)
+    calendar = await default_calendar(session, user, tz)
+    event = Event(
+        user_id=user.id, calendar_id=calendar.id, title=title[:300],
+        start_at=moment, end_at=moment + timedelta(minutes=15), timezone=tz,
+        source="ai", all_day=False, sync_status="skipped",
+    )
+    session.add(event)
+    await session.flush()
+    return event
+
+
+async def ensure_custom_events(session: AsyncSession, user: User) -> None:
+    """Give reminders created before calendar visibility a task, once, under a row lock."""
+    pending = list(await session.scalars(select(Notification).where(
+        Notification.user_id == user.id, Notification.kind == CUSTOM_KIND,
+        Notification.status == NotificationStatus.PENDING, Notification.event_id.is_(None),
+    ).with_for_update()))
+    for notification in pending:
+        event = await custom_event(session, user, (notification.payload or {}).get("text") or notification.text, notification.scheduled_for)
+        notification.event_id = event.id
+    if pending:
+        await session.commit()
 
 
 def custom_view(notification: Notification, tz: ZoneInfo) -> dict:
@@ -723,8 +753,10 @@ async def create_custom(
             moment = local.astimezone(timezone.utc)
         payload |= {"repeat": repeat, "series": series, **({"day": local.day} if repeat == "monthly" else {})}
     local = moment.astimezone(ZoneInfo(user_timezone(user)))
+    event = await custom_event(session, user, text, moment)
     notification = Notification(
         user_id=user.id,
+        event_id=event.id,
         kind=CUSTOM_KIND,
         # The ones after it are custom:<user>:<series>:<time> (see queue_next)
         dedupe_key=f"custom:{user.id}:{series}",
@@ -808,6 +840,12 @@ async def cancel_custom(session: AsyncSession, user: User, notification_id: int)
     if not notification or notification.status != NotificationStatus.PENDING:
         return None
     notification.status = NotificationStatus.CANCELLED
+    if notification.event_id:
+        event = await session.get(Event, notification.event_id)
+        if event and event.user_id == user.id:
+            notification.event_id = None
+            await session.flush()
+            await session.delete(event)
     await session.flush()
     await release_file(session, notification)
     return notification
