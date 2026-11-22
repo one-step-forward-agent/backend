@@ -40,6 +40,7 @@ ai_source_update ai_source_reparse sent_contact_data filled_contact_data form_su
 llm_request team_create""".split()
 EXCLUDED = ["logout", "logout_all", "event_delete", "file_delete", "integration_disconnect", "telegram_unlink",
             "account_delete", "calendar_feed_reset", "assistant_history_clear", "ai_source_remove"]
+DAU_EXCLUDED = {"register_success", "login_success"}
 
 
 def bounds(start: date, end: date, tz: str):
@@ -90,9 +91,12 @@ async def metrics(session: AsyncSession, tables: dict[str, Table], start: date, 
     actions, coverage = action_query(tables, lower, upper, tz, definition)
     goals_daily, goal_totals, period_active = [], [], 0
     if actions is not None:
+        # Keep authentication in the action breakdown, but require product/site
+        # activity for daily and period active-user counts.
+        active = ~actions.c.goal.in_(DAU_EXCLUDED)
         rows = (await session.execute(select(actions.c.date,
-            func.count().label("total_actions"), func.count(distinct(actions.c.user_id)).label("extended_dau"),
-            func.count(distinct(actions.c.user_id)).filter(actions.c.category != "site").label("product_dau"),
+            func.count().label("total_actions"), func.count(distinct(actions.c.user_id)).filter(active).label("extended_dau"),
+            func.count(distinct(actions.c.user_id)).filter(active & (actions.c.category != "site")).label("product_dau"),
         ).group_by(actions.c.date))).mappings()
         for row in rows:
             daily[row["date"].isoformat()].update({k: int(row[k]) for k in ("total_actions", "extended_dau", "product_dau")})
@@ -104,7 +108,7 @@ async def metrics(session: AsyncSession, tables: dict[str, Table], start: date, 
                 func.count(distinct(actions.c.user_id)).label("unique_users"))
                 .group_by(actions.c.date, actions.c.goal))).mappings():
             goals_daily.append(dict(row))
-        period_active = int(await session.scalar(select(func.count(distinct(actions.c.user_id)))))
+        period_active = int(await session.scalar(select(func.count(distinct(actions.c.user_id))).where(active)))
     else:
         for row in daily.values():
             row.update(extended_dau=None, product_dau=None, total_actions=None)
@@ -149,7 +153,7 @@ async def metrics(session: AsyncSession, tables: dict[str, Table], start: date, 
     rows = list(daily.values())
     return {"start_date": start, "end_date": end, "timezone": tz, "definition": definition,
             "daily": rows, "model_daily": model_daily, "goals": goal_totals, "goals_daily": goals_daily,
-            "purposes": purposes, "coverage": coverage, "excluded": EXCLUDED, "models": available_models,
+            "purposes": purposes, "coverage": coverage, "excluded": EXCLUDED + sorted(DAU_EXCLUDED), "models": available_models,
             "summary": {"active_users": period_active if actions is not None else None,
                         "users_now": users_now, "requests_all_time": requests_all_time,
                         "average_dau": sum(row["extended_dau"] for row in rows) / len(rows) if actions is not None else None,

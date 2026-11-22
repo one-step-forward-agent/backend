@@ -51,8 +51,9 @@ async def test_full_dataset_metrics(analytics_tables):
     assert [r["llm_requests"] for r in result["daily"]] == [2, 1]
     assert result["daily"][0]["extended_dau"] == 2
     assert result["daily"][0]["product_dau"] == 1
-    assert result["daily"][1]["extended_dau"] == 1  # Registration, not anonymous LLM.
-    assert result["summary"]["active_users"] == 3
+    assert result["daily"][1]["extended_dau"] == 0  # Neither registration nor anonymous LLM counts.
+    assert result["daily"][1]["product_dau"] == 0
+    assert result["summary"]["active_users"] == 2
     assert result["summary"]["total_tokens"] == 365  # Cached input counted once.
     assert sum(r["requests"] for r in result["model_daily"]) == 3
     assert not {"email", "user_id", "content", "credentials_encrypted"} & set(str(result).split("'"))
@@ -72,6 +73,37 @@ async def test_models_do_not_filter_dau_and_definitions_are_explicit(analytics_t
     assert report["daily"][0]["extended_dau"] == 1
     assert report["daily"][0]["product_dau"] == 0
     assert any(r["goal"] == "llm_request" and r["status"] == "not_in_definition" for r in report["coverage"])
+
+
+@pytest.mark.parametrize("definition", ["combined", "charts", "report"])
+async def test_registration_and_login_do_not_count_as_active_users(analytics_tables, definition):
+    session, tables = analytics_tables
+    # This account only registers and receives refresh tokens on November 2.
+    await session.execute(insert(tables["refresh_tokens"]), [
+        {"user_id": 910002, "jti": f"analytics-login-{i}",
+         "created_at": stamp("2026-11-02T12:00:00Z"), "expires_at": stamp("2026-12-02T12:00:00Z")}
+        for i in range(2)
+    ])
+    args = (session, tables, date(2026, 11, 2), date(2026, 11, 2), "UTC", definition, [])
+    result = await metrics(*args)
+    row = result["daily"][0]
+    assert row["extended_dau"] == row["product_dau"] == 0
+    assert row["new_users"] == 2 and row["total_users"] == 3
+    assert result["summary"]["active_users"] == result["summary"]["average_dau"] == 0
+    assert {"register_success", "login_success"} <= set(result["excluded"])
+    goals = {goal["goal"]: goal for goal in result["goals"]}
+    assert goals["register_success"]["actions"] == 2
+    if definition != "charts":
+        assert goals["login_success"]["actions"] == 2
+
+    # A real product action on the same day counts the account exactly once.
+    await session.execute(insert(tables["tags"]), [
+        {"user_id": 910002, "name": f"analytics-tag-{i}", "created_at": stamp("2026-11-02T14:00:00Z")}
+        for i in range(2)
+    ])
+    result = await metrics(*args)
+    assert result["daily"][0]["extended_dau"] == result["daily"][0]["product_dau"] == 1
+    assert result["summary"]["active_users"] == result["summary"]["average_dau"] == 1
 
 
 async def test_zero_days_and_timezone_changes(analytics_tables):
