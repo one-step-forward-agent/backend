@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 
 import httpx
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, update
 
 from app.api.deps import get_current_user
 from app.core.database import Base, session_factory
@@ -39,6 +39,9 @@ async def analytics_tables():
             {"id": 920002, "user_id": 910001, "model": "model-b", "purpose": "process_message", "prompt_tokens": 200, "completion_tokens": 30, "precached_prompt_tokens": 80, "total_tokens": 230, "created_at": stamp("2026-11-01T13:00:00Z")},
             {"id": 920003, "user_id": None, "model": "model-a", "purpose": "system", "prompt_tokens": 10, "completion_tokens": 5, "precached_prompt_tokens": 0, "total_tokens": 15, "created_at": stamp("2026-11-02T22:59:59.999999Z")},
         ])
+        await session.execute(update(tables["llm_usage"]).where(
+            tables["llm_usage"].c.id.in_([920001, 920002])
+        ).values(user_initiated=True))
         await session.execute(insert(tables["feature_wishes"]), {"user_id": 910003, "wish": "Synthetic test", "channel": "web", "created_at": stamp("2026-11-01T12:00:00Z")})
         yield session, tables
         await session.rollback()
@@ -104,6 +107,38 @@ async def test_registration_and_login_do_not_count_as_active_users(analytics_tab
     result = await metrics(*args)
     assert result["daily"][0]["extended_dau"] == result["daily"][0]["product_dau"] == 1
     assert result["summary"]["active_users"] == result["summary"]["average_dau"] == 1
+
+
+@pytest.mark.parametrize("definition", ["combined", "charts", "report"])
+async def test_unanswered_assistant_messages_do_not_activate_users(analytics_tables, definition):
+    session, tables = analytics_tables
+    # All accounts receive proactive messages; only one replies the next local day.
+    await session.execute(insert(tables["conversation_messages"]), [
+        {"user_id": user_id, "role": role, "content": "Synthetic message",
+         "created_at": stamp("2026-11-03T20:59:00Z")}
+        for user_id in [910001, 910002, 910003] for role in ["assistant", "system"]
+    ])
+    await session.execute(insert(tables["llm_usage"]), [
+        {"user_id": user_id, "model": "background", "purpose": "proactivity",
+         "user_initiated": initiated, "created_at": stamp("2026-11-03T20:59:00Z")}
+        for user_id in [910001, 910002, 910003] for initiated in [False, None]
+    ])
+    await session.execute(insert(tables["conversation_messages"]), [
+        {"user_id": 910001, "role": "user", "content": "Synthetic reply",
+         "created_at": stamp("2026-11-03T21:01:00Z")}
+        for _ in range(10)
+    ])
+    result = await metrics(session, tables, date(2026, 11, 3), date(2026, 11, 4),
+                           "Europe/Moscow", definition, [])
+    assert [row["extended_dau"] for row in result["daily"]] == [0, 1]
+    assert [row["product_dau"] for row in result["daily"]] == [0, 1]
+    assert result["summary"]["active_users"] == 1
+    assert result["summary"]["average_dau"] == 0.5
+    # Six background calls plus the fixture's anonymous call after Moscow midnight.
+    assert result["summary"]["llm_requests"] == 7
+    messages = next(row for row in result["goals"] if row["goal"] == "assistant_message")
+    assert messages["actions"] == 10 and messages["unique_users"] == 1
+    assert [row["date"] for row in result["goals_daily"] if row["goal"] == "assistant_message"] == [date(2026, 11, 4)]
 
 
 async def test_zero_days_and_timezone_changes(analytics_tables):

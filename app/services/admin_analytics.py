@@ -61,15 +61,25 @@ def action_query(tables: dict[str, Table], lower, upper, tz, definition):
         selected = not (definition == "charts" and goal in REPORT_ONLY or definition == "report" and goal in CHARTS_ONLY)
         table = tables.get(name)
         available = table is not None and {user, timestamp} <= set(table.c.keys())
+        if goal == "assistant_message":
+            available = available and "role" in table.c
         # Current event_files have no creation timestamp: never borrow the event's date.
         status = "available" if selected and available else "not_in_definition" if not selected else "unavailable"
         coverage.append({"goal": goal, "source": name, "timestamp": timestamp, "status": status})
         if status != "available":
             continue
         stamp = table.c[timestamp]
+        # Background model work remains in usage totals, but cannot activate an
+        # account. Unknown historical initiation is not evidence of user activity.
+        counts_as_active = (table.c.user_initiated.is_(True)
+                            if goal == "llm_request" and "user_initiated" in table.c
+                            else literal(goal != "llm_request"))
         statement = select(table.c[user].label("user_id"), local_day(stamp, tz).label("date"),
-                           literal(goal).label("goal"), literal(category).label("category")).where(
+                           literal(goal).label("goal"), literal(category).label("category"),
+                           counts_as_active.label("counts_as_active")).where(
                                stamp >= lower, stamp < upper, table.c[user].is_not(None))
+        if goal == "assistant_message":
+            statement = statement.where(table.c.role == "user")
         if goal in {"me_update", "event_update"}:
             statement = statement.where(stamp > table.c.created_at)
         statements.append(statement)
@@ -93,7 +103,7 @@ async def metrics(session: AsyncSession, tables: dict[str, Table], start: date, 
     if actions is not None:
         # Keep authentication in the action breakdown, but require product/site
         # activity for daily and period active-user counts.
-        active = ~actions.c.goal.in_(DAU_EXCLUDED)
+        active = ~actions.c.goal.in_(DAU_EXCLUDED) & actions.c.counts_as_active
         rows = (await session.execute(select(actions.c.date,
             func.count().label("total_actions"), func.count(distinct(actions.c.user_id)).filter(active).label("extended_dau"),
             func.count(distinct(actions.c.user_id)).filter(active & (actions.c.category != "site")).label("product_dau"),
