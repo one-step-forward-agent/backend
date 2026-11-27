@@ -9,3 +9,7 @@ When available, read `../AGENTS.md` and `../codex-setup/commands.md` for workspa
 - From this directory, use a Python 3.12 virtual environment: `python -m pip install -r requirements-dev.txt`; `python -m uvicorn app.main:app --reload`; `python -m alembic heads`; `python -m pytest tests/test_dates.py -q`. Full pytest and migrations require a verified disposable PostgreSQL database; see the workspace command guide.
 - `tests/conftest.py` imports the app and sets defaults with `setdefault`: inherited production environment can override them. Tests do not isolate the database by transaction rollback. Mock LLM/calendar/email services; inspect selected tests for external calls.
 - App startup can grant configured admin access and start calendar sync. Docker startup additionally applies migrations. Production safety validation must remain enabled. Use `app/core/errors.py` and structured, sanitized logging rather than returning internal exceptions.
+
+## Работа с API Deyla
+
+Для изменений HTTP-контрактов, доменных сервисов и схемы данных используй [deyla-backend](.agents/skills/deyla-backend/SKILL.md). Локальный пример настройки тестового PostgreSQL приведён в [tests/README.md](tests/README.md).

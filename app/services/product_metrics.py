@@ -68,6 +68,7 @@ async def daily(session, start: date, end: date, now: datetime | None = None):
     rows = {start + timedelta(days=i): {
         "date": start + timedelta(days=i), "dau": 0, "llm_requests": 0,
         "tool_requests": 0, "total_users": 0, "new_users": 0,
+        "retained_d1": None, "retained_d3": None, "retained_d7": None, "retained_d14": None,
         "is_final": start + timedelta(days=i) < now.date(),
     } for i in range((end - start).days + 1)}
     allowed = eligible()
@@ -80,6 +81,15 @@ async def daily(session, start: date, end: date, now: datetime | None = None):
         row["new_users"] = int(additions.get(stamp, 0))
         current += row["new_users"]
         row["total_users"] = current
+
+    # Retention joins registration cohorts to distinct active users on exact
+    # calendar dates. Fetch through end + 14 so historical and 15-day exports
+    # can calculate every mature cohort with one activity aggregation.
+    retention_end = min(end + timedelta(days=14), date.max - timedelta(days=1))
+    retention_upper = datetime.combine(retention_end + timedelta(days=1), time.min, MOSCOW).astimezone(timezone.utc)
+    registrations = select(MetricRegistration.user_id, day(MetricRegistration.created_at).label("cohort_date")).where(
+        MetricRegistration.user_id.in_(allowed), MetricRegistration.created_at >= lower,
+        MetricRegistration.created_at < upper).subquery()
 
     # Historical fallback uses durable action timestamps, never login/page views
     # or mutable updated_at timestamps. DAU is DISTINCT across all sources.
@@ -100,9 +110,26 @@ async def daily(session, start: date, end: date, now: datetime | None = None):
                       or_(LlmUsage.user_initiated.is_(True),
                           LlmUsage.user_initiated.is_(None) & ~LlmUsage.purpose.in_(["recommendations", "plan_recommendations"]))]
     actions.append(select(LlmUsage.metrics_user_id.label("user_id"), day(LlmUsage.created_at).label("date")).where(*llm_conditions))
-    combined = union_all(*actions).subquery()
+    combined = union_all(*[
+        select(actor.label("user_id"), day(stamp).label("date")).where(
+            actor.in_(allowed), stamp >= lower, stamp < retention_upper,
+            *([condition] if condition is not None else []))
+        for actor, stamp, condition in sources
+    ] + [select(LlmUsage.metrics_user_id.label("user_id"), day(LlmUsage.created_at).label("date")).where(
+        LlmUsage.metrics_user_id.in_(allowed), LlmUsage.created_at >= lower, LlmUsage.created_at < retention_upper,
+        *llm_conditions[:1], *llm_conditions[3:])]).subquery()
     for stamp, count in await session.execute(select(combined.c.date, func.count(distinct(combined.c.user_id))).group_by(combined.c.date)):
-        rows[stamp]["dau"] = int(count)
+        if stamp in rows:
+            rows[stamp]["dau"] = int(count)
+    active = select(distinct(registrations.c.cohort_date), combined.c.user_id, combined.c.date).join(
+        registrations, registrations.c.user_id == combined.c.user_id).subquery()
+    for offset in (1, 3, 7, 14):
+        for cohort, count in await session.execute(select(active.c.cohort_date, func.count(distinct(active.c.user_id))).where(
+            active.c.date == active.c.cohort_date + offset,
+            active.c.cohort_date.between(start, end)).group_by(active.c.cohort_date)):
+            target = cohort + timedelta(days=offset)
+            if target < now.date():
+                rows[cohort][f"retained_d{offset}"] = int(count)
     for stamp, count in await session.execute(select(day(LlmUsage.created_at).label("date"), func.count()).where(*llm_conditions).group_by("date")):
         rows[stamp]["llm_requests"] = int(count)
     for stamp, count in await session.execute(select(day(ProductActivity.created_at).label("date"), func.count()).where(

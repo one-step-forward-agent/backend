@@ -24,6 +24,10 @@ class DailyMetric(BaseModel):
     tool_requests: int
     total_users: int
     new_users: int
+    retained_d1: int | None
+    retained_d3: int | None
+    retained_d7: int | None
+    retained_d14: int | None
     is_final: bool
 
 

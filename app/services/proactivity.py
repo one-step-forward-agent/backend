@@ -72,7 +72,19 @@ async def welcome(session: AsyncSession, user: User, language: str | None = None
 
 
 async def dialogue_reply(session: AsyncSession, user: User, text: str) -> dict | None:
-    """After a campaign question, offer real ecosystem entry points before any model call."""
+    """Continue short replies to campaign prompts and offer a useful next step for plans."""
+    en = user.language == "en"
+    scheduled_conversation = re.search(
+        r"\b(?:созвон|встреч\w*|интервью|собеседован\w*|переговор\w*|call|meeting|interview)\b",
+        text, re.I,
+    ) and re.search(r"\b(?:в\s*)?\d{1,2}(?::\d{2})?\b|\b(?:today|tomorrow|завтра|сегодня|в\s+понедельник|в\s+пятницу)\b", text, re.I)
+    if scheduled_conversation and not re.search(r"\b(?:удали|отмени|перенеси|создай|добавь|schedule|delete|cancel|move)\b", text, re.I):
+        return {
+            "kind": "answer",
+            "text": ("I can help you prepare for that conversation. Want me to make a short preparation plan and gather useful materials?" if en else
+                     "Могу помочь подготовиться к этому разговору. Хотите, составлю короткий план подготовки и подберу полезные материалы?"),
+            "replies": ["Составь план подготовки", "Подбери материалы", "Пока не нужно"] if not en else ["Make a preparation plan", "Find useful materials", "Not now"],
+        }
     if not re.fullmatch(r"\s*(?:да(?:,?\s+давай(?:\s+спланируем\s+вместе)?)?|ага|хочу|давай(?:\s+спланируем\s+вместе)?|yes(?:,?\s+let['’]s\s+plan\s+together)?|sure|нет|позже|no(?:,?\s+thanks)?|later)[.!\s]*", text, re.I):
         return None
     last = await session.scalar(select(ConversationMessage).where(
@@ -81,7 +93,6 @@ async def dialogue_reply(session: AsyncSession, user: User, text: str) -> dict |
     question_id = (last.reply or {}).get("dialogue_question_id") if last and last.role == "assistant" else None
     if not question_id:
         return None
-    en = user.language == "en"
     if re.match(r"\s*(?:нет|позже|no\b|later)", text, re.I):
         return {"kind": "answer", "text": "Okay. Write whenever you need help with your plans." if en else "Хорошо. Напиши, когда понадобится помощь с планами."}
     question = await session.get(ProactivityQuestion, question_id)
